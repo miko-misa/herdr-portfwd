@@ -1,0 +1,44 @@
+[package]
+name = "herdr-portfwd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "Forward dev-server ports from remote Herdr hosts to your local machine, managed from inside Herdr"
+repository = "https://github.com/hacnosuke/herdr-portfwd"
+homepage = "https://github.com/hacnosuke/herdr-portfwd"
+readme = "README.md"
+keywords = ["herdr", "ssh", "port-forwarding", "tunnel", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/reference", "/assets", "/.github"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
+toml = { version = "0.9", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"

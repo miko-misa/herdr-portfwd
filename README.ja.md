@@ -1,0 +1,188 @@
+# herdr-portfwd
+
+[![CI](https://github.com/hacnosuke/herdr-portfwd/actions/workflows/ci.yml/badge.svg)](https://github.com/hacnosuke/herdr-portfwd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+リモートホストの dev サーバーを手元の `localhost` に持ってきて、その転送の
+開始・停止・管理を [Herdr](https://herdr.dev) の中だけで完結させるプラグインです。
+
+*[English README](README.md)*
+
+ビルド機の上でエージェントが `npm run dev` を実行し、`http://localhost:5173`
+と表示する。それを Ctrl+クリックする。ポートが転送され、**同じポート番号のまま**、
+あなたが実際に座っているマシンのブラウザでページが開きます。
+
+## `ssh -L` と何が違うか
+
+**どのポートがどのエージェントのものか分かります。** 実際のホストで待ち受けている
+ポートの大半はインフラ — トンネルのデーモン、VM マネージャ、SSH の多重化ソケット
+です。`herdr-portfwd` は各リスナーのプロセス系譜を Herdr ペインの `shell_pid` まで
+遡るので、提示される一覧はこうなります:
+
+```
+mini: scholion   claude   :5173   node (vite)
+mini: api        codex    :8787   workerd
+```
+
+こうはなりません:
+
+```
+127.0.0.1:20241  cloudflared    127.0.0.1:49313  limactl    *:53  limactl
+```
+
+ペインに帰属しないポートは、既定では提示されません。
+
+**勝手に番号を振り直しません。** ローカル側のポートはリモートと同じ番号にします。
+表示された URL がそのまま使えることに価値があるからです。番号を変えると Vite の
+HMR、OAuth の `redirect_uri`、アプリが吐く絶対 URL が壊れます。衝突したときは
+はっきり報告して選ばせます。黙って別のポートに逃がすことはしません。
+
+**裏で勝手に転送しません。** 検出したポートは Herdr の通知で*提示*し、承認されて
+から張ります。全自動の転送も用意していますが、ワークスペース単位のオプトインです。
+
+## 必要なもの
+
+- 両端に Herdr **0.8.0** 以降
+- macOS または Linux（x86_64 / aarch64）
+- 各ホストへの非対話な鍵認証:
+  `ssh -o BatchMode=yes <host> true` がプロンプトなしで通ること
+- ポート検出のため、リモート側に `lsof`（macOS）または `ss`（Linux）
+
+## インストール
+
+```bash
+herdr plugin install hacnosuke/herdr-portfwd
+herdr server reload-config
+```
+
+`~/.local/bin/herdr-portfwd` に CLI も張られます。
+
+ホスト定義は `~/.config/herdr-mirror/hosts.toml` があればそれを読むので、
+[herdr-mirror](https://github.com/nikok6/herdr-mirror) を使っているなら追加の設定は
+不要です。そうでなければ `~/.config/herdr-portfwd/hosts.toml` を作ってください:
+
+```toml
+[hosts.buildbox]
+target = "buildbox"   # ssh が受け付ける形式なら何でも: alias, user@host, ssh://host:2222
+prefix = "build"      # ミラーされたワークスペースの "build: " 接頭辞と対応
+```
+
+## どちらのモードで使っているか
+
+Herdr はサーバーを接続のどちら側にも置けて、それがプラグインの実行場所を決めます。
+`herdr-portfwd` は両方に対応しますが、設定方法が違います。
+
+### herdr-mirror と併用（サーバーはローカル）
+
+追加作業はありません。ローカルにプラグインを入れ、ローカルの
+`~/.config/herdr/config.toml` にキーを割り当てれば終わりです。
+
+### `herdr --remote`（サーバーはリモート）
+
+`--remote` ではローカルの Herdr は薄いクライアントで、サーバーも、したがって
+すべてのプラグインもリモートホストで動きます。リモートのプラグインは、あなたの
+ラップトップにポートを開くことができません。そこで、プラグインは「何を転送するか」
+を宣言するだけにして、小さなローカルエージェントが実際の転送を行います。
+
+`herdr --remote` を直接叩く代わりに、ラッパー経由でセッションを開始してください:
+
+```bash
+herdr-portfwd attach buildbox     # ローカルエージェントを起動してから herdr --remote を exec
+```
+
+さらに 2 点、違いがあります:
+
+- プラグインは**リモートホスト側に**インストールします（そちらで `herdr plugin install ...`）
+- キーバインドは**リモートの** `config.toml` に書きます。Herdr はリモートサーバーへ
+  送るプロファイルから `[[keys.command]]` を——`type = "plugin_action"` も含めて——
+  すべて取り除くため、ローカルの設定は届きません。
+
+## 使い方
+
+**URL を Ctrl+クリック。** ペイン内の `http://localhost:PORT` や
+`http://127.0.0.1:PORT` がプラグインに渡り、転送してからローカルで開きます。
+Cmd+クリックではなく Ctrl+クリックなのは、端末のマウスレポートが Cmd+クリックを
+ただのクリックと区別できないためで、これは全プラットフォーム共通です。
+
+**一覧から選ぶ。** `scan` アクションがホストごとの帰属済みリスナーを表示し、
+選んだものを転送します。
+
+**動いているものを管理する。** `list` アクションが、生きている全転送と、その
+持ち主のペイン、停止キーをオーバーレイで表示します。
+
+### アクション
+
+| アクション | 動作 |
+| --- | --- |
+| `portfwd.scan` | 帰属済みのリモートリスナーを一覧し、選んだものを転送 |
+| `portfwd.add` | 入力したポートを転送 |
+| `portfwd.list` | 生きている転送のオーバーレイ（停止キー付き） |
+| `portfwd.stop` | 選んだ転送を停止 |
+| `portfwd.stop-all` | 現在のホストの転送をすべて停止 |
+| `portfwd.open-url` | リンクハンドラの飛び先。転送してからローカルで開く |
+
+### キーバインド
+
+既定のキーは割り当てていません。`config.toml` で設定してください。`herdr --remote`
+なら**リモート側**、herdr-mirror ならローカル側です:
+
+```toml
+[[keys.command]]
+key = "prefix+p"
+type = "plugin_action"
+command = "portfwd.scan"
+description = "forward a remote port"
+
+[[keys.command]]
+key = "prefix+shift+p"
+type = "plugin_action"
+command = "portfwd.list"
+description = "manage port forwards"
+```
+
+そのあと `herdr server reload-config` を実行します。
+
+## 設定
+
+`~/.config/herdr-portfwd/config.toml`:
+
+```toml
+# 新しいリスナーを探す間隔。0 で検出そのものを無効化。
+poll_seconds = 5
+
+# 検出したポートを Herdr の通知で提示する。既定: true
+offer_new_listeners = true
+
+# Herdr のペインに帰属するリスナーだけを提示する。既定: true
+require_pane_attribution = true
+
+# オプトインの自動転送。ワークスペース単位で照合。既定では空。
+[[auto]]
+workspace = "scholion"
+ports = [5173, 8787]
+```
+
+## セキュリティ
+
+このプラグインはあなたの権限・鍵・ssh-agent で SSH を実行し、手元では loopback
+にしか bind しません。外部コマンドは argv 配列で起動し、シェルを経由しません。
+報告手順は [SECURITY.md](SECURITY.md) を参照してください。
+
+## 開発
+
+```bash
+just check      # fmt + clippy + テスト
+just test
+cargo build --release
+herdr plugin link .          # この作業ツリーをリンク
+herdr server reload-config
+```
+
+テストは実際の `ssh`・実際の `herdr`・ネットワークを一切叩きません（どちらも
+トレイト越しのフェイクに差し替わります）。設計とその不変条件は
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、プルリクエスト前に
+[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+
+## ライセンス
+
+MIT — [LICENSE](LICENSE) を参照。

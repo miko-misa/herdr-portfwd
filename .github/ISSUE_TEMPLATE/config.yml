@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/hacnosuke/herdr-portfwd/discussions
+    about: Ask a question or float an idea before it becomes an issue.
+  - name: Security vulnerability
+    url: https://github.com/hacnosuke/herdr-portfwd/security/advisories/new
+    about: Report privately. Please do not open a public issue.
+  - name: Herdr itself
+    url: https://github.com/herdrdev/herdr/issues
+    about: For bugs in Herdr rather than this plugin.

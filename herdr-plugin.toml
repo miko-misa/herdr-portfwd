@@ -1,0 +1,98 @@
+id = "portfwd"
+name = "Herdr Port Forward"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Forward dev-server ports from remote Herdr hosts to your local machine"
+platforms = ["macos", "linux"]
+
+# Fetch the prebuilt herdr-portfwd binary for this platform into
+# ./target/release/herdr-portfwd. Dev installs via `herdr plugin link` build
+# with cargo themselves; link does not run build commands.
+[[build]]
+command = ["bash", "scripts/install.sh"]
+
+# One-shot: reconcile recorded forwards against what is actually live, and drop
+# records whose pane or host is gone. Not a daemon — it exits.
+[[startup]]
+command = ["./target/release/herdr-portfwd", "reconcile", "--startup"]
+
+[[actions]]
+id = "scan"
+title = "Port: scan remote listeners"
+description = "List remote ports that belong to a Herdr pane and forward the ones you pick"
+contexts = ["global", "workspace", "pane"]
+command = ["./target/release/herdr-portfwd", "scan"]
+
+[[actions]]
+id = "add"
+title = "Port: forward a port"
+description = "Type a remote port to forward to the same port locally"
+contexts = ["global", "workspace", "pane"]
+command = ["./target/release/herdr-portfwd", "add"]
+
+[[actions]]
+id = "list"
+title = "Port: manage forwards"
+description = "Overlay of every live forward, with keys to stop them"
+contexts = ["global"]
+command = ["./target/release/herdr-portfwd", "pane-ui", "list"]
+
+[[actions]]
+id = "stop"
+title = "Port: stop a forward"
+description = "Pick a live forward and stop it"
+contexts = ["global", "workspace", "pane"]
+command = ["./target/release/herdr-portfwd", "stop"]
+
+[[actions]]
+id = "stop-all"
+title = "Port: stop all forwards for this host"
+description = "Stop every forward belonging to the invoking host"
+contexts = ["global", "workspace", "pane"]
+command = ["./target/release/herdr-portfwd", "stop-all"]
+
+[[actions]]
+id = "open-url"
+title = "Port: forward and open"
+description = "Forward the clicked localhost URL, then open it locally"
+contexts = ["pane"]
+command = ["./target/release/herdr-portfwd", "open-url"]
+
+# Ctrl+click on a loopback URL forwards it and opens it locally instead of
+# handing it to a browser that may be on the wrong machine. Deliberately
+# restricted to loopback hosts: see SECURITY.md.
+[[link_handlers]]
+id = "loopback-url"
+title = "Forward and open locally"
+pattern = "^https?://(?:localhost|127\\.0\\.0\\.1|\\[::1\\]):[0-9]{1,5}(?:[/?#].*)?$"
+action = "open-url"
+
+[[panes]]
+id = "list"
+title = "Port forwards"
+description = "Live forwards, their owning panes, and stop keys"
+placement = "overlay"
+command = ["./target/release/herdr-portfwd", "pane-ui", "list"]
+
+[[panes]]
+id = "picker"
+title = "Forward a port"
+description = "Pick from attributed remote listeners"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["./target/release/herdr-portfwd", "pane-ui", "picker"]
+
+# Reconcile when attention moves to a different host, and release forwards owned
+# by a pane that has gone away.
+[[events]]
+on = "workspace.focused"
+command = ["./target/release/herdr-portfwd", "reconcile", "--event"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/herdr-portfwd", "reconcile", "--event"]
+
+[[events]]
+on = "pane.closed"
+command = ["./target/release/herdr-portfwd", "reconcile", "--event"]

@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Upstream sources cloned locally for reference only; never part of this repo.
+/reference
+
+.DS_Store
