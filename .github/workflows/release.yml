@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (must already exist)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset: herdr-portfwd-linux-x86_64
+          - os: ubuntu-24.04-arm
+            asset: herdr-portfwd-linux-aarch64
+          - os: macos-15-intel
+            asset: herdr-portfwd-darwin-x86_64
+          - os: macos-15
+            asset: herdr-portfwd-darwin-aarch64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Stage asset
+        run: |
+          mkdir -p dist
+          cp target/release/herdr-portfwd "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v5
+        with:
+          path: staging
+          merge-multiple: true
+      - name: Verify the tag matches the crate version
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$tag" != "v$crate" ]; then
+            echo "tag $tag does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+      - name: Checksums
+        working-directory: staging
+        run: |
+          sha256sum herdr-portfwd-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: staging/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,67 @@
+name: Bug report
+description: Something does not work the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check existing issues first. The fields below are what triage
+        actually needs — a report without them usually cannot be acted on.
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: Current behavior, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The shortest exact steps that reproduce it.
+      placeholder: |
+        1. herdr-portfwd attach buildbox
+        2. In the remote pane, run `python3 -m http.server 8000`
+        3. Ctrl+click http://localhost:8000
+        4. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which mode
+      description: This decides where the plugin runs, and is usually the first thing that matters.
+      options:
+        - herdr-mirror (Herdr server is local)
+        - herdr --remote (Herdr server is remote)
+        - SSH in, then run herdr there
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: "`herdr --version` on both ends, and `herdr-portfwd --version`."
+      placeholder: "local herdr 0.8.0, remote herdr 0.8.0, herdr-portfwd 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platforms
+    attributes:
+      label: Host OS, both ends
+      placeholder: "local macOS 15 aarch64, remote Ubuntu 24.04 x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Relevant output from `herdr plugin log list --plugin portfwd`. Trim to the smallest useful excerpt."
+      render: text
