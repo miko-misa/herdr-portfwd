@@ -9,8 +9,17 @@ on:
         description: Tag to build (must already exist)
         required: true
 
+# Only the publish job writes, and it raises its own. The build and verify jobs
+# compile a checkout and need nothing but read access.
 permissions:
-  contents: write
+  contents: read
+
+# Two runs for one tag would race each other's `--clobber` uploads and could
+# leave the release holding a mix of both. Queue them instead of cancelling:
+# a cancelled run can stop between uploading and publishing.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,10 +57,67 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  # What the tag asserts, checked before anything reaches a release page.
+  #
+  # Three versions have to agree, not two: `herdr plugin install` resolves the
+  # release assets from the *crate* version, while Herdr reads the plugin
+  # manifest's, so a pair that disagrees installs a plugin reporting a version
+  # whose assets do not exist. CI's `manifest` job pins the two files to each
+  # other on every push; only a tag can disagree with both.
+  #
+  # The tests run here rather than only on `main` because a tag can point at any
+  # commit — one pushed straight to a branch CI never ran on, one
+  # workflow_dispatch reaches for months later. Whatever `build` is about to
+  # compile into four binaries is what gets tested.
+  #
+  # Beside `build` rather than after it: a mismatch or a failing test then
+  # reports in a couple of minutes instead of after four release builds.
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Tag, Cargo.toml and herdr-plugin.toml all name the same version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          plugin="$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml | head -1)"
+          if [ -z "$crate" ]; then
+            echo "cannot read version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ -z "$plugin" ]; then
+            echo "cannot read version from herdr-plugin.toml" >&2
+            exit 1
+          fi
+          if [ "$TAG" != "v$crate" ] || [ "$TAG" != "v$plugin" ]; then
+            echo "version mismatch: tag=$TAG Cargo.toml=$crate herdr-plugin.toml=$plugin" >&2
+            exit 1
+          fi
+          echo "ok: $TAG"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features --locked
+
   publish:
     name: publish release
-    needs: build
+    needs: [build, verify]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      # The exact names scripts/install.sh looks up in SHA256SUMS. Renaming one
+      # breaks every existing install, so they are spelled out rather than
+      # globbed: a glob would happily ship three assets, or a stray file.
+      ASSETS: >-
+        herdr-portfwd-linux-x86_64
+        herdr-portfwd-linux-aarch64
+        herdr-portfwd-darwin-x86_64
+        herdr-portfwd-darwin-aarch64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -60,24 +126,19 @@ jobs:
         with:
           path: staging
           merge-multiple: true
-      - name: Verify the tag matches the crate version
-        env:
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: |
-          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$TAG" != "v$crate" ]; then
-            echo "tag $TAG does not match Cargo.toml version $crate" >&2
-            exit 1
-          fi
       - name: Checksums
         working-directory: staging
         run: |
+          set -euo pipefail
           # scripts/install.sh looks each asset up in this file by name, so a
           # release missing one has to fail here rather than ship incomplete.
-          test "$(ls herdr-portfwd-* | wc -l)" -eq 4 || {
-            echo "expected 4 platform assets, found:" >&2; ls >&2; exit 1
-          }
-          sha256sum herdr-portfwd-* > SHA256SUMS
+          for asset in $ASSETS; do
+            test -f "$asset" || {
+              echo "missing platform asset: $asset" >&2; ls >&2; exit 1
+            }
+          done
+          # shellcheck disable=SC2086 # deliberate word split over the name list
+          sha256sum $ASSETS > SHA256SUMS
           cat SHA256SUMS
       # `gh` is preinstalled on the runner, so the release path carries no
       # third-party action and nothing to keep pinned.
@@ -86,8 +147,51 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" staging/* --clobber
+          set -euo pipefail
+          files=()
+          for asset in $ASSETS; do files+=("staging/$asset"); done
+          files+=(staging/SHA256SUMS)
+
+          if draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            echo "release $TAG already exists; replacing its assets"
+            gh release upload "$TAG" "${files[@]}" --clobber
+            if [ "$draft" = true ]; then
+              # A draft satisfies `gh release view`, but its assets are not
+              # served from the public /releases/download/<tag>/ URL that
+              # scripts/install.sh fetches. Uploading into one and stopping
+              # reports success here and 404s for every user, so finish the job
+              # the tag asked for and publish it.
+              echo "release $TAG was a draft; publishing it"
+              gh release edit "$TAG" --draft=false
+            fi
           else
-            gh release create "$TAG" staging/* --title "$TAG" --generate-notes
+            # --verify-tag: never invent a tag. Without it, a typo in the
+            # workflow_dispatch input would tag the default branch and release
+            # whatever happened to be on it.
+            gh release create "$TAG" "${files[@]}" \
+              --title "$TAG" --generate-notes --verify-tag
           fi
+      - name: Verify the release is downloadable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Everything above can succeed while the assets stay unreachable, and
+          # the first person to find out would be a user running
+          # `herdr plugin install`. Check what the release actually looks like.
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != false ]; then
+            echo "release $TAG is still a draft; install.sh would 404" >&2
+            exit 1
+          fi
+          uploaded="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          missing=""
+          for asset in $ASSETS SHA256SUMS; do
+            printf '%s\n' "$uploaded" | grep -qxF "$asset" || missing="$missing $asset"
+          done
+          if [ -n "$missing" ]; then
+            echo "release $TAG is missing:$missing" >&2
+            exit 1
+          fi
+          echo "release $TAG is published with:"
+          printf '%s\n' "$uploaded"

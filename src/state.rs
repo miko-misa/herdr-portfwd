@@ -1,9 +1,10 @@
 //! Durable record of which forwards should exist.
 //!
-//! Lives under `HERDR_PLUGIN_STATE_DIR` when Herdr provides one, and under
-//! `$XDG_STATE_HOME/herdr-portfwd` otherwise, so the CLI and the plugin agree
-//! on one file. Control sockets deliberately do *not* live here: see
-//! [`crate::ssh::control_socket_path`].
+//! Lives under `$XDG_STATE_HOME/herdr-portfwd`, falling back to
+//! `~/.local/state/herdr-portfwd` — the same directory, chosen by the same
+//! rule, that [`crate::ssh::control_socket_dir`] puts control sockets in. See
+//! [`state_dir_from`] for why `HERDR_PLUGIN_STATE_DIR` is deliberately not
+//! consulted.
 //!
 //! Concurrency is real. A `[[startup]]` hook, an event hook, an action, and the
 //! local agent can all write at once. Every mutation is lock, read, mutate,
@@ -46,10 +47,7 @@ pub enum StateError {
     },
     #[error("could not encode {0} as JSON")]
     Encode(&'static str),
-    #[error(
-        "no directory to keep {file} in: set HERDR_PLUGIN_STATE_DIR, \
-         XDG_STATE_HOME or HOME"
-    )]
+    #[error("no directory to keep {file} in: set XDG_STATE_HOME or HOME")]
     NoStateDir { file: &'static str },
     #[error(
         "{path} is not usable as a state directory: {why}. Refusing to keep \
@@ -72,16 +70,29 @@ pub fn stderr_reporter() -> Reporter {
 
 /// Directory holding this plugin's durable files.
 pub fn state_dir(file: &'static str) -> Result<PathBuf> {
-    state_dir_from(
-        env::var_os("HERDR_PLUGIN_STATE_DIR"),
-        env::var_os("XDG_STATE_HOME"),
-        env::var_os("HOME"),
-    )
-    .ok_or(StateError::NoStateDir { file })
+    state_dir_from(env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))
+        .ok_or(StateError::NoStateDir { file })
 }
 
 /// Resolution rule behind [`state_dir`], separated so it is testable without
 /// mutating the process-global environment.
+///
+/// # Why `HERDR_PLUGIN_STATE_DIR` is not consulted
+///
+/// Herdr injects that variable for plugin *commands* and for nothing else, so
+/// obeying it splits this tool's records in two along a line the user cannot
+/// see: a forward created by a keybinding went into Herdr's per-plugin
+/// directory, and the `herdr-portfwd status` they ran in a shell a second later
+/// read `$XDG_STATE_HOME/herdr-portfwd` and reported no forwards at all, while
+/// the ports were open. `stop` could not stop what it could not see, and the
+/// README's whole Troubleshooting section rests on those two commands.
+///
+/// The control socket already refuses that variable ([`crate::ssh`]), so the
+/// *live* master is shared between the two halves whatever the records say —
+/// which is precisely what makes the split a lie rather than a separation.
+/// Following Herdr's per-plugin-state convention is worth less here than both
+/// halves naming one file, so the socket's rule wins and the records land beside
+/// the socket that carries them.
 ///
 /// `None` rather than a fixed path when nothing points anywhere: there is no
 /// safe fallback. `/tmp/herdr-portfwd` would be a predictable name in a
@@ -89,14 +100,7 @@ pub fn state_dir(file: &'static str) -> Result<PathBuf> {
 /// read forwards out of, plant requests in, or leave a symlink in the way of.
 /// A process launched with no `HOME` — a system-level launchd or systemd unit —
 /// is told to configure one instead.
-pub fn state_dir_from(
-    plugin_state_dir: Option<OsString>,
-    xdg_state_home: Option<OsString>,
-    home: Option<OsString>,
-) -> Option<PathBuf> {
-    if let Some(dir) = non_empty(plugin_state_dir) {
-        return Some(dir);
-    }
+pub fn state_dir_from(xdg_state_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
     if let Some(dir) = non_empty(xdg_state_home) {
         return Some(dir.join("herdr-portfwd"));
     }
@@ -795,23 +799,32 @@ mod tests {
     }
 
     #[test]
-    fn state_dir_prefers_the_directory_herdr_injected() {
-        let dir = state_dir_from(
-            Some("/plugin/state".into()),
-            Some("/xdg".into()),
-            Some("/home/u".into()),
-        );
-        assert_eq!(dir, Some(PathBuf::from("/plugin/state")));
+    fn the_state_directory_is_the_one_the_control_socket_already_uses() {
+        // Records and the master that carries them have to be findable by one
+        // rule, or `status` reports no forwards while the ports are open.
+        for (xdg, home) in [
+            (Some("/xdg"), Some("/home/u")),
+            (Some("/xdg"), None),
+            (None, Some("/home/u")),
+        ] {
+            let xdg = xdg.map(OsString::from);
+            let home = home.map(OsString::from);
+            assert_eq!(
+                state_dir_from(xdg.clone(), home.clone()),
+                crate::ssh::control_socket_dir_from(xdg, home),
+                "the two halves of this tool must agree on one directory"
+            );
+        }
     }
 
     #[test]
     fn state_dir_falls_back_through_xdg_then_home() {
         assert_eq!(
-            state_dir_from(None, Some("/xdg".into()), Some("/home/u".into())),
+            state_dir_from(Some("/xdg".into()), Some("/home/u".into())),
             Some(PathBuf::from("/xdg/herdr-portfwd"))
         );
         assert_eq!(
-            state_dir_from(None, None, Some("/home/u".into())),
+            state_dir_from(None, Some("/home/u".into())),
             Some(PathBuf::from("/home/u/.local/state/herdr-portfwd"))
         );
     }
@@ -821,8 +834,8 @@ mod tests {
         // A fixed path in a world-writable directory is one another local user
         // can create first, and then plant requests in or read forwards out of.
         // A daemon started without HOME is told to configure one.
-        assert_eq!(state_dir_from(None, None, None), None);
-        assert_eq!(state_dir_from(Some("".into()), Some("".into()), None), None);
+        assert_eq!(state_dir_from(None, None), None);
+        assert_eq!(state_dir_from(Some("".into()), None), None);
     }
 
     #[test]
@@ -830,7 +843,7 @@ mod tests {
         // Herdr exports the variable even in contexts where it has nothing to
         // put in it; an empty string must not become the state directory.
         assert_eq!(
-            state_dir_from(Some("".into()), Some("".into()), Some("/home/u".into())),
+            state_dir_from(Some("".into()), Some("/home/u".into())),
             Some(PathBuf::from("/home/u/.local/state/herdr-portfwd"))
         );
     }
@@ -866,8 +879,8 @@ mod tests {
 
     #[test]
     fn a_directory_belonging_to_another_user_is_refused() {
-        // `HERDR_PLUGIN_STATE_DIR`, or an XDG variable, pointing at somebody
-        // else's directory. A 0755 directory trips neither mode check, so the
+        // An XDG variable, or a `HOME`, pointing at somebody else's
+        // directory. A 0755 directory trips neither mode check, so the
         // ownership test is the only guard: without it, that user's
         // `forwards.json` and `requests.json` decide which ports this machine
         // opens and which requests the agent applies.

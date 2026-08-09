@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::actions::{parse_loopback_url, LocalPorts, SystemOpener, SystemPorts, UrlOpener};
 use crate::config::Settings;
 use crate::discover;
 use crate::herdr::{HerdrClient, Notification};
@@ -243,11 +244,19 @@ pub struct RemoteRequests<S> {
 
 /// Leaves the remote plugin state directory in `$p`, or `$p` empty.
 ///
-/// The candidate list follows Herdr's own rule for a plugin state directory —
-/// `<state>/plugins/<id>` under `XDG_STATE_HOME` or `~/.local/state` — plus the
-/// debug-build directory name and this plugin's own XDG directory for a plugin
-/// that was run outside Herdr. A directory only counts when the request file is
-/// in it, so the mark is always written beside the requests it settles.
+/// First candidate is the one [`crate::state::state_dir_from`] resolves, since
+/// that is the only place this version of the plugin writes — records and the
+/// control socket share one directory precisely so both halves of the tool can
+/// find them by one rule.
+///
+/// The rest are kept for version skew, which is real here: the agent is
+/// installed on the user's machine and the plugin on the remote, and they are
+/// updated separately. A remote still running a plugin that obeyed
+/// `HERDR_PLUGIN_STATE_DIR` — Herdr's `<state>/plugins/<id>` under
+/// `XDG_STATE_HOME` or `~/.local/state`, or the debug-build name — is still
+/// reachable. A directory only counts when the request file is in it, so an
+/// empty leftover never shadows the live one and the mark is always written
+/// beside the requests it settles.
 ///
 /// A macro rather than a `const` because `concat!` only joins literals, and the
 /// three snippets below must share one copy of this list.
@@ -255,10 +264,10 @@ macro_rules! remote_state_dir {
     () => {
         concat!(
             "p=''; for d in ",
+            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-portfwd\" ",
             "\"${HERDR_PLUGIN_STATE_DIR:-}\" ",
             "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/portfwd\" ",
-            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-dev/plugins/portfwd\" ",
-            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-portfwd\"",
+            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-dev/plugins/portfwd\"",
             "; do if [ -n \"$d\" ] && [ -f \"$d/requests.json\" ]; then p=\"$d\"; break; fi;",
             " done; "
         )
@@ -413,10 +422,26 @@ struct AgentState {
     /// has nothing to do with what is listening on the far side, and forgetting
     /// it would produce the notification per poll this set exists to prevent.
     reported: HashSet<u16>,
+    /// Requests whose URL has already been handed to a browser, so one the
+    /// agent meets twice — a request the mark has not settled yet because an
+    /// earlier one is still failing — does not become two windows.
+    ///
+    /// Keyed by request id and deliberately not by the URL. A second Ctrl+click
+    /// on the same URL, after the user closed the tab, is a *new* request with a
+    /// new id, and it asks for a window as much as the first one did; keying
+    /// this by the string swallowed it for the life of the agent. Bounded, and
+    /// it has to be: the ids come off requests written on the far side, so an
+    /// unbounded set is memory a compromised remote can grow for free. Past the
+    /// cap the oldest is forgotten, which at worst costs a duplicate window for
+    /// a request nobody has met in a while.
+    opened: Vec<u64>,
     /// Consecutive failing passes, the exponent behind [`Agent::delay`].
     failures: u32,
     probe: Probe,
 }
+
+/// How many opened requests [`AgentState::opened`] remembers.
+const MAX_REMEMBERED_OPENS: usize = 64;
 
 /// Everything the agent needs that is not a trait.
 #[derive(Debug, Clone)]
@@ -454,6 +479,9 @@ pub struct StepReport {
     pub auto: Vec<u16>,
     /// Ports offered through a notification (L2). Never forwarded here.
     pub offered: Vec<u16>,
+    /// URLs handed to a browser on this machine, after their forward was in
+    /// place.
+    pub opened: Vec<String>,
     /// Requests that timed out before anyone applied them.
     pub expired: Vec<u16>,
     pub errors: Vec<String>,
@@ -492,6 +520,18 @@ pub struct Agent<S, H, R, C> {
     store: Store,
     config: AgentConfig,
     reporter: Reporter,
+    /// Where a URL a request asked for goes. This agent is the half of the tool
+    /// that runs on the machine with the browser, so it is the only place a
+    /// Ctrl+click under `herdr --remote` can be honoured — and a trait object
+    /// rather than a fifth type parameter because every existing caller and
+    /// test names the other four, and a test must never launch a browser.
+    opener: Box<dyn UrlOpener>,
+    /// Whether a local port is bound here. A record is not a forward: one left
+    /// by a master that has gone says a port is forwarded when nothing is
+    /// listening on it, and this is how the agent tells the two apart. The same
+    /// seam `Actions` asks the same question through, for the same reason — the
+    /// real implementation binds a socket and a test must not.
+    ports: Box<dyn LocalPorts>,
     shutdown: Arc<AtomicBool>,
     state: AgentState,
 }
@@ -512,6 +552,8 @@ where
             store,
             config,
             reporter: stderr_reporter(),
+            opener: Box::new(SystemOpener),
+            ports: Box::new(SystemPorts),
             shutdown: Arc::new(AtomicBool::new(false)),
             state: AgentState::default(),
         }
@@ -519,6 +561,20 @@ where
 
     pub fn with_reporter(mut self, reporter: Reporter) -> Self {
         self.reporter = reporter;
+        self
+    }
+
+    /// Replace the desktop opener. Tests install one that records instead of
+    /// launching anything.
+    pub fn with_opener(mut self, opener: Box<dyn UrlOpener>) -> Self {
+        self.opener = opener;
+        self
+    }
+
+    /// Replace the local-port probe. Tests install one that answers from their
+    /// fake master's own bindings, so no socket is ever bound.
+    pub fn with_ports(mut self, ports: Box<dyn LocalPorts>) -> Self {
+        self.ports = ports;
         self
     }
 
@@ -733,19 +789,39 @@ where
                 if existing.spec.remote_port == spec.remote_port
                     && existing.spec.remote_bind == spec.remote_bind =>
             {
-                // The port is already forwarded, but the request may still say
-                // something the record does not: an explicit `add` over a
-                // forward this agent opened on its own is the user pinning it,
-                // and a record that goes on saying otherwise loses the port
-                // when the pane that happened to open it exits.
-                if let Some(promoted) = crate::state::promoted(&existing, &spec) {
-                    if let Err(err) = self.store.upsert(promoted) {
-                        report.errors.push(err.to_string());
-                        return false;
+                // A record is not a forward. One over a local port nothing is
+                // listening on is stale by definition — the master it lived on
+                // went away, or it was cancelled behind the tool's back — and
+                // invariant 3 says it must not shadow the port. Believing it
+                // here settles the request with no tunnel behind it and, worse,
+                // hands the browser a URL over a dead port. So the record only
+                // answers the request while the port it claims is really bound;
+                // otherwise this falls through and the forward is made below,
+                // exactly as `Actions::apply_or_request_opening` treats a record
+                // over a free port on this side.
+                if self.ports.in_use(spec.local_port) {
+                    // The port is already forwarded, but the request may still
+                    // say something the record does not: an explicit `add` over
+                    // a forward this agent opened on its own is the user pinning
+                    // it, and a record that goes on saying otherwise loses the
+                    // port when the pane that happened to open it exits.
+                    if let Some(promoted) = crate::state::promoted(&existing, &spec) {
+                        if let Err(err) = self.store.upsert(promoted) {
+                            report.errors.push(err.to_string());
+                            return false;
+                        }
                     }
+                    self.state.handled.insert(spec.remote_port);
+                    // The forward this request asked for is in place — made by
+                    // this agent on this master, whether a moment ago or on an
+                    // earlier pass — so the click that carried the URL has been
+                    // honoured and the browser can have it. Not opening here
+                    // would leave the second Ctrl+click on a port that is
+                    // already forwarded doing nothing at all, which is the bug
+                    // this whole path exists for.
+                    self.open_requested_url(request, &spec, report);
+                    return true;
                 }
-                self.state.handled.insert(spec.remote_port);
-                return true;
             }
             Ok(Some(existing)) => {
                 // Someone else's port. Told to the user and left unsettled, so
@@ -773,6 +849,7 @@ where
                 report.applied.push(spec.local_port);
                 self.state.handled.insert(spec.remote_port);
                 self.state.reported.remove(&spec.local_port);
+                self.open_requested_url(request, &spec, report);
                 true
             }
             Err(problem) => {
@@ -781,6 +858,76 @@ where
                 false
             }
         }
+    }
+
+    /// Hand the URL a request carried to a browser on this machine, now that
+    /// its forward is live.
+    ///
+    /// Called only where the request was settled as *applied*: a request this
+    /// agent skipped as somebody else's, expired, or could not apply has no
+    /// forward behind it, and a URL pointing at a port nothing is listening on
+    /// is a browser error page the user did not ask for. A record claiming the
+    /// port is not enough either — both callers have established that the
+    /// forward is really live before they get here.
+    ///
+    /// Nothing about the string is trusted. It was written by a plugin on the
+    /// remote host, into a file on the remote host, and read back over `ssh`, so
+    /// it is re-parsed here by the same loopback validator the plugin used and
+    /// then has to name the very local port this agent bound. That is invariant
+    /// 11's reasoning at the other end of the click: a remote decides *that* a
+    /// forward is wanted, never where it goes — and never, through a URL, what
+    /// this machine's browser visits. What reaches the opener is finally
+    /// re-rendered from the validated parts rather than passed through, and goes
+    /// as one argv word (invariant 9).
+    fn open_requested_url(
+        &mut self,
+        request: &Request,
+        spec: &ForwardSpec,
+        report: &mut StepReport,
+    ) {
+        let Some(raw) = request.open_url.as_deref() else {
+            return;
+        };
+        let parsed = match parse_loopback_url(raw) {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                report.errors.push(format!(
+                    "request {} carried a URL this machine will not open: {why}",
+                    request.id
+                ));
+                return;
+            }
+        };
+        if parsed.port != spec.local_port {
+            report.errors.push(format!(
+                "request {} forwarded local port {} but asked to open port {}; \
+                 not opening it",
+                request.id, spec.local_port, parsed.port
+            ));
+            return;
+        }
+        let url = parsed.with_port(spec.local_port);
+        // Once per *request*, not once per URL. The queue is re-read whole on
+        // every pass and a request the mark has not settled yet — one held
+        // behind an earlier request that keeps failing — comes back with it, so
+        // without this a single click becomes a window a poll. A later request
+        // carrying the same URL is a later click, and gets its own window.
+        if self.state.opened.contains(&request.id) {
+            return;
+        }
+        if let Err(problem) = self.opener.open(&url) {
+            // Not recorded as opened: nothing was, and the next pass over this
+            // request deserves another try.
+            report
+                .errors
+                .push(format!("could not open {url}: {problem}"));
+            return;
+        }
+        if self.state.opened.len() >= MAX_REMEMBERED_OPENS {
+            self.state.opened.remove(0);
+        }
+        self.state.opened.push(request.id);
+        report.opened.push(url);
     }
 
     /// A request names the host it is for. The remote plugin's name for the
@@ -1643,6 +1790,10 @@ mod tests {
         ensured: Vec<String>,
         forwards: Vec<String>,
         cancels: Vec<String>,
+        /// Local ports this master currently holds. A real `ssh -L` binds the
+        /// port, so the fake master is also where a local-port probe gets its
+        /// answer; nothing in the suite may bind a socket for real.
+        bound: HashSet<u16>,
         exits: usize,
         execs: Vec<String>,
         responses: HashMap<String, std::result::Result<String, String>>,
@@ -1660,6 +1811,7 @@ mod tests {
                 ensured: Vec::new(),
                 forwards: Vec::new(),
                 cancels: Vec::new(),
+                bound: HashSet::new(),
                 exits: 0,
                 execs: Vec::new(),
                 responses: HashMap::new(),
@@ -1687,6 +1839,23 @@ mod tests {
             self.lock()
                 .responses
                 .insert(command.to_string(), Err(why.to_string()));
+        }
+
+        /// Hold a local port without a forward having been asked for here: what
+        /// a test seeding a record of a forward that really is live needs, since
+        /// the probe answers from this master's own bindings.
+        fn bind(&self, port: u16) {
+            self.lock().bound.insert(port);
+        }
+    }
+
+    /// The probe the agent asks whether a local port is bound. Answering from
+    /// the fake master keeps the two in step: a forward binds its local port and
+    /// a cancel releases it, so a record with no forward behind it — the stale
+    /// record invariant 3 is about — is exactly a record over a free port.
+    impl LocalPorts for FakeSsh {
+        fn in_use(&self, port: u16) -> bool {
+            self.lock().bound.contains(&port)
         }
     }
 
@@ -1719,6 +1888,7 @@ mod tests {
                 Some(why) => Err(ssh_failure("forward", &why)),
                 None => {
                     state.forwards.push(spec.forward_arg());
+                    state.bound.insert(spec.local_port);
                     Ok(())
                 }
             }
@@ -1735,6 +1905,7 @@ mod tests {
                 Some(why) => Err(ssh_failure("cancel", &why)),
                 None => {
                     state.cancels.push(spec.forward_arg());
+                    state.bound.remove(&spec.local_port);
                     Ok(())
                 }
             }
@@ -1957,6 +2128,37 @@ mod tests {
         }
     }
 
+    /// A desktop opener that records instead of launching a browser. No test
+    /// may ever put a window in front of whoever is running the suite.
+    #[derive(Clone, Default)]
+    struct FakeOpener {
+        opened: Arc<Mutex<Vec<String>>>,
+        error: Arc<Mutex<Option<String>>>,
+    }
+
+    impl FakeOpener {
+        fn opened(&self) -> Vec<String> {
+            self.opened.lock().expect("opened urls").clone()
+        }
+
+        fn refuse(&self, why: &str) {
+            *self.error.lock().expect("opener error") = Some(why.to_string());
+        }
+    }
+
+    impl UrlOpener for FakeOpener {
+        fn open(&self, url: &str) -> std::result::Result<(), String> {
+            if let Some(why) = self.error.lock().expect("opener error").clone() {
+                return Err(why);
+            }
+            self.opened
+                .lock()
+                .expect("opened urls")
+                .push(url.to_string());
+            Ok(())
+        }
+    }
+
     fn recorder() -> (Arc<Mutex<Vec<String>>>, Reporter) {
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&log);
@@ -2016,6 +2218,7 @@ mod tests {
         clock: FakeClock,
         warnings: Arc<Mutex<Vec<String>>>,
         reporter: Reporter,
+        opener: FakeOpener,
         config: AgentConfig,
         agent: Agent<FakeSsh, FakeHerdr, FakeRequests, FakeClock>,
         store: Store,
@@ -2043,6 +2246,7 @@ mod tests {
             let requests = FakeRequests::default();
             let clock = FakeClock::default();
             let (warnings, reporter) = recorder();
+            let opener = FakeOpener::default();
             let mut config = AgentConfig::new(host(), dir.path().join("buildbox.ctl"));
             config.settings = settings;
             let agent = Agent::new(
@@ -2053,7 +2257,9 @@ mod tests {
                 Store::open(dir.path()).expect("store"),
                 config.clone(),
             )
-            .with_reporter(Arc::clone(&reporter));
+            .with_reporter(Arc::clone(&reporter))
+            .with_opener(Box::new(opener.clone()))
+            .with_ports(Box::new(ssh.clone()));
             Self {
                 store: Store::open(dir.path()).expect("second store handle"),
                 ssh,
@@ -2062,6 +2268,7 @@ mod tests {
                 clock,
                 warnings,
                 reporter,
+                opener,
                 config,
                 agent,
                 dir,
@@ -2080,7 +2287,9 @@ mod tests {
                 Store::open(self.dir.path()).expect("store"),
                 self.config.clone(),
             )
-            .with_reporter(Arc::clone(&self.reporter));
+            .with_reporter(Arc::clone(&self.reporter))
+            .with_opener(Box::new(self.opener.clone()))
+            .with_ports(Box::new(self.ssh.clone()));
         }
 
         /// Answer every discovery command with a single node listener.
@@ -2111,6 +2320,304 @@ mod tests {
         assert_eq!(second.applied, Vec::<u16>::new());
         assert_eq!(h.ssh.lock().forwards, vec!["localhost:5173:127.0.0.1:5173"]);
         assert_eq!(h.requests.lock().reads, 2, "the log really was read twice");
+    }
+
+    // -- the clicked URL ---------------------------------------------------
+    //
+    // Under `herdr --remote` the plugin that handles a Ctrl+click runs on the
+    // remote host and the browser is here. The plugin told the user the URL
+    // "opens once the local agent applies the forward" and then nobody opened
+    // anything, because the opener was wired only into the process the plugin
+    // runs in. It has to be wired here, where the browser is.
+
+    fn clicked(id: u64, port: u16, url: &str) -> Request {
+        request(id, port).opening(Some(url.to_string()))
+    }
+
+    #[test]
+    fn a_ctrl_click_on_the_remote_opens_a_browser_on_this_machine() {
+        let mut h = Harness::new();
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:5173/app?x=1")]);
+
+        let report = h.agent.step();
+
+        assert_eq!(report.applied, vec![5173], "the forward comes first");
+        assert_eq!(
+            h.opener.opened(),
+            vec!["http://localhost:5173/app?x=1".to_string()],
+            "the click reached no browser: {:?}",
+            report.errors
+        );
+        assert_eq!(report.opened, vec!["http://localhost:5173/app?x=1"]);
+    }
+
+    #[test]
+    fn a_request_that_carries_no_url_opens_nothing() {
+        // `add 5173` from the remote is not a click, and must not put a window
+        // in front of anybody.
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173)]);
+        h.agent.step();
+        assert!(h.opener.opened().is_empty());
+    }
+
+    #[test]
+    fn one_click_opens_one_window() {
+        // The same request comes back on every poll until the mark settles it,
+        // and the mark cannot advance past a request that is still failing. So
+        // the agent meets this click again on every pass while 3000 keeps
+        // colliding, and one click may not become a window a poll.
+        let mut h = Harness::new();
+        // A forward of remote 9000 that landed on local 3000. The request for
+        // remote 3000 collides with it, so it can never be applied and never
+        // settles, and the mark stays behind the click that follows it.
+        h.store
+            .upsert(Forward {
+                spec: ForwardSpec {
+                    remote_port: 9000,
+                    local_port: 3000,
+                    ..spec(3000)
+                },
+                created_unix_ms: 1,
+            })
+            .expect("seed the forward local 3000 already belongs to");
+        h.ssh.bind(3000);
+        h.requests.set(vec![
+            request(1, 3000),
+            clicked(2, 5173, "http://localhost:5173/"),
+        ]);
+
+        h.agent.step();
+        h.agent.step();
+        h.agent.step();
+
+        assert!(
+            h.requests.settled().is_empty(),
+            "the click is met again every pass, which is the point of this test"
+        );
+        assert_eq!(h.opener.opened().len(), 1, "{:?}", h.opener.opened());
+    }
+
+    #[test]
+    fn a_second_click_on_a_url_already_opened_opens_it_again() {
+        // The user closed the tab and Ctrl+clicked the same URL again. That is a
+        // new request, with a new id, asking for a window as much as the first
+        // one did. Remembering URL strings for the life of the agent swallowed
+        // it and left the click doing nothing at all.
+        let mut h = Harness::new();
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:5173/app")]);
+        h.agent.step();
+
+        h.requests
+            .set(vec![clicked(2, 5173, "http://localhost:5173/app")]);
+        let report = h.agent.step();
+
+        assert!(report.applied.is_empty(), "the forward is already there");
+        assert_eq!(
+            h.opener.opened(),
+            vec![
+                "http://localhost:5173/app".to_string(),
+                "http://localhost:5173/app".to_string()
+            ],
+            "the second click reached no browser: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_url_this_machine_would_not_forward_is_not_a_url_it_will_open() {
+        // The string arrived in a file on the remote, so the manifest pattern
+        // that first matched it is on the wrong side of the trust boundary. The
+        // agent re-validates rather than believing the record — invariant 11's
+        // reasoning at the other end of the click.
+        let mut h = Harness::new();
+        h.requests.set(vec![
+            clicked(1, 5173, "http://evil.example.com:5173/"),
+            clicked(2, 3000, "file:///etc/passwd"),
+            clicked(3, 8080, "http://localhost:8080@evil.example.com/"),
+            clicked(4, 9000, "http://127.0.0.2:9000/"),
+        ]);
+
+        let report = h.agent.step();
+
+        assert!(
+            h.opener.opened().is_empty(),
+            "a remote pointed this machine's browser somewhere: {:?}",
+            h.opener.opened()
+        );
+        assert_eq!(
+            report.applied,
+            vec![5173, 3000, 8080, 9000],
+            "the forward the user asked for still happens"
+        );
+        assert_eq!(report.errors.len(), 4, "each refusal is said out loud");
+    }
+
+    #[test]
+    fn a_url_naming_a_port_other_than_the_one_that_was_forwarded_is_refused() {
+        // Loopback, so the validator passes it — and pointed at whatever else
+        // this machine happens to have listening. Only the port this pass
+        // actually bound is opened.
+        let mut h = Harness::new();
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:22/")]);
+
+        let report = h.agent.step();
+
+        assert!(h.opener.opened().is_empty());
+        assert_eq!(report.applied, vec![5173]);
+        assert!(
+            report.errors.iter().any(|e| e.contains("22")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_url_on_a_request_that_was_never_applied_is_never_opened() {
+        // Expired, and somebody else's. Neither has a forward behind it, so the
+        // URL would resolve to whatever else holds that port here.
+        let mut h = Harness::new();
+        let mut expired = clicked(1, 5173, "http://localhost:5173/");
+        expired.created_unix_ms = 0;
+        let mut elsewhere = clicked(2, 3000, "http://localhost:3000/");
+        elsewhere.host = "another-host".to_string();
+        h.requests.set(vec![expired, elsewhere]);
+        h.clock.set_now(DEFAULT_TTL_MS + 10);
+
+        let report = h.agent.step();
+
+        assert_eq!(report.expired, vec![5173]);
+        assert!(report.applied.is_empty());
+        assert!(h.opener.opened().is_empty());
+    }
+
+    #[test]
+    fn a_url_whose_forward_failed_is_not_opened_either() {
+        let mut h = Harness::new();
+        h.ssh.lock().forward_error = Some("port already bound".to_string());
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:5173/")]);
+
+        let report = h.agent.step();
+
+        assert!(report.applied.is_empty());
+        assert!(h.opener.opened().is_empty());
+    }
+
+    #[test]
+    fn a_second_click_on_a_port_that_is_already_forwarded_still_opens_it() {
+        // The record answers the request, so no new forward is made — but the
+        // user clicked, and the port they clicked is forwarded. Doing nothing
+        // here is the same silence this whole path exists to end.
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173)]);
+        h.agent.step();
+        assert!(h.opener.opened().is_empty());
+
+        h.requests
+            .set(vec![clicked(2, 5173, "http://localhost:5173/app")]);
+        let report = h.agent.step();
+
+        assert!(report.applied.is_empty(), "nothing new was forwarded");
+        assert_eq!(h.opener.opened(), vec!["http://localhost:5173/app"]);
+    }
+
+    /// A record for 5173 with nothing bound behind it: what an agent finds
+    /// after the master its forwards lived on went away, or after one was
+    /// cancelled behind the tool's back. Invariant 3 — a stale record never
+    /// shadows a real port.
+    fn stale_record(h: &Harness) {
+        h.store
+            .upsert(Forward {
+                spec: spec(5173),
+                created_unix_ms: 1,
+            })
+            .expect("seed a record with no forward behind it");
+    }
+
+    #[test]
+    fn a_url_over_a_stale_record_is_not_opened_at_a_port_nothing_is_listening_on() {
+        // The record says the click's port is forwarded and it is not. Believing
+        // it opens a browser on a dead port — an error page the user did not ask
+        // for — and settles the request, so nobody ever forwards it either.
+        let mut h = Harness::new();
+        stale_record(&h);
+        h.ssh.lock().forward_error = Some("cannot listen to port: 5173".to_string());
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:5173/app")]);
+
+        let report = h.agent.step();
+
+        assert!(
+            h.opener.opened().is_empty(),
+            "a browser was pointed at a port with no tunnel behind it: {:?}",
+            h.opener.opened()
+        );
+        assert!(report.applied.is_empty());
+        assert!(
+            h.requests.settled().is_empty(),
+            "a request nobody could apply is not settled"
+        );
+    }
+
+    #[test]
+    fn a_stale_record_is_replaced_by_the_forward_the_click_asked_for() {
+        // The other half: the record is not obeyed, so the request is applied
+        // for real — and only then does the URL reach a browser.
+        let mut h = Harness::new();
+        stale_record(&h);
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:5173/app")]);
+
+        let report = h.agent.step();
+
+        assert_eq!(report.applied, vec![5173], "{:?}", report.errors);
+        assert_eq!(h.ssh.lock().forwards, vec!["localhost:5173:127.0.0.1:5173"]);
+        assert_eq!(h.opener.opened(), vec!["http://localhost:5173/app"]);
+    }
+
+    #[test]
+    fn an_opener_that_refuses_is_reported_rather_than_silently_swallowed() {
+        let mut h = Harness::new();
+        h.opener.refuse("xdg-open exited with 1");
+        h.requests
+            .set(vec![clicked(1, 5173, "http://localhost:5173/")]);
+
+        let report = h.agent.step();
+
+        assert_eq!(report.applied, vec![5173], "the forward is still made");
+        assert!(report.opened.is_empty());
+        assert!(
+            report.errors.iter().any(|e| e.contains("xdg-open")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn only_the_last_urls_are_remembered_so_a_remote_cannot_grow_this_forever() {
+        // The ids come off a file on the far side. Remembering every one would
+        // be memory a compromised remote can grow for free.
+        let mut h = Harness::new();
+        let mut id = 0u64;
+        for n in 0..(MAX_REMEMBERED_OPENS + 8) {
+            id += 1;
+            let port = 20_000 + u16::try_from(n).expect("fits");
+            h.requests.set(vec![clicked(
+                id,
+                port,
+                &format!("http://localhost:{port}/"),
+            )]);
+            h.agent.step();
+        }
+        assert_eq!(
+            h.agent.state.opened.len(),
+            MAX_REMEMBERED_OPENS,
+            "the set of remembered opens is unbounded"
+        );
     }
 
     #[test]
@@ -2297,6 +2804,7 @@ mod tests {
                 created_unix_ms: 1,
             })
             .expect("seed the agent's own forward");
+        h.ssh.bind(5173);
         h.requests.set(vec![request(1, 5173)]);
 
         let report = h.agent.step();
@@ -2327,6 +2835,7 @@ mod tests {
                 created_unix_ms: 1,
             })
             .expect("seed a pinned forward");
+        h.ssh.bind(5173);
         let mut offered = request(1, 5173);
         offered.origin = Origin::Offered;
         h.requests.set(vec![offered]);
@@ -2429,6 +2938,7 @@ mod tests {
                 created_unix_ms: 1,
             })
             .expect("seed a live forward");
+        h.ssh.bind(5173);
         h.requests.set(vec![request(1, 5173)]);
 
         let report = h.agent.step();
@@ -3322,7 +3832,11 @@ mod tests {
     }
 
     #[test]
-    fn the_remote_request_command_prefers_the_directory_herdr_named() {
+    fn the_remote_request_command_prefers_the_directory_this_plugin_writes() {
+        // The others are there for a remote running an older plugin. With a
+        // current one on the far side its own directory has to win, or the
+        // agent polls a file nothing writes any more and every Ctrl+click is
+        // dropped.
         let root = tempfile::tempdir().expect("temp dir");
         let injected = root.path().join("injected");
         let xdg = root.path().join("xdg");
@@ -3339,11 +3853,7 @@ mod tests {
             ("HOME", root.path()),
         ]);
 
-        assert_eq!(
-            stdout.trim(),
-            "{\"pending\":[\"injected\"]}",
-            "the first candidate that exists wins, and Herdr's own is first"
-        );
+        assert_eq!(stdout.trim(), "{\"pending\":[\"own\"]}");
     }
 
     #[test]

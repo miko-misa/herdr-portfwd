@@ -825,8 +825,29 @@ impl Actions<'_> {
         spec: ForwardSpec,
         placement: Where,
     ) -> Result<AddOutcome> {
+        self.apply_or_request_opening(host, spec, placement, None)
+    }
+
+    /// [`Actions::apply_or_request`], with a URL for whoever ends up applying
+    /// the forward to open afterwards.
+    ///
+    /// Only the request path carries it: when the forward is applied here, this
+    /// process is on the machine with the browser and opens the URL itself.
+    /// What the applier is allowed to believe about the string is
+    /// [`Request::open_url`] — nothing, until it has re-validated it.
+    pub fn apply_or_request_opening(
+        &self,
+        host: &Host,
+        spec: ForwardSpec,
+        placement: Where,
+        open_url: Option<&str>,
+    ) -> Result<AddOutcome> {
         if placement.placement == Placement::Remote {
-            let request = self.requests.enqueue(spec.clone(), self.now())?;
+            let request = self.requests.enqueue_opening(
+                spec.clone(),
+                self.now(),
+                open_url.map(str::to_string),
+            )?;
             return Ok(AddOutcome {
                 spec,
                 applied: Applied::Requested,
@@ -924,7 +945,15 @@ impl Actions<'_> {
             origin: Origin::Explicit,
             pane_id: self.env.context.pane_id.clone(),
         };
-        let add = self.apply_or_request(&resolved.host, spec, placement)?;
+        // Re-rendered from the validated parts rather than passed through as
+        // the raw click text, and pinned to the port this request asks for, so
+        // the string that travels is one this process built. The local port
+        // cannot move under a request: `apply_or_request` queues the spec as
+        // written, and only the local branch — which opens the URL here — can
+        // meet a remap at all.
+        let requested_url = parsed.with_port(spec.local_port);
+        let add =
+            self.apply_or_request_opening(&resolved.host, spec, placement, Some(&requested_url))?;
         let local_url = parsed.with_port(add.spec.local_port);
 
         if placement.is_local() {
@@ -2897,6 +2926,51 @@ mod tests {
             "{:?}",
             notes[0]
         );
+
+        // And the promise that notification makes — that the URL opens once the
+        // local agent applies the forward — is carried in the request, because
+        // the agent is the half of this tool on the machine with the browser.
+        // Without it the notification was simply false: nothing ever opened.
+        let pending = harness.requests.pending().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].open_url.as_deref(),
+            Some("http://localhost:5173/"),
+            "the local agent was given nothing to open"
+        );
+    }
+
+    #[test]
+    fn a_request_carries_the_url_re_rendered_rather_than_the_click_text() {
+        // What travels is built from the validated parts, at the port the
+        // request asks for, so the applier's own re-validation is checking a
+        // string this side constructed rather than one it merely copied.
+        let harness = Harness::simple();
+        let mut e = env(vec![host("buildbox", None)]);
+        e.placement = Some(Placement::Remote);
+        harness
+            .actions(e)
+            .open_url(Some("  HTTP://LocalHost:5173/app?x=1#f  "))
+            .expect("open");
+
+        let pending = harness.requests.pending().expect("pending");
+        assert_eq!(
+            pending[0].open_url.as_deref(),
+            Some("http://localhost:5173/app?x=1#f")
+        );
+    }
+
+    #[test]
+    fn an_add_that_nobody_clicked_asks_for_no_browser() {
+        // Only a clicked URL may put a window in front of the user. `add` is a
+        // forward and nothing else.
+        let harness = Harness::simple();
+        let mut e = env(vec![host("buildbox", None)]);
+        e.placement = Some(Placement::Remote);
+        harness.actions(e).add(Some(5173), None).expect("add");
+
+        let pending = harness.requests.pending().expect("pending");
+        assert_eq!(pending[0].open_url, None);
     }
 
     #[test]
