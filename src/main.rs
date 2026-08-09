@@ -343,6 +343,29 @@ fn route<'a>(
     Route::Refuse
 }
 
+/// Where a `scan` invocation goes.
+///
+/// `scan` never names a port, so something is always left to pick and [`route`]
+/// decides it — with one exception. `scan` alone has a complete answer without
+/// asking anybody, and `--json` names a caller that wants exactly that answer
+/// parsed: a pane in front of it would be a screenful of drawing where the
+/// report should be, and there is nobody at that end to drive it anyway.
+///
+/// What this is *not* allowed to do is treat a headless plugin action as a
+/// caller that wants the report. `[[actions]] id = "scan"` is the manifest's
+/// flagship keybinding — "shows attributed listeners and forwards the ones you
+/// pick" — and Herdr runs an action with both streams captured into the plugin
+/// log. Printing the report there told nobody anything: the person who pressed
+/// the key saw no picker, no listeners, and no error. An action's stdout is a
+/// log, not a person, so it asks Herdr for the pane exactly like `add` and
+/// `stop` do.
+fn scan_route<'a>(json: bool, interactive: bool, plugin: &'a PluginInvocation) -> Route<'a> {
+    if json {
+        return Route::Run;
+    }
+    route(interactive, true, plugin)
+}
+
 /// Where a `pane-ui` invocation goes.
 ///
 /// It already names a pane, so nothing is missing — but `pane-ui list` is
@@ -500,13 +523,12 @@ impl Ctx<'_> {
     // -- the actions --------------------------------------------------------
 
     fn scan(&self) -> Result<ExitCode> {
-        // `scan` takes no port, so there is always something left to pick — but
-        // it is also the one command whose headless answer is complete on its
-        // own. A report of every candidate is worth reading in a plugin log, so
-        // only the terminal case draws, and the other two fall through to it
-        // rather than asking Herdr for a pane.
-        if matches!(self.route(true), Route::Pane) {
-            return self.open(Pane::Picker);
+        match scan_route(self.json, self.interactive(), &self.plugin) {
+            Route::Pane => return self.open(Pane::Picker),
+            Route::AskHerdr(plugin_id) => return self.ask_herdr(plugin_id, Pane::Picker),
+            // A shell invocation with nowhere to draw still has a complete
+            // answer to print: unlike `add`, `scan` was not missing anything.
+            Route::Run | Route::Refuse => {}
         }
         let report = self.actions.scan()?;
         self.emit(&report, render_scan)?;
@@ -1871,6 +1893,58 @@ mod tests {
         for interactive in [true, false] {
             assert_eq!(pane_route(interactive, &pane), Route::Pane);
         }
+    }
+
+    #[test]
+    fn the_scan_action_asks_herdr_for_the_picker_instead_of_printing_into_the_log() {
+        // The flagship keybinding. Herdr invokes it as an action, with stdout
+        // and stderr piped into `herdr plugin log list`, so the report it used
+        // to print reached nobody: the user pressed the key and saw nothing at
+        // all. `add` and `stop` already ask; there is no reason `scan` differs,
+        // because an action's stdout is a log and not a person.
+        let action = PluginInvocation {
+            action_id: Some("portfwd.scan".to_string()),
+            ..action_invocation()
+        };
+        for interactive in [true, false] {
+            assert_eq!(
+                scan_route(false, interactive, &action),
+                Route::AskHerdr("portfwd"),
+                "a scan action must open the picker, whatever its streams are"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_still_prints_its_report_for_a_caller_that_can_read_one() {
+        // The two cases the picker would be wrong for: a caller parsing JSON,
+        // and a shell invocation with no Herdr on the other end. Both get the
+        // complete report `scan` can always produce.
+        let shell = PluginInvocation::default();
+        assert_eq!(scan_route(false, false, &shell), Route::Refuse);
+        assert_eq!(
+            scan_route(true, false, &action_invocation()),
+            Route::Run,
+            "--json asked for the report, not for a pane in front of nobody"
+        );
+        assert_eq!(scan_route(true, false, &shell), Route::Run);
+        assert_eq!(
+            scan_route(true, false, &pane_invocation()),
+            Route::Run,
+            "--json outranks every invocation kind: a pane cannot print JSON"
+        );
+    }
+
+    #[test]
+    fn a_person_at_a_terminal_still_gets_the_scan_picker_drawn_here() {
+        let shell = PluginInvocation::default();
+        assert_eq!(scan_route(false, true, &shell), Route::Pane);
+        // And the recursion guard still holds: the picker pane's own `scan`
+        // must not ask for another picker.
+        assert!(!matches!(
+            scan_route(false, false, &pane_invocation()),
+            Route::AskHerdr(_)
+        ));
     }
 
     #[test]

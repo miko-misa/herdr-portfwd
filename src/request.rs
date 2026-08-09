@@ -84,6 +84,27 @@ pub struct Request {
     /// Pane the port was attributed to, when one was.
     #[serde(default)]
     pub pane_id: Option<String>,
+    /// A URL for the *applier* to open once it has made this forward.
+    ///
+    /// Under `herdr --remote` the plugin that handles a Ctrl+click runs on the
+    /// remote host, and the browser is on the machine the local agent runs on.
+    /// Without this the agent had nothing to open and the notification promising
+    /// that the URL "opens once the local agent applies the forward" was simply
+    /// false.
+    ///
+    /// Optional in both directions, which is the forward-compatibility rule this
+    /// module exists for: an agent older than the field ignores it — nothing
+    /// here is `deny_unknown_fields` — and applies the forward exactly as it
+    /// always did rather than refusing to parse the queue; a newer agent reading
+    /// an older writer's record simply has no URL to open. It is never
+    /// serialized when absent, so an older reader's file is byte-identical to
+    /// what it wrote before.
+    ///
+    /// A hint, never an instruction. It crossed a machine boundary in a file
+    /// written on the remote, so the applier re-validates it as loopback and
+    /// against the port it actually bound before any of it reaches a browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_url: Option<String>,
     /// Plugin version that wrote the record.
     #[serde(default)]
     pub plugin_version: String,
@@ -104,7 +125,16 @@ impl Request {
             pane_id: spec.pane_id,
             plugin_version: PLUGIN_VERSION.to_string(),
             created_unix_ms,
+            open_url: None,
         }
+    }
+
+    /// The same request, asking the applier to open `url` once the forward is
+    /// in place. Separate from [`Request::new`] because a forward is the whole
+    /// record and a URL is an extra the applier may ignore.
+    pub fn opening(mut self, url: Option<String>) -> Self {
+        self.open_url = url;
+        self
     }
 
     /// What the apply side actually acts on.
@@ -224,10 +254,22 @@ impl RequestLog {
     /// Queue a request, allocating its id under the same lock that writes it.
     /// Two processes enqueueing at once therefore cannot collide on an id.
     pub fn enqueue(&self, spec: ForwardSpec, created_unix_ms: u64) -> Result<Request> {
+        self.enqueue_opening(spec, created_unix_ms, None)
+    }
+
+    /// Queue a request that also asks the applier to open `open_url` once the
+    /// forward is live. See [`Request::open_url`] for what the applier is
+    /// allowed to believe about it.
+    pub fn enqueue_opening(
+        &self,
+        spec: ForwardSpec,
+        created_unix_ms: u64,
+        open_url: Option<String>,
+    ) -> Result<Request> {
         let mark = self.ack_mark();
         self.file.update(move |queue| {
             settle_to(queue, mark);
-            let request = Request::new(queue.next_id(), created_unix_ms, spec);
+            let request = Request::new(queue.next_id(), created_unix_ms, spec).opening(open_url);
             apply_push(queue, request.clone());
             queue.version = REQUEST_VERSION;
             request
@@ -435,6 +477,63 @@ mod tests {
         assert_eq!(request.plugin_version, "9.9.9");
     }
 
+    /// The other half of forward compatibility, and the reason `open_url` is
+    /// optional: an agent that predates the field must go on applying the
+    /// forward instead of choking on the record that carries it. This is that
+    /// older agent's view, since `Request` is the type it would be using.
+    #[test]
+    fn a_url_from_a_newer_writer_is_ignorable_rather_than_fatal() {
+        let json = r#"{
+          "id": 4,
+          "host": "buildbox",
+          "remote_port": 5173,
+          "local_port": 5173,
+          "origin": "explicit",
+          "created_unix_ms": 1700000000000,
+          "open_url": "http://localhost:5173/app"
+        }"#;
+        let request: Request =
+            serde_json::from_str(json).expect("an added optional field must not be fatal");
+        assert_eq!(request.local_port, 5173, "the forward still parses");
+        assert_eq!(
+            request.open_url.as_deref(),
+            Some("http://localhost:5173/app")
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_url_serializes_exactly_as_it_did_before_the_field() {
+        // An older reader sees the same document it always saw, rather than a
+        // null it has no `#[serde(default)]` for.
+        let json = serde_json::to_string(&Request::new(1, NOW, spec("buildbox", 5173)))
+            .expect("serialize");
+        assert!(!json.contains("open_url"), "{json}");
+    }
+
+    #[test]
+    fn a_url_survives_the_queue_it_travels_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = log_in(dir.path());
+        let queued = log
+            .enqueue_opening(
+                spec("buildbox", 5173),
+                NOW,
+                Some("http://localhost:5173/app".to_string()),
+            )
+            .expect("enqueue");
+        assert_eq!(
+            queued.open_url.as_deref(),
+            Some("http://localhost:5173/app")
+        );
+        let pending = log.pending().expect("read back");
+        assert_eq!(pending[0].open_url, queued.open_url);
+        // And a plain enqueue still asks for nothing to be opened: only a
+        // clicked URL may put one in front of a browser.
+        log.enqueue(spec("buildbox", 3000), NOW).expect("enqueue");
+        let pending = log.pending().expect("read back");
+        assert_eq!(pending[1].open_url, None);
+    }
+
     #[test]
     fn a_request_from_a_writer_that_omitted_the_optional_fields_still_loads() {
         let json = r#"{
@@ -449,6 +548,7 @@ mod tests {
         assert_eq!(request.remote_bind, "127.0.0.1", "v1 forwards to loopback");
         assert_eq!(request.pane_id, None);
         assert_eq!(request.plugin_version, "");
+        assert_eq!(request.open_url, None, "nothing asked for a browser");
     }
 
     #[test]

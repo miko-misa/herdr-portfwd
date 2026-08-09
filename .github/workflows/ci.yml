@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nothing here writes: every job checks the tree out, compiles it, and reports
+# through the check run. Spelled out because the repository default is what
+# applies otherwise, and that default is settable — and raisable — outside this
+# file.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -25,7 +32,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -38,7 +45,24 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features -- --nocapture
+      - run: cargo test --all-features --locked -- --nocapture
+
+  # The release profile is not the profile anything above builds: lto,
+  # panic = "abort", opt-level = "z" and codegen-units = 1 change what the
+  # compiler and linker are asked to do, and each of them can fail on its own.
+  # Left to the Release workflow, the first attempt happens after the tag is
+  # pushed, which is the one moment a failure is expensive. Its own job rather
+  # than a step bolted onto `lint`: it runs beside the others instead of
+  # extending anything, so it costs no wall-clock the test matrix was not
+  # already spending.
+  release-profile:
+    name: release profile builds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
 
   msrv:
     name: minimum supported rust version
@@ -55,7 +79,15 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets --all-features
+      # RUSTUP_TOOLCHAIN, not just the installed toolchain: rust-toolchain.toml
+      # pins `stable`, and rustup honours the file over whatever the action made
+      # the default. Without this the job silently checks stable and proves
+      # nothing about the version Cargo.toml promises.
+      - run: cargo check --all-targets --all-features --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+      - name: The declared MSRV is what the lockfile actually needs
+        run: python3 scripts/check-msrv.py
 
   manifest:
     name: plugin manifest is parseable
@@ -73,3 +105,107 @@ jobs:
             exit 1
           fi
           echo "ok: $crate"
+
+  asset-names:
+    name: install.sh fetches what release.yml uploads
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every asset install.sh would fetch is one the release builds
+        run: |
+          set -euo pipefail
+
+          # Ask install.sh itself rather than restating its answer: a second
+          # hardcoded copy of the names would keep agreeing with release.yml
+          # forever while install.sh drifted away from both. install.sh prints
+          # the asset URL before it downloads anything, so stub the three
+          # commands it consults — `uname` for the platform, `git` for the
+          # slug, `curl` to stop it at the download — and read the name it
+          # computed back off stdout.
+          stub="$(mktemp -d)"
+          trap 'rm -rf "$stub"' EXIT
+
+          cat > "$stub/uname" <<'STUB'
+          #!/usr/bin/env bash
+          case "${1-}" in
+            -m) printf '%s\n' "$STUB_MACHINE" ;;
+            *) printf '%s\n' "$STUB_SYSTEM" ;;
+          esac
+          STUB
+          cat > "$stub/git" <<'STUB'
+          #!/usr/bin/env bash
+          [ "$*" = "config --get remote.origin.url" ] || exit 1
+          printf 'https://github.com/owner/repo\n'
+          STUB
+          printf '#!/usr/bin/env bash\nexit 22\n' > "$stub/curl"
+          chmod 755 "$stub/uname" "$stub/git" "$stub/curl"
+
+          # The platforms install.sh supports are its own `case` arms, so read
+          # them from there too. An arch added to install.sh alone then fails
+          # here instead of shipping a name no release ever builds.
+          uname_arms() { # <subject, e.g. "uname -s">
+            awk -v want="$1" '
+              $0 ~ ("^case \"\\$\\(" want "\\)\" in") { f = 1; next }
+              f && /^esac/ { exit }
+              f {
+                line = $0
+                sub(/\).*/, "", line)
+                gsub(/[ \t]/, "", line)
+                n = split(line, pats, "|")
+                for (i = 1; i <= n; i++) if (pats[i] != "*" && pats[i] != "") print pats[i]
+              }
+            ' scripts/install.sh
+          }
+          systems="$(uname_arms 'uname -s')"
+          machines="$(uname_arms 'uname -m')"
+          [ -n "$systems" ] && [ -n "$machines" ] || {
+            echo "could not read the supported uname values out of scripts/install.sh" >&2
+            exit 1
+          }
+
+          computed="$stub/computed"
+          : > "$computed"
+          for system in $systems; do
+            for machine in $machines; do
+              out="$(PATH="$stub:$PATH" STUB_SYSTEM="$system" STUB_MACHINE="$machine" \
+                bash scripts/install.sh 2>/dev/null || true)"
+              asset="$(printf '%s\n' "$out" | sed -n 's#^fetching .*/##p' | head -1)"
+              if [ -z "$asset" ]; then
+                echo "install.sh computed no asset name for uname -s=$system -m=$machine" >&2
+                exit 1
+              fi
+              printf '%s\n' "$asset" >> "$computed"
+            done
+          done
+          sort -u -o "$computed" "$computed"
+
+          # The ASSETS list release.yml actually uploads, read out of its
+          # folded block scalar: every line indented deeper than the key, until
+          # the indentation returns.
+          uploaded="$stub/uploaded"
+          awk '
+            /^[[:space:]]*ASSETS:[[:space:]]*>-?[[:space:]]*$/ {
+              match($0, /^[[:space:]]*/); ind = RLENGTH; f = 1; next
+            }
+            f {
+              if ($0 ~ /^[[:space:]]*$/) next
+              match($0, /^[[:space:]]*/)
+              if (RLENGTH <= ind) exit
+              for (i = 1; i <= NF; i++) print $i
+            }
+          ' .github/workflows/release.yml | sort -u > "$uploaded"
+
+          [ -s "$uploaded" ] || {
+            echo "could not read the ASSETS list out of .github/workflows/release.yml" >&2
+            exit 1
+          }
+
+          if ! diff -u "$uploaded" "$computed"; then
+            echo >&2
+            echo "scripts/install.sh and .github/workflows/release.yml disagree about asset names." >&2
+            echo "A '-' line is uploaded by the release and never fetched; a '+' line is fetched" >&2
+            echo "by install.sh and never uploaded. Either one breaks herdr plugin install." >&2
+            exit 1
+          fi
+          echo "install.sh and release.yml agree on:"
+          cat "$computed"

@@ -2,7 +2,7 @@
 name = "herdr-portfwd"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "MIT"
 description = "Forward dev-server ports from remote Herdr hosts to your local machine, managed from inside Herdr"
 repository = "https://github.com/miko-misa/herdr-portfwd"

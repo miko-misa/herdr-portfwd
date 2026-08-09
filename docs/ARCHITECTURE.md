@@ -31,10 +31,22 @@ load-bearing; if they change, this design changes.
    local panes streaming a remote terminal. A plugin invoked from a mirror pane
    runs locally and has full access to the user's machine.
 
-4. **`[[keys.command]]` bindings are not sent to a `--remote` server.** The
-   client ships a keybinding profile that strips every custom command binding,
-   including `type = "plugin_action"`. Under `--remote`, plugin keybindings must
-   be configured in the *remote* `config.toml`.
+4. **A default `--remote` attach runs with no custom command bindings on either
+   side.** `herdr --remote` defaults to `--remote-keybindings local`
+   (`extract_remote_args` in `src/remote/attach.rs`), so the client sends its
+   *local* profile (`requested_keybindings` → `ClientKeybindings::Local`) built
+   by `local_keybindings_profile_toml`, which omits every `[[keys.command]]`;
+   the server clears the list again on arrival (`parse_client_keybindings`) and
+   that profile *replaces* the server's own for the client, so the remote
+   `config.toml`'s bindings are not in effect either. `--remote-keybindings
+   server` is the single switch that changes this: the server keeps its own
+   profile, and plugin-action keys in the *remote* `config.toml` fire.
+
+   Every action must therefore be reachable without a keybinding.
+   `[[link_handlers]]` are resolved from the server's plugin registry on a
+   modified click, not from a keybinding profile, and
+   `herdr plugin action invoke <id>` runs one by name. Those two are the only
+   entry points that work in every configuration.
 
 5. **`pane.process_info` returns `shell_pid`** plus the foreground process list.
    This is what makes port attribution possible.
@@ -99,6 +111,26 @@ tool splits into two halves that talk through a serialized request:
 The same request record drives both paths. Only the transport differs, and only
 `local_agent` knows about the difference.
 
+### The browser is on the applier's side too
+
+A Ctrl+click asks for two things: the forward, and the page. Under `--remote`
+the plugin that handles the click can do neither, so the request carries an
+optional URL for whoever applies it, and the agent opens it once the forward is
+live. Everything else is unchanged, which is why the field is optional in both
+directions: an agent older than the field applies the forward exactly as before
+and opens nothing, and a newer agent reading an older writer's record simply has
+no URL to open.
+
+The URL is a hint, never an instruction. It was written on the remote, into a
+file on the remote, and read back over `ssh`, so the agent re-validates it as
+loopback with the same parser the plugin used, requires it to name the local
+port that pass actually bound, re-renders it from the validated parts, and hands
+it to the desktop opener as one argv word. That is invariant 11 at the other end
+of the click: a remote decides *that* a forward is wanted, never where it goes —
+and never what this machine's browser visits. A request the agent did not apply
+opens nothing at all, because a URL over a port nothing is listening on is an
+error page the user did not ask for.
+
 ### Settling a request
 
 A request is *settled* once the applier knows what became of it: applied,
@@ -136,13 +168,28 @@ Under `--remote`, Herdr itself holds a master at
 - `RemoteSsh::drop` sends `-O exit` when the attach ends,
 - `[remote].manage_ssh_config = false` disables it entirely.
 
-`herdr-portfwd attach <host>` starts its own master, then execs
-`herdr --remote <host>`. One extra SSH connection is cheap and the lifetime is
-ours to control.
+`herdr-portfwd attach <host>` starts its own master, spawns the local agent in
+the background, then runs `herdr --remote <host>` on the terminal it inherited
+and waits for it. Not `execve`, despite the shorthand: a replaced process cannot
+stop the agent, cancel the forwards, or take the master down afterwards, and
+every exit path — return, error, signal, panic — has to go through that one
+teardown. One extra SSH connection is cheap and the lifetime is ours to control.
 
 **ControlPath must stay under 104 bytes** (`sun_path` limit). Sockets live at
-`$XDG_STATE_HOME/herdr-portfwd/<host>.ctl`, never under a plugin state dir,
-whose path can be arbitrarily long.
+`$XDG_STATE_HOME/herdr-portfwd/<host>.ctl` (falling back to
+`~/.local/state/herdr-portfwd`), never under a plugin state dir, whose path can
+be arbitrarily long.
+
+The durable records live in that same directory, chosen by that same rule, and
+`HERDR_PLUGIN_STATE_DIR` is deliberately not consulted for them either. Herdr
+injects it for plugin commands only, so obeying it split the records along a
+line the user cannot see: a forward made by a keybinding went into Herdr's
+per-plugin directory and the `herdr-portfwd status` run in a shell a second
+later read the XDG one and reported nothing, while the ports were open. The
+socket is shared between the two halves whatever the records say, which is what
+made that split a lie rather than a separation. The agent still recognises the
+older locations on the *remote* host, where the plugin it is polling may be
+older than it is.
 
 ## Port attribution: which listener belongs to whom
 
@@ -168,11 +215,22 @@ be cycle-guarded and depth-capped: PID reuse can produce a loop.
 | Level | Trigger | Who resolves ambiguity | Default |
 | --- | --- | --- | --- |
 | L1 explicit | Ctrl+click on a URL, or `add <port>` | the user pointed at it | on |
-| L2 offer | new attributed listener → Herdr notification → one key to accept | the user approves | on |
+| L2 offer | new attributed listener → Herdr notification naming the port, the process, the pane, and the `add` that would forward it | the user runs it | on |
 | L3 auto | matches a user-declared allowlist for that workspace | the user configured it | off |
 
 Silent forwarding is never the default. L2's candidate set is already filtered
 by attribution, so infrastructure ports never reach a notification.
+
+**There is no accept key, and L2 cannot have one.** Herdr's notification API is
+`herdr notification show <title> --body <body>` — a toast, with no callback, no
+choices, and no way to bind a key to the offer that raised it. An offer is
+therefore a sentence, and accepting one is an L1 action the user performs, which
+is why the notification carries the exact command rather than a hint. Each port
+is offered once — a toast per poll would be worse than silence — and again only
+once its listener has gone away and come back. `offer_new_listeners = false`
+silences the toasts without disabling discovery. Invariant 7's "accepted L2
+offer" is therefore the same event as an L1 `add`; what L2 contributes is that
+the user was told which port to type.
 
 An L1 action over a port L2 or L3 already opened is not a no-op: it **pins** the
 forward. The record becomes explicit, so the `reconcile` that follows the owning
@@ -247,6 +305,11 @@ These are the properties tests must defend.
     since a pane reads keys from one and paints frames to the other. This binds
     a command that names a pane too: `pane-ui list` run as an action asks rather
     than drawing, because the argv alone does not say which kind is running.
+    `scan` is bound by the same rule for a different reason: it is never missing
+    an argument, but its answer is a list to pick from, and an action's stdout is
+    a plugin log rather than a person, so as an action it asks for the picker.
+    `--json`, and a shell invocation with no Herdr to ask, still get the printed
+    report — `scan` alone has a complete answer without asking anybody.
 11. Both ends of a forward are chosen on the machine that opens it: the
     listening end is bound to loopback explicitly rather than left to
     `GatewayPorts`, and a request's `remote_bind` is clamped to loopback rather

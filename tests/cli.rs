@@ -52,6 +52,11 @@ impl Sandbox {
             "herdr-bin",
             "home",
             "config/herdr-portfwd",
+            // Where the records live: `$XDG_STATE_HOME/herdr-portfwd`, the same
+            // directory the control socket uses. `state/plugin` is what Herdr
+            // injects as HERDR_PLUGIN_STATE_DIR below and is deliberately *not*
+            // where anything is written — see `Sandbox::state_file`.
+            "state/herdr-portfwd",
             "state/plugin",
             "log",
         ] {
@@ -185,8 +190,23 @@ esac
         fs::read_to_string(self.path("log").join(name)).unwrap_or_default()
     }
 
+    /// A record file, at the one location every invocation of this tool uses.
+    ///
+    /// Not `HERDR_PLUGIN_STATE_DIR`, which is set for these runs and must be
+    /// ignored: Herdr injects it for plugin commands only, so obeying it put a
+    /// keybinding's forwards somewhere a shell's `status` never looked.
     fn state_file(&self, name: &str) -> String {
-        fs::read_to_string(self.path("state/plugin").join(name)).unwrap_or_default()
+        fs::read_to_string(self.state_path(name)).unwrap_or_default()
+    }
+
+    fn state_path(&self, name: &str) -> PathBuf {
+        self.path("state/herdr-portfwd").join(name)
+    }
+
+    /// A record file somewhere other than where it belongs, for asserting that
+    /// nothing was written there.
+    fn state_file_in(&self, dir: &str, name: &str) -> String {
+        fs::read_to_string(self.path(dir).join(name)).unwrap_or_default()
     }
 }
 
@@ -451,6 +471,11 @@ fn an_action_with_no_port_asks_herdr_to_open_the_pane_that_can_ask() {
         // live forwards and has the keys that stop them.
         (["add"], "portfwd.add", "picker"),
         (["stop"], "portfwd.stop", "list"),
+        // `scan` too, and it is the flagship keybinding: the README and the
+        // manifest both promise it "shows attributed listeners and forwards the
+        // ones you pick". It used to print its report instead, into the plugin
+        // log, where the person who pressed the key never saw it.
+        (["scan"], "portfwd.scan", "picker"),
     ] {
         // A sandbox each, so one command's herdr log cannot satisfy the other's
         // assertion.
@@ -465,6 +490,33 @@ fn an_action_with_no_port_asks_herdr_to_open_the_pane_that_can_ask() {
             sandbox.log("herdr.log")
         );
     }
+}
+
+#[test]
+fn a_scan_that_someone_can_actually_read_still_prints_its_report() {
+    // The other half of the flagship keybinding's fix. `scan` differs from
+    // `add` and `stop` in having a complete answer without asking anybody, so a
+    // caller parsing JSON gets that answer rather than a pane opened in front
+    // of nobody — even when Herdr ran it as an action.
+    let sandbox = Sandbox::new().with_host();
+    let mut env = action_env("portfwd.scan");
+    env.push(("HERDR_PORTFWD_MODE", "remote"));
+    let run = sandbox.run_with(&["--json", "scan"], &env);
+    run.succeeded();
+    assert_eq!(run.json()["host"], serde_json::json!("buildbox"));
+    assert!(
+        !sandbox.log("herdr.log").contains("pane open"),
+        "--json asked for the report, not for a pane:\n{}",
+        sandbox.log("herdr.log")
+    );
+
+    // And a shell with no Herdr on the other end: nothing to ask, nowhere to
+    // draw, but the report is still worth printing.
+    let shell = Sandbox::new().with_host();
+    let run = shell.run_with(&["scan"], &[("HERDR_PORTFWD_MODE", "remote")]);
+    run.succeeded();
+    assert!(run.stdout().contains("candidate(s)"), "{}", run.stdout());
+    assert!(!shell.log("herdr.log").contains("pane open"));
 }
 
 #[test]
@@ -666,6 +718,16 @@ fn open_url_on_the_far_side_queues_a_request_and_notifies_instead_of_opening() {
         sandbox.state_file("requests.json").contains("5173"),
         "the request the local agent will apply was not recorded"
     );
+    // The notification promises the URL opens once the agent applies the
+    // forward. The agent is the half of this tool on the machine with the
+    // browser, so the URL has to travel to it or that promise is false.
+    assert!(
+        sandbox
+            .state_file("requests.json")
+            .contains("http://localhost:5173/app?x=1"),
+        "the local agent was given nothing to open:\n{}",
+        sandbox.state_file("requests.json")
+    );
     assert!(
         sandbox.log("herdr.log").contains("notification show"),
         "the user was never told where to point a browser: {:?}",
@@ -832,9 +894,17 @@ fn a_startup_reconcile_does_not_dial_when_there_is_nothing_to_restore() {
     let sandbox = Sandbox::new().with_host();
     sandbox.run(&["reconcile", "--startup"]).succeeded();
     assert_eq!(sandbox.log("ssh.log"), "", "no records means no ssh at all");
+    // The records and the control sockets share a directory, so its existence
+    // proves nothing; a socket in it would.
+    let sockets: Vec<String> = fs::read_dir(sandbox.path("state/herdr-portfwd"))
+        .expect("the state directory exists")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".ctl"))
+        .collect();
     assert!(
-        !sandbox.path("state/herdr-portfwd").exists(),
-        "no control socket directory should have been created"
+        sockets.is_empty(),
+        "no control socket should have been created: {sockets:?}"
     );
 }
 
@@ -855,6 +925,57 @@ fn status_reports_rather_than_failing_when_the_world_is_broken() {
     );
     assert_eq!(json["hosts"], serde_json::json!([]));
     assert_eq!(json["pending_requests"], serde_json::json!(0));
+}
+
+#[test]
+fn a_keybinding_and_a_shell_read_and_write_the_same_records() {
+    // The bug: `state_dir` preferred HERDR_PLUGIN_STATE_DIR, which Herdr
+    // injects for plugin commands and nothing else. A forward created by a
+    // keybinding therefore landed in Herdr's per-plugin directory and
+    // `herdr-portfwd status` in a shell read `$XDG_STATE_HOME/herdr-portfwd`
+    // and reported nothing — while the port was open, because the control
+    // socket already ignored that variable and the master *was* shared. `stop`
+    // could not stop what it could not see.
+    let sandbox = Sandbox::new().with_host();
+
+    // A plugin action, with everything Herdr injects, queues a request.
+    let mut env = action_env("portfwd.add");
+    env.push(("HERDR_PORTFWD_MODE", "remote"));
+    let queued = sandbox.run_with(&["--json", "add", "5173"], &env);
+    queued.succeeded();
+    assert_eq!(queued.json()["applied"], serde_json::json!("requested"));
+
+    // A plain shell invocation, with none of them, has to see it.
+    let status = sandbox.run_with(&["--json", "status"], &[("HERDR_PORTFWD_MODE", "remote")]);
+    status.succeeded();
+    assert_eq!(
+        status.json()["pending_requests"],
+        serde_json::json!(1),
+        "a shell must see what a keybinding recorded: {}",
+        status.stdout()
+    );
+    // And it has to name the file it really read, so the Troubleshooting
+    // section's `cat` of it finds something.
+    let reported = status.json()["request_file"]
+        .as_str()
+        .expect("status names the request file")
+        .to_string();
+    assert_eq!(
+        PathBuf::from(&reported),
+        sandbox.state_path("requests.json"),
+        "status printed a path other than the one it used"
+    );
+    assert!(
+        fs::read_to_string(&reported)
+            .expect("the file status named exists")
+            .contains("5173"),
+        "the request is not in the file status pointed at"
+    );
+    assert_eq!(
+        sandbox.state_file_in("state/plugin", "requests.json"),
+        "",
+        "nothing may be written to the per-plugin directory any more"
+    );
 }
 
 #[test]
@@ -919,7 +1040,7 @@ fn a_malformed_invocation_context_is_reported_not_ignored() {
 fn a_truncated_state_file_does_not_stop_the_binary() {
     let sandbox = Sandbox::new().with_host();
     fs::write(
-        sandbox.path("state/plugin").join("forwards.json"),
+        sandbox.state_path("forwards.json"),
         "{\"version\":1,\"forwards\":[{\"host\"",
     )
     .expect("write a half-written state file");
