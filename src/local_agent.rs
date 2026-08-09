@@ -1158,10 +1158,14 @@ impl Interrupts for ProcessSignals {
 /// orphaned. SIGINT usually reaches the client too — it shares the terminal's
 /// foreground group — and this is about the case where it does not.
 pub fn install_signal_handlers() -> ProcessSignals {
+    // Through a function pointer, not straight from the function item: a direct
+    // item-to-integer cast is a hard error on current rustc, and the pointer is
+    // what `sighandler_t` has always meant anyway.
+    let handler = note_signal as extern "C" fn(libc::c_int);
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // Safe: the handler only stores into a static atomic.
         unsafe {
-            libc::signal(signal, note_signal as libc::sighandler_t);
+            libc::signal(signal, handler as libc::sighandler_t);
         }
     }
     ProcessSignals
