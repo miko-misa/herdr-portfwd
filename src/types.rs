@@ -43,11 +43,12 @@ pub struct Listener {
 impl Listener {
     /// Whether the listener is reachable through a loopback-targeted forward.
     /// A wildcard bind is, a bind to a specific non-loopback address is not.
+    ///
+    /// Brackets are stripped first because `lsof` and `ss` disagree about them,
+    /// and the IPv6 wildcard reaches here as bare `::` from both parsers.
     pub fn is_forwardable(&self) -> bool {
-        matches!(
-            self.bind.as_str(),
-            "127.0.0.1" | "::1" | "*" | "0.0.0.0" | "[::]"
-        )
+        let bind = self.bind.trim_start_matches('[').trim_end_matches(']');
+        matches!(bind, "127.0.0.1" | "::1" | "*" | "0.0.0.0" | "::")
     }
 }
 
@@ -89,13 +90,38 @@ pub struct ForwardSpec {
     pub pane_id: Option<String>,
 }
 
+/// Bind address for the listening end of every forward.
+///
+/// Named explicitly rather than left out: a three-field `-L` spec binds "in
+/// accordance with the GatewayPorts setting", so a user whose `ssh_config` says
+/// `GatewayPorts yes` would have every forwarded dev server bound to the
+/// wildcard address and reachable from their network. `man ssh` documents
+/// `localhost` as meaning local use only, and unlike a literal `127.0.0.1` it
+/// still covers both loopback families, which matters to a client that resolves
+/// `localhost` to `::1`. This is the unconditional half of SECURITY.md's
+/// loopback promise.
+pub const LOCAL_BIND: &str = "localhost";
+
+/// Bracket a bare IPv6 destination: `ssh -L` splits its argument on colons, and
+/// `5173:::1:5173` means nothing in particular.
+fn bracketed(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 impl ForwardSpec {
     /// `-L` argument for `ssh -O forward`/`-O cancel`. The two must be
     /// byte-identical or the cancel silently matches nothing.
     pub fn forward_arg(&self) -> String {
         format!(
-            "{}:{}:{}",
-            self.local_port, self.remote_bind, self.remote_port
+            "{}:{}:{}:{}",
+            LOCAL_BIND,
+            self.local_port,
+            bracketed(&self.remote_bind),
+            self.remote_port
         )
     }
 
@@ -132,7 +158,35 @@ mod tests {
 
     #[test]
     fn forward_arg_is_stable_between_create_and_cancel() {
-        assert_eq!(spec(5173, 5173).forward_arg(), "5173:127.0.0.1:5173");
+        assert_eq!(
+            spec(5173, 5173).forward_arg(),
+            "localhost:5173:127.0.0.1:5173"
+        );
+    }
+
+    #[test]
+    fn the_listening_end_is_bound_to_loopback_explicitly() {
+        // Without a bind address ssh honours GatewayPorts, and a user with
+        // `GatewayPorts yes` in ssh_config would have the forward bound to the
+        // wildcard address — the one thing SECURITY.md promises cannot happen.
+        let arg = spec(5173, 5173).forward_arg();
+        assert!(
+            arg.starts_with("localhost:"),
+            "the spec must name its bind address: {arg}"
+        );
+        assert_eq!(arg.split(':').count(), 4, "a four-field -L spec: {arg}");
+    }
+
+    #[test]
+    fn an_ipv6_destination_is_bracketed_so_the_spec_stays_unambiguous() {
+        let mut v6 = spec(8501, 8501);
+        v6.remote_bind = "::1".into();
+        assert_eq!(v6.forward_arg(), "localhost:8501:[::1]:8501");
+
+        // Already bracketed by whoever built the spec: not bracketed twice.
+        let mut bracketed = spec(8501, 8501);
+        bracketed.remote_bind = "[::1]".into();
+        assert_eq!(bracketed.forward_arg(), "localhost:8501:[::1]:8501");
     }
 
     #[test]
@@ -151,6 +205,34 @@ mod tests {
         };
         assert!(listener("127.0.0.1").is_forwardable());
         assert!(listener("*").is_forwardable());
+        // `--host 0.0.0.0` is the default for `vite --host`, `next dev -H` and
+        // most containerized servers, and it is what `ss -ltnH` reports for
+        // them. Dropped from the matcher, the commonest dev server there is
+        // vanishes from `scan` and from the picker with nothing said.
+        assert!(listener("0.0.0.0").is_forwardable());
         assert!(!listener("192.168.1.10").is_forwardable());
+        assert!(!listener("10.0.0.9").is_forwardable());
+    }
+
+    #[test]
+    fn ipv6_binds_are_forwardable_bracketed_or_not() {
+        let listener = |bind: &str| Listener {
+            port: 5173,
+            bind: bind.into(),
+            pid: 1,
+            process: "node".into(),
+        };
+        // `ss` reports `[::]`, the parsers hand this type a bare `::`, and a
+        // wildcard v6 listener is exactly the case a dev server produces.
+        for bind in ["::", "[::]", "::1", "[::1]"] {
+            assert!(
+                listener(bind).is_forwardable(),
+                "{bind} should be forwardable"
+            );
+        }
+        // A routable v6 address is not reachable through a loopback forward,
+        // bracketed or not: stripping the brackets must not lose the check.
+        assert!(!listener("2001:db8::1").is_forwardable());
+        assert!(!listener("[2001:db8::1]").is_forwardable());
     }
 }

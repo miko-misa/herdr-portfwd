@@ -48,6 +48,30 @@ load-bearing; if they change, this design changes.
    because captured terminal mouse reports cannot distinguish Cmd+click from a
    plain click.
 
+8. **A plugin can ask Herdr to open one of its own declared panes**:
+   `herdr plugin pane open --plugin <id> --entrypoint <id>`. This is the only
+   way an action reaches a user, because an action command runs headless: its
+   stdout and stderr are pipes into the plugin log, there is no pane in front
+   of it, and its stdin may never reach EOF. Note that a pane's command and an
+   action's command may be the same argv — `pane-ui list` is both the `list`
+   pane and the "Port: manage forwards" action — so the argv cannot be what
+   decides which one is running.
+
+9. **Which kind of command is running is only readable from the injected
+   environment.** `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH` and `HERDR_PLUGIN_ID`
+   arrive for every plugin command; `HERDR_PLUGIN_ACTION_ID` marks an action,
+   `HERDR_PLUGIN_ENTRYPOINT_ID` a pane, `HERDR_PLUGIN_EVENT` a startup or event
+   hook.
+
+   `is_terminal()` answers a different question, and it is **not** reliably
+   false: `start_plugin_command` sets only stdout and stderr to `Stdio::piped()`
+   and leaves stdin inherited from the server process. The auto-spawned daemon
+   nulls all three, but a server the user started in the foreground —
+   `herdr server`, or `herdr --no-session` — hands its own tty to every plugin
+   command it spawns. A rule that consults the terminal before the injected
+   variables therefore draws a pane into the plugin log and reads keys off a
+   terminal Herdr is already reading.
+
 ## Consequence: request and apply must be separable
 
 Opening a listening socket on the user's machine can only be done by a process
@@ -154,7 +178,12 @@ These are the properties tests must defend.
 1. A forward is never created for a local port already in use, unless the user
    explicitly asked for that remap.
 2. `state` never loses a record on concurrent writes: lock, read, mutate,
-   atomically replace.
+   atomically replace. This binds callers too, not only `state`: a pass that
+   reads, decides across seconds of SSH, and then writes — `reconcile` — merges
+   its decision into whatever the file holds under the final lock. It may
+   overrule only records still identical to the ones it read, so an `add` that
+   landed mid-pass keeps its record and a `stop` that landed mid-pass is not
+   undone.
 3. Every forward in `forwards.json` is either live on its master or reconciled
    away on the next pass; a stale record never shadows a real port.
 4. Cancelling a forward that was never created is a no-op, not an error.
@@ -164,10 +193,27 @@ These are the properties tests must defend.
    allowlist match.
 8. Paths that become Unix socket addresses are length-checked before use.
 9. No user-controlled string reaches a shell. Commands are argv arrays.
+10. A command that was not told enough goes to the one place that can ask: a
+    plugin action asks Herdr to open the pane (fact 8), a terminal draws it
+    itself, and anything else refuses with what was missing named. The injected
+    variables of fact 9 are consulted **first** and decide on their own — a
+    pane command never asks, or the pane it opens would ask again; an action
+    always asks, whatever it inherited on stdin. `is_terminal()` is only the
+    tie-breaker for what is left, and it has to be true of stdin *and* stdout,
+    since a pane reads keys from one and paints frames to the other. This binds
+    a command that names a pane too: `pane-ui list` run as an action asks rather
+    than drawing, because the argv alone does not say which kind is running.
+11. Both ends of a forward are chosen on the machine that opens it: the
+    listening end is bound to loopback explicitly rather than left to
+    `GatewayPorts`, and a request's `remote_bind` is clamped to loopback rather
+    than obeyed. A remote decides *that* a forward is wanted, never *where* it
+    goes.
 
 ## Non-goals for v1
 
 - Windows hosts (Herdr's own `--remote` does not support them either).
 - Reverse forwards (local → remote).
-- Forwarding to anything but loopback on the remote side.
+- Forwarding to anything but loopback on the remote side. The apply side
+  enforces this rather than trusting the request record, which is written on the
+  remote: see invariant 11.
 - Any transport other than SSH ControlMaster multiplexing.

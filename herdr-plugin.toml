@@ -26,7 +26,7 @@ command = ["./target/release/herdr-portfwd", "scan"]
 [[actions]]
 id = "add"
 title = "Port: forward a port"
-description = "Type a remote port to forward to the same port locally"
+description = "Pick a remote port to forward to the same port locally"
 contexts = ["global", "workspace", "pane"]
 command = ["./target/release/herdr-portfwd", "add"]
 

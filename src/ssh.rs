@@ -27,6 +27,8 @@ pub enum SshError {
         len: usize,
         max: usize,
     },
+    #[error("no directory to keep control sockets in: set XDG_STATE_HOME or HOME")]
+    NoControlDir,
     #[error("ssh {operation} failed for {target} (exit {code}): {stderr}")]
     Command {
         operation: &'static str,
@@ -78,14 +80,27 @@ pub trait SshRunner {
 ///
 /// Not the plugin state dir: that path can be arbitrarily long, and a control
 /// socket that overflows `sun_path` fails confusingly.
-pub fn control_socket_dir() -> PathBuf {
-    if let Some(state) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(state).join("herdr-portfwd");
+pub fn control_socket_dir() -> Result<PathBuf> {
+    control_socket_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+        .ok_or(SshError::NoControlDir)
+}
+
+/// Resolution rule behind [`control_socket_dir`], pure so it is testable
+/// without the process environment.
+///
+/// `None` rather than `/tmp/herdr-portfwd` when neither is set: a fixed path in
+/// a world-writable directory is one another local user can create first, and a
+/// control socket they own is a connection of theirs that every forward this
+/// tool creates would land on.
+pub fn control_socket_dir_from(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(state) = xdg_state_home.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(state).join("herdr-portfwd"));
     }
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".local/state/herdr-portfwd"),
-        None => PathBuf::from("/tmp/herdr-portfwd"),
-    }
+    let home = home.filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(home).join(".local/state/herdr-portfwd"))
 }
 
 /// Control socket path for `host`, rejected up front when it would overflow
@@ -112,6 +127,31 @@ mod tests {
         let path = control_socket_path(Path::new("/tmp/hpf"), "buildbox")
             .expect("short path should be accepted");
         assert!(path.ends_with("buildbox.ctl"));
+    }
+
+    #[test]
+    fn the_socket_directory_follows_xdg_then_home() {
+        assert_eq!(
+            control_socket_dir_from(Some("/xdg".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/xdg/herdr-portfwd"))
+        );
+        assert_eq!(
+            control_socket_dir_from(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.local/state/herdr-portfwd"))
+        );
+        assert_eq!(
+            control_socket_dir_from(Some("".into()), Some("".into())),
+            None,
+            "an exported-but-empty variable names nowhere"
+        );
+    }
+
+    #[test]
+    fn with_nowhere_to_put_a_socket_nothing_is_put_in_tmp() {
+        // A control socket at a fixed path in a world-writable directory can be
+        // created first by another local user, and every forward this tool
+        // makes would then land on their connection.
+        assert_eq!(control_socket_dir_from(None, None), None);
     }
 
     #[test]

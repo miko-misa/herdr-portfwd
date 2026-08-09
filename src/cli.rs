@@ -105,7 +105,7 @@ pub enum Command {
     Status,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 pub enum PaneEntrypoint {
     /// Overlay listing live forwards, with keys to stop them.
     List,
