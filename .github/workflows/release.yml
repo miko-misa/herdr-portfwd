@@ -32,7 +32,7 @@ jobs:
           - os: macos-15
             asset: herdr-portfwd-darwin-aarch64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/herdr-portfwd "dist/${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
@@ -53,29 +53,41 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: staging
           merge-multiple: true
       - name: Verify the tag matches the crate version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
           crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$tag" != "v$crate" ]; then
-            echo "tag $tag does not match Cargo.toml version $crate" >&2
+          if [ "$TAG" != "v$crate" ]; then
+            echo "tag $TAG does not match Cargo.toml version $crate" >&2
             exit 1
           fi
       - name: Checksums
         working-directory: staging
         run: |
+          # scripts/install.sh looks each asset up in this file by name, so a
+          # release missing one has to fail here rather than ship incomplete.
+          test "$(ls herdr-portfwd-* | wc -l)" -eq 4 || {
+            echo "expected 4 platform assets, found:" >&2; ls >&2; exit 1
+          }
           sha256sum herdr-portfwd-* > SHA256SUMS
           cat SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: staging/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+      # `gh` is preinstalled on the runner, so the release path carries no
+      # third-party action and nothing to keep pinned.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" staging/* --clobber
+          else
+            gh release create "$TAG" staging/* --title "$TAG" --generate-notes
+          fi

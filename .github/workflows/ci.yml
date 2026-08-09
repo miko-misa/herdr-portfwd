@@ -19,7 +19,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,7 +35,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features -- --nocapture
@@ -44,7 +44,7 @@ jobs:
     name: minimum supported rust version
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Read rust-version from Cargo.toml
         id: msrv
         run: |
@@ -61,7 +61,7 @@ jobs:
     name: plugin manifest is parseable
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Validate herdr-plugin.toml
         run: python3 -c "import tomllib,sys; m=tomllib.load(open('herdr-plugin.toml','rb')); [sys.exit(f'missing {k}') for k in ('id','name','version','min_herdr_version') if k not in m]; print('ok:', m['id'], m['version'])"
       - name: Manifest version matches Cargo.toml

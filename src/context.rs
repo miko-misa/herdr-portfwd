@@ -759,13 +759,10 @@ mod tests {
 
     #[test]
     fn a_mirror_label_resolves_to_the_host_behind_the_prefix() {
-        let hosts = [
-            host("mac-mini-honkoma", Some("mini")),
-            host("vps", Some("v")),
-        ];
+        let hosts = [host("build-mini", Some("mini")), host("vps", Some("v"))];
         let resolved = resolve_host(None, &context_with_label("mini: scholion"), &hosts, None)
             .expect("the prefix identifies the host");
-        assert_eq!(resolved.host.name, "mac-mini-honkoma");
+        assert_eq!(resolved.host.name, "build-mini");
         assert_eq!(resolved.source, HostSource::WorkspacePrefix);
     }
 
