@@ -189,6 +189,13 @@ invocation resolves to **and by which rule**, whether a control master is up
 per host, the forwards recorded for each, and how many requests are still
 waiting for the local agent. `--json` if you want to grep it.
 
+"Waiting" counts only what nobody has dealt with yet. The local agent records
+how far it has got in a `requests.acked` file beside `requests.json`, and every
+read of the queue folds that mark in, so a request the agent has already applied
+stops being counted — on the remote host too, which is where `status` runs under
+`herdr --remote`. A queue that never drains means the agent is not running, or
+cannot write beside the request file it is reading.
+
 The full log of what Herdr ran is `herdr plugin log list --plugin portfwd` — on
 the machine running the server, which under `herdr --remote` is the remote one.
 
@@ -231,8 +238,14 @@ where the tool is not on your machine binds a port nobody can reach, and
 ## Security
 
 The plugin runs SSH as you, with your keys and your agent, and only ever binds
-to loopback on your machine. It shells out with argv arrays, never through a
-shell. See [SECURITY.md](SECURITY.md) for the reporting process.
+to loopback on your machine. Every command it starts here is an argv array,
+never a string handed to a shell. `ssh` gives a remote command to the remote
+login shell, so the few things that run over there are held to the same rule
+from the other side: the snippets that locate the request file and record the
+agent's progress are fixed text with a number as the only thing ever
+interpolated, and a `herdr` call is quoted word by word so it survives exactly
+one round of shell parsing. See [SECURITY.md](SECURITY.md) for the reporting
+process.
 
 ## Development
 

@@ -843,6 +843,17 @@ impl Actions<'_> {
                     if existing.spec.remote_port == spec.remote_port
                         && existing.spec.remote_bind == spec.remote_bind =>
                 {
+                    // Nothing to open, but possibly something to record: an
+                    // explicit add over a forward the agent made for a pane is
+                    // the user pinning it, and a record that still says
+                    // otherwise loses the port when that pane exits.
+                    let existing = match crate::state::promoted(&existing, &spec) {
+                        Some(promoted) => {
+                            self.store.upsert(promoted.clone())?;
+                            promoted
+                        }
+                        None => existing,
+                    };
                     return Ok(AddOutcome {
                         spec: existing.spec,
                         applied: Applied::AlreadyLive,
@@ -2609,6 +2620,93 @@ mod tests {
             .expect("idempotent");
         assert_eq!(outcome.applied, Applied::AlreadyLive);
         assert!(harness.ssh.calls().is_empty());
+    }
+
+    #[test]
+    fn adding_a_forward_the_agent_made_for_a_pane_pins_it() {
+        // Idempotent is not the same as inert. The agent opened 5173 because a
+        // pane asked for it; the user then said `add 5173`, or Ctrl+clicked the
+        // URL. There is nothing to open, but the record has to record the
+        // intent, or the pin lasts exactly as long as the pane does.
+        let harness = Harness::new(
+            FakeSsh::new(),
+            FakeHerdr::default(),
+            FakePorts::taken(&[5173]),
+        );
+        harness
+            .store
+            .upsert(forward("buildbox", 5173, 5173, Origin::Auto, Some("w1:p1")))
+            .expect("seed the agent's own forward");
+
+        let outcome = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .add(Some(5173), None)
+            .expect("idempotent");
+
+        assert_eq!(outcome.applied, Applied::AlreadyLive);
+        assert!(harness.ssh.calls().is_empty(), "nothing to open");
+        assert_eq!(outcome.spec.origin, Origin::Explicit);
+        let recorded = harness
+            .store
+            .get("buildbox", 5173)
+            .expect("read")
+            .expect("still one record");
+        assert_eq!(recorded.spec.origin, Origin::Explicit);
+    }
+
+    #[test]
+    fn a_pinned_forward_the_agent_had_opened_survives_the_pane_exiting() {
+        // The consequence the upgrade exists for, through the path that killed
+        // the port: `pane.exited` fires `reconcile --event`, which cancels every
+        // pane-scoped forward whose pane is gone.
+        let harness = reconcile_harness(&[5173], vec![]);
+        harness
+            .store
+            .upsert(forward("buildbox", 5173, 5173, Origin::Auto, Some("w1:p9")))
+            .expect("seed the agent's own forward");
+        let actions = harness.actions(env(vec![host("buildbox", None)]));
+
+        actions.add(Some(5173), None).expect("the user pins it");
+        let report = actions
+            .reconcile(ReconcileTrigger::Event)
+            .expect("the pane exits");
+
+        assert!(
+            report.dropped.is_empty(),
+            "the user asked for the port, not for the pane: {:?}",
+            report.dropped
+        );
+        assert_eq!(harness.store.list().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn a_clicked_url_pins_the_forward_it_lands_on() {
+        let harness = Harness::new(
+            FakeSsh::new(),
+            FakeHerdr::default(),
+            FakePorts::taken(&[5173]),
+        );
+        harness
+            .store
+            .upsert(forward("buildbox", 5173, 5173, Origin::Auto, Some("w1:p1")))
+            .expect("seed");
+
+        let outcome = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .open_url(Some("http://localhost:5173/"))
+            .expect("open");
+
+        assert_eq!(outcome.add.applied, Applied::AlreadyLive);
+        assert_eq!(
+            harness
+                .store
+                .get("buildbox", 5173)
+                .expect("read")
+                .expect("a record")
+                .spec
+                .origin,
+            Origin::Explicit
+        );
     }
 
     #[test]

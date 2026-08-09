@@ -64,6 +64,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A request the local agent has applied stops being pending. Nothing consumed
+  the request queue, so `list` and `status` reported a forward that was already
+  live as "waiting for the local agent" until `requests.json` was deleted by
+  hand, and an agent that started inside the ten-minute TTL re-opened a port the
+  user had since stopped. The agent now records how far it has got in a
+  `requests.acked` file beside the queue — one integer, written by a rename, the
+  only thing it can update safely on a host it reaches through a shell — and
+  reads that mark back before it applies anything. A request is settled only
+  once the agent knows what happened to it, so a forward that failed is still
+  retried on the next pass.
+- An explicit `add`, or a Ctrl+click, over a forward the agent had opened by
+  itself now pins that forward. The record kept its original pane, so the next
+  `pane.exited` reconcile cancelled the port the user had just asked to keep.
+- A request whose local port a *different* forward already holds is reported
+  instead of answered with that other forward. `add 3000 --local-port 5173` on
+  the far side matched the record for remote 5173 on the local port alone: 3000
+  was never opened and nothing said so, and the pin the request carried landed
+  on the forward it had collided with. The local agent now applies the same test
+  `add` applies on this machine — same remote port and same remote bind, not
+  merely the same local port — tells the user once, and retries until the
+  request expires.
+- A remapped forward is no longer offered — or, with an `[[auto]]` rule, opened
+  a second time — under the port the remote listens on. Discovery looked the
+  record up by that number, and a record is keyed by the local port it was
+  given.
+- A refusal from `herdr` on a remote host is reported as itself. Only the first
+  line of ssh's stderr survives the hop, so anything that spoke first — a
+  control socket ssh fell back from, the login shell's rc files — was reported
+  in its place: "herdr refused the request: Warning: Permanently added ...".
+  The remote call now carries its own status and stderr back on stdout.
 - The `Port: forward a port` and `Port: stop a forward` actions do something.
   A plugin action runs headless, so both took the "nobody to ask" refusal path
   from every keybinding and every command-palette entry, and the declared
@@ -93,12 +123,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add > add.txt` from a shell used to put the terminal in raw mode and paint a
   blind picker into the redirect target at a guessed 80x24; it now falls
   through to the refusal that names what was missing.
+- Walking up a long table in the `list` or `picker` pane moves the highlight
+  before it scrolls. The visible window was derived from the selection alone,
+  which pinned the highlight to the bottom row and scrolled the whole table on
+  every keypress. The pane now remembers where it is scrolled to and moves that
+  offset by the least it takes to keep the selection on screen, including after
+  a stop or a refresh has made the table shorter.
+- No pane line outgrows the pane. A long status line — an ssh error can be any
+  length — wrapped, and the wrapped line cost a row the height budget had
+  already spent, pushing the footer off the bottom. Lines are now cut to width
+  with their escape sequences copied through whole, so a cut can neither leave
+  half a sequence on screen nor leak a colour into the rest of the pane.
+- The `remapped` note on a forward and the `forwarded` note on a listener are
+  paid for by the column layout instead of hung past the right edge, where they
+  wrapped for the same cost.
+- A selected row stays highlighted across its whole width. Reverse video was
+  closed by the first painted cell in the row — the yellow local port of a
+  remapped forward — because a reset clears every attribute, so everything to
+  its right rendered as an ordinary row.
 - `stop` with no port suggested `herdr-portfwd add 5173`. Each command names
   itself in its own hint.
 - Both READMEs had the `hosts.toml` precedence backwards: the herdr-portfwd
   file wins over the herdr-mirror one, which is what `status` reports as
   shadowed. They also now document `status`, the global `--host` flag, and the
   `HERDR_PORTFWD_MODE` override in a troubleshooting section.
+- Both READMEs claimed the tool never goes through a shell at all. `ssh` hands a
+  remote command to the remote login shell, so it always did over there; what is
+  true, and what they say now, is that commands started here are argv arrays,
+  the remote snippets are fixed text whose only interpolation is a number, and a
+  remote `herdr` argv is quoted word by word. `docs/ARCHITECTURE.md` invariant 9
+  says the same.
 - `reconcile` no longer overwrites the whole state file from a snapshot it took
   before its ssh round trips. A forward recorded by a concurrent `add`,
   `open-url` or the local agent used to be silently wiped, leaving it live with

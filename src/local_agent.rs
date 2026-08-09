@@ -114,13 +114,30 @@ impl Clock for SystemClock {
     }
 }
 
-/// Where pending requests come from.
+/// Where pending requests come from, and where the fact that they were dealt
+/// with goes back.
 ///
 /// Under herdr-mirror this is a local file; under `herdr --remote` it is a file
-/// on the far side of the SSH master. Reading twice must be harmless: the agent
-/// de-duplicates, because the transport cannot.
+/// on the far side of the SSH master, written by a plugin running on that
+/// machine. Reading twice must be harmless: the agent de-duplicates, because
+/// the transport cannot.
+///
+/// Only the applier knows a forward was really made, so only the applier can
+/// settle a request — and it has to say so where the *writer* can see it, or
+/// `list` and `status` over there go on reporting an applied request as waiting
+/// for this agent, and this agent re-applies it after a restart. That is what
+/// [`RequestSource::settled`] is for, and [`RequestSource::settled_mark`] is how
+/// a fresh agent picks up where the last one left off.
 pub trait RequestSource {
     fn pending(&self) -> Result<Vec<Request>>;
+
+    /// Highest request id an applier has already finished with.
+    fn settled_mark(&self) -> Result<u64>;
+
+    /// Record that every request up to and including `id` has been applied,
+    /// skipped, or expired. Must be idempotent and must never move the mark
+    /// backwards.
+    fn settled(&self, id: u64) -> Result<()>;
 }
 
 /// An [`SshRunner`] shared by the agent, its Herdr client, and its request
@@ -195,14 +212,28 @@ impl RequestSource for LocalRequests {
     fn pending(&self) -> Result<Vec<Request>> {
         Ok(self.log.pending()?)
     }
+
+    fn settled_mark(&self) -> Result<u64> {
+        Ok(self.log.last_consumed_id()?)
+    }
+
+    /// Sharing the filesystem with the writer, this settles a request the
+    /// direct way: under the log's own lock, dropping exactly what was named.
+    fn settled(&self, id: u64) -> Result<()> {
+        self.log.consume_through(id)?;
+        Ok(())
+    }
 }
 
-/// Reads the remote request file over the agent's own control master.
+/// Reads the remote request file over the agent's own control master, and
+/// writes back the mark saying how far it has got.
 ///
-/// Read-only on purpose. Consuming a request would mean writing a file on the
-/// far side from a shell, which cannot be made atomic against the plugin
-/// writing it at the same moment; the agent keeps its own high-water mark
-/// instead, so re-reading the same document applies nothing twice.
+/// The request file itself stays untouched: rewriting it from a shell cannot be
+/// made atomic against the plugin writing it at the same moment, and a lost
+/// enqueue is a Ctrl+click that silently did nothing. The mark
+/// ([`crate::request::ACK_FILE`]) is a different matter — one integer with a
+/// single writer, replaced by a rename — so it can be written from a shell
+/// safely, and the plugin over there folds it into everything it reports.
 pub struct RemoteRequests<S> {
     ssh: S,
     target: String,
@@ -210,22 +241,72 @@ pub struct RemoteRequests<S> {
     reporter: Reporter,
 }
 
+/// Leaves the remote plugin state directory in `$p`, or `$p` empty.
+///
+/// The candidate list follows Herdr's own rule for a plugin state directory —
+/// `<state>/plugins/<id>` under `XDG_STATE_HOME` or `~/.local/state` — plus the
+/// debug-build directory name and this plugin's own XDG directory for a plugin
+/// that was run outside Herdr. A directory only counts when the request file is
+/// in it, so the mark is always written beside the requests it settles.
+///
+/// A macro rather than a `const` because `concat!` only joins literals, and the
+/// three snippets below must share one copy of this list.
+macro_rules! remote_state_dir {
+    () => {
+        concat!(
+            "p=''; for d in ",
+            "\"${HERDR_PLUGIN_STATE_DIR:-}\" ",
+            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/portfwd\" ",
+            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-dev/plugins/portfwd\" ",
+            "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-portfwd\"",
+            "; do if [ -n \"$d\" ] && [ -f \"$d/requests.json\" ]; then p=\"$d\"; break; fi;",
+            " done; "
+        )
+    };
+}
+
 /// Locates and prints the remote request file.
 ///
 /// Fixed text with no interpolation: nothing user-controlled reaches the remote
-/// shell (invariant 9). The candidate list follows Herdr's own rule for a
-/// plugin state directory — `<state>/plugins/<id>` under `XDG_STATE_HOME` or
-/// `~/.local/state` — plus the debug-build directory name and this plugin's own
-/// XDG directory for a plugin that was run outside Herdr.
+/// shell (invariant 9).
 pub const REMOTE_REQUESTS_COMMAND: &str = concat!(
-    "p=''; for d in ",
-    "\"${HERDR_PLUGIN_STATE_DIR:-}\" ",
-    "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/portfwd\" ",
-    "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-dev/plugins/portfwd\" ",
-    "\"${XDG_STATE_HOME:-$HOME/.local/state}/herdr-portfwd\"",
-    "; do if [ -n \"$d\" ] && [ -f \"$d/requests.json\" ]; then p=\"$d/requests.json\"; break; fi;",
-    " done; if [ -n \"$p\" ]; then cat \"$p\"; fi"
+    remote_state_dir!(),
+    "if [ -n \"$p\" ]; then cat \"$p/requests.json\"; fi"
 );
+
+/// Prints the mark an applier left beside the remote request file, or nothing.
+pub const REMOTE_MARK_COMMAND: &str = concat!(
+    remote_state_dir!(),
+    "if [ -n \"$p\" ] && [ -f \"$p/requests.acked\" ]; then cat \"$p/requests.acked\"; fi"
+);
+
+/// Records `id` as the highest request this agent has finished with.
+///
+/// The one snippet here that is not fixed text. What it interpolates is a `u64`
+/// rendered by `format!`, which is decimal digits and nothing else — no caller
+/// string reaches the remote shell, so invariant 9 still holds; the test below
+/// pins that.
+///
+/// Written by a temp file and a rename, so a reader sees the old integer or the
+/// new one and never a half-written line, and only ever forwards: a mark that
+/// went backwards would re-offer a request the user has since stopped. The
+/// comparison is guarded rather than trusted — a file somebody else planted
+/// makes `[` fail, and failing to write the mark is the one outcome that leaves
+/// this agent unable to settle anything.
+pub fn remote_mark_command(id: u64) -> String {
+    // Two `format!` calls rather than one: the directory list above is full of
+    // `${...}` and would have to be brace-escaped to survive a format string,
+    // which is a copy of it waiting to drift from the one the other two
+    // snippets use.
+    let write = format!(
+        "if [ -n \"$p\" ]; then o=$(cat \"$p/requests.acked\" 2>/dev/null); \
+         case \"$o\" in ''|*[!0-9]*) o=0;; esac; \
+         if [ \"$o\" -ge {id} ] 2>/dev/null; then :; else \
+         t=\"$p/requests.acked.$$\"; \
+         printf '%s\\n' {id} > \"$t\" && mv \"$t\" \"$p/requests.acked\"; fi; fi"
+    );
+    format!("{}{write}", remote_state_dir!())
+}
 
 impl<S> RemoteRequests<S> {
     pub fn new(ssh: S, target: impl Into<String>, control_path: impl Into<PathBuf>) -> Self {
@@ -255,6 +336,28 @@ impl<S: SshRunner> RequestSource for RemoteRequests<S> {
             Vec::new()
         }))
     }
+
+    fn settled_mark(&self) -> Result<u64> {
+        let stdout = self
+            .ssh
+            .exec(&self.target, &self.control_path, REMOTE_MARK_COMMAND)?;
+        Ok(parse_mark(&stdout))
+    }
+
+    fn settled(&self, id: u64) -> Result<()> {
+        self.ssh
+            .exec(&self.target, &self.control_path, &remote_mark_command(id))?;
+        Ok(())
+    }
+}
+
+/// The applier's mark as printed by [`REMOTE_MARK_COMMAND`].
+///
+/// Pure and total. No file, an empty file, or anything that is not a plain
+/// number all read as zero: the mark can only settle requests, so an unreadable
+/// one has to mean "nothing has been settled" rather than "settle everything".
+pub fn parse_mark(text: &str) -> u64 {
+    text.trim().parse().unwrap_or(0)
 }
 
 /// Pending requests from a serialized [`Queue`], oldest id first.
@@ -268,6 +371,9 @@ pub fn parse_pending(text: &str) -> std::result::Result<Vec<Request>, serde_json
     }
     let queue: Queue = serde_json::from_str(text)?;
     let mut pending = queue.pending;
+    // The document carries its own high-water mark; a request at or below it
+    // has been settled by whoever wrote that mark and is not ours to apply.
+    pending.retain(|request| request.id > queue.last_consumed_id);
     pending.sort_by_key(|request| request.id);
     Ok(pending)
 }
@@ -291,8 +397,16 @@ struct AgentState {
     /// Highest request id known to be settled. Everything at or below it has
     /// been applied, skipped, or expired.
     last_applied_id: u64,
-    /// Ports already offered, auto-forwarded, or known to be forwarded. What
-    /// keeps a long-lived dev server from producing a notification a minute.
+    /// Whether [`AgentState::last_applied_id`] has been seeded from the mark
+    /// the request source holds. Purely in-memory state cannot answer this: a
+    /// restarted agent starts at zero and would re-apply every request still
+    /// inside its TTL, including one whose port the user has since stopped.
+    mark_read: bool,
+    /// *Remote* ports already offered, auto-forwarded, or known to be
+    /// forwarded. What keeps a long-lived dev server from producing a
+    /// notification a minute. Keyed by the remote port because that is what
+    /// discovery sees; a forward that was remapped is recorded under its local
+    /// port and would otherwise look unforwarded here.
     handled: HashSet<u16>,
     /// Ports whose forward failed and whose failure the user has been told
     /// about once. Not pruned with `handled`: a port that failed to open here
@@ -520,6 +634,25 @@ where
     // -- requests ----------------------------------------------------------
 
     fn apply_requests(&mut self, now: u64, report: &mut StepReport) {
+        // Nothing may be applied before the agent knows what a previous one
+        // already applied. Guessing zero here is how a restart re-opens a port
+        // the user stopped a minute ago; failing the pass instead costs one
+        // poll interval.
+        if !self.state.mark_read {
+            match self.requests.settled_mark() {
+                Ok(mark) => {
+                    self.state.last_applied_id = self.state.last_applied_id.max(mark);
+                    self.state.mark_read = true;
+                }
+                Err(err) => {
+                    report
+                        .errors
+                        .push(format!("could not read the applied-request mark: {err}"));
+                    return;
+                }
+            }
+        }
+
         let pending = match self.requests.pending() {
             Ok(pending) => pending,
             Err(err) => {
@@ -547,7 +680,17 @@ where
                 stalled = true;
             }
         }
-        self.state.last_applied_id = cursor;
+        if cursor > self.state.last_applied_id {
+            self.state.last_applied_id = cursor;
+            // Told to the writer, not just to this process: it is what stops
+            // `list` and `status` on the other machine reporting an applied
+            // request as still waiting, and what a restarted agent reads back.
+            if let Err(err) = self.requests.settled(cursor) {
+                report.errors.push(format!(
+                    "could not record request {cursor} as applied: {err}"
+                ));
+            }
+        }
     }
 
     /// Returns whether the request is settled — applied, ignored, or expired.
@@ -580,10 +723,43 @@ where
             spec.remote_bind = clamped.to_string();
         }
 
+        // A record is keyed by its local port, so one at `spec.local_port` is
+        // not necessarily this request's: `add 3000 --local-port 5173` collides
+        // with a forward of remote 5173. Only a record describing the same
+        // forward answers the request — the same test `Actions::apply_or_request`
+        // applies when it meets this collision on this machine.
         match self.store.get(&spec.host, spec.local_port) {
-            Ok(Some(_)) => {
-                self.state.handled.insert(spec.local_port);
+            Ok(Some(existing))
+                if existing.spec.remote_port == spec.remote_port
+                    && existing.spec.remote_bind == spec.remote_bind =>
+            {
+                // The port is already forwarded, but the request may still say
+                // something the record does not: an explicit `add` over a
+                // forward this agent opened on its own is the user pinning it,
+                // and a record that goes on saying otherwise loses the port
+                // when the pane that happened to open it exits.
+                if let Some(promoted) = crate::state::promoted(&existing, &spec) {
+                    if let Err(err) = self.store.upsert(promoted) {
+                        report.errors.push(err.to_string());
+                        return false;
+                    }
+                }
+                self.state.handled.insert(spec.remote_port);
                 return true;
+            }
+            Ok(Some(existing)) => {
+                // Someone else's port. Told to the user and left unsettled, so
+                // it is retried while the other forward might still go away and
+                // then expires like any other request nobody could apply —
+                // rather than reported as forwarded, which is what matching on
+                // the local port alone made of it.
+                let problem = format!(
+                    "local port {} already forwards {} port {}",
+                    spec.local_port, existing.spec.host, existing.spec.remote_port
+                );
+                self.report_failure(spec.local_port, &problem);
+                report.errors.push(problem);
+                return false;
             }
             Ok(None) => {}
             Err(err) => {
@@ -595,7 +771,7 @@ where
         match self.forward(&spec, now) {
             Ok(()) => {
                 report.applied.push(spec.local_port);
-                self.state.handled.insert(spec.local_port);
+                self.state.handled.insert(spec.remote_port);
                 self.state.reported.remove(&spec.local_port);
                 true
             }
@@ -610,6 +786,13 @@ where
     /// A request names the host it is for. The remote plugin's name for the
     /// machine and ours can differ, so the target counts too, and an unnamed
     /// host means "wherever this is applied".
+    ///
+    /// One that is not ours counts as settled, and so gets marked applied along
+    /// with the rest. That is not this agent stealing it: the queue belongs to
+    /// the machine this agent polls, nothing else reads it, and a request in it
+    /// naming a third host can only ever sit there. Leaving it unsettled would
+    /// stall the mark behind it and keep every later request pending forever in
+    /// the eyes of the process that wrote them.
     fn is_ours(&self, request: &Request) -> bool {
         request.host.is_empty()
             || request.host == self.config.host.name
@@ -700,7 +883,12 @@ where
         if self.state.handled.contains(&port) {
             return;
         }
-        match self.store.get(&self.config.host.name, port) {
+        // By the *remote* port: `port` is what the far side is listening on,
+        // and a record is keyed by the local port it was given here. Asking for
+        // a record at the local port `port` misses every remapped forward, and
+        // the listener then reads as unforwarded — offered again, and with an
+        // `[[auto]]` rule opened a second time alongside the remap.
+        match self.store.get_remote(&self.config.host.name, port) {
             Ok(Some(_)) => {
                 self.state.handled.insert(port);
                 return;
@@ -1654,7 +1842,11 @@ mod tests {
     struct RequestState {
         pending: Vec<Request>,
         error: Option<String>,
+        mark_error: Option<String>,
         reads: usize,
+        /// Every id the agent said it had finished with, in order.
+        settled: Vec<u64>,
+        mark: u64,
     }
 
     #[derive(Clone, Default)]
@@ -1670,8 +1862,17 @@ mod tests {
         fn set(&self, pending: Vec<Request>) {
             self.lock().pending = pending;
         }
+
+        fn settled(&self) -> Vec<u64> {
+            self.lock().settled.clone()
+        }
     }
 
+    /// Deliberately modelled on the *remote* source, the one production uses:
+    /// settling records a mark and leaves the document alone, because the agent
+    /// cannot rewrite a file on the far side. So a request stays in `pending`
+    /// after it has been applied, and only the mark keeps it from being applied
+    /// again.
     impl RequestSource for FakeRequests {
         fn pending(&self) -> Result<Vec<Request>> {
             let mut state = self.lock();
@@ -1680,6 +1881,21 @@ mod tests {
                 Some(why) => Err(AgentError::Other(why)),
                 None => Ok(state.pending.clone()),
             }
+        }
+
+        fn settled_mark(&self) -> Result<u64> {
+            let state = self.lock();
+            match state.mark_error.clone() {
+                Some(why) => Err(AgentError::Other(why)),
+                None => Ok(state.mark),
+            }
+        }
+
+        fn settled(&self, id: u64) -> Result<()> {
+            let mut state = self.lock();
+            state.settled.push(id);
+            state.mark = state.mark.max(id);
+            Ok(())
         }
     }
 
@@ -1789,12 +2005,14 @@ mod tests {
     const SS: &str = "LISTEN 0 511 127.0.0.1:5173 0.0.0.0:* users:((\"node\",pid=900,fd=20))\n";
 
     struct Harness {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         ssh: FakeSsh,
         herdr: FakeHerdr,
         requests: FakeRequests,
         clock: FakeClock,
         warnings: Arc<Mutex<Vec<String>>>,
+        reporter: Reporter,
+        config: AgentConfig,
         agent: Agent<FakeSsh, FakeHerdr, FakeRequests, FakeClock>,
         store: Store,
     }
@@ -1829,19 +2047,36 @@ mod tests {
                 requests.clone(),
                 clock.clone(),
                 Store::open(dir.path()).expect("store"),
-                config,
+                config.clone(),
             )
             .with_reporter(Arc::clone(&reporter));
             Self {
                 store: Store::open(dir.path()).expect("second store handle"),
-                _dir: dir,
                 ssh,
                 herdr,
                 requests,
                 clock,
                 warnings,
+                reporter,
+                config,
                 agent,
+                dir,
             }
+        }
+
+        /// Replace the agent with a fresh one over the same fakes and the same
+        /// files: what the next `attach` gets. Everything the old agent knew
+        /// only in memory is gone, which is the whole point.
+        fn restart(&mut self) {
+            self.agent = Agent::new(
+                self.ssh.clone(),
+                self.herdr.clone(),
+                self.requests.clone(),
+                self.clock.clone(),
+                Store::open(self.dir.path()).expect("store"),
+                self.config.clone(),
+            )
+            .with_reporter(Arc::clone(&self.reporter));
         }
 
         /// Answer every discovery command with a single node listener.
@@ -2044,6 +2279,144 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_request_over_a_forward_this_agent_made_pins_the_record() {
+        // The agent opened 5173 for a pane; the user then clicked the URL or
+        // ran `add`. There is nothing to open, but the record has to stop
+        // saying the forward belongs to that pane, or the next `reconcile`
+        // after the pane exits cancels the port the user just pinned.
+        let mut h = Harness::new();
+        let mut auto = spec(5173);
+        auto.origin = Origin::Auto;
+        h.store
+            .upsert(Forward {
+                spec: auto,
+                created_unix_ms: 1,
+            })
+            .expect("seed the agent's own forward");
+        h.requests.set(vec![request(1, 5173)]);
+
+        let report = h.agent.step();
+
+        assert!(report.is_clean(), "{report:?}");
+        assert!(
+            h.ssh.lock().forwards.is_empty(),
+            "the port is already forwarded; nothing to open"
+        );
+        let recorded = h
+            .store
+            .get("buildbox", 5173)
+            .expect("store read")
+            .expect("a record");
+        assert_eq!(recorded.spec.origin, Origin::Explicit);
+        assert_eq!(
+            recorded.created_unix_ms, 1,
+            "pinning does not restart the forward's life"
+        );
+    }
+
+    #[test]
+    fn a_detection_never_downgrades_a_pinned_forward() {
+        let mut h = Harness::new();
+        h.store
+            .upsert(Forward {
+                spec: spec(5173),
+                created_unix_ms: 1,
+            })
+            .expect("seed a pinned forward");
+        let mut offered = request(1, 5173);
+        offered.origin = Origin::Offered;
+        h.requests.set(vec![offered]);
+
+        h.agent.step();
+
+        let recorded = h
+            .store
+            .get("buildbox", 5173)
+            .expect("store read")
+            .expect("a record");
+        assert_eq!(recorded.spec.origin, Origin::Explicit);
+    }
+
+    #[test]
+    fn a_request_for_a_local_port_another_forward_holds_is_reported_not_swallowed() {
+        // The two halves of a record: `add 3000 --local-port 5173` on the far
+        // side asks for local 5173, which the agent has already given to remote
+        // 5173. Matching only on the local port makes that record look like the
+        // one the request asked for — it is answered "already forwarded", 3000
+        // is never opened and nothing says so, and the pin the request carries
+        // lands on the unrelated forward it collided with.
+        let mut h = Harness::new();
+        let mut auto = spec(5173);
+        auto.origin = Origin::Auto;
+        h.store
+            .upsert(Forward {
+                spec: auto,
+                created_unix_ms: 1,
+            })
+            .expect("seed the agent's own forward of 5173");
+        let mut remap = spec(3000);
+        remap.local_port = 5173;
+        remap.pane_id = Some("w2:p9".to_string());
+        h.requests.set(vec![Request::new(1, 1_000, remap)]);
+
+        let report = h.agent.step();
+
+        assert!(
+            !report.is_clean(),
+            "a local port that is taken is a conflict, not a success: {report:?}"
+        );
+        assert!(report.applied.is_empty(), "{report:?}");
+        let recorded = h
+            .store
+            .get("buildbox", 5173)
+            .expect("store read")
+            .expect("a record");
+        assert_eq!(
+            recorded.spec.remote_port, 5173,
+            "the record still describes the forward it always described"
+        );
+        assert_eq!(
+            recorded.spec.origin,
+            Origin::Auto,
+            "a request that was refused pins nothing"
+        );
+        assert_eq!(recorded.spec.pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(
+            h.store.list().expect("store read").len(),
+            1,
+            "and nothing was opened beside it"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_request_is_retried_and_finally_expires_rather_than_stalling() {
+        // Invariant of the mark: an unsettled request holds every later one
+        // behind it. A conflict is settled the way a failed forward is — by the
+        // TTL — so the queue drains without the forward being dropped silently.
+        let mut h = Harness::new();
+        let mut auto = spec(5173);
+        auto.origin = Origin::Auto;
+        h.store
+            .upsert(Forward {
+                spec: auto,
+                created_unix_ms: 1,
+            })
+            .expect("seed");
+        let mut remap = spec(3000);
+        remap.local_port = 5173;
+        h.requests.set(vec![Request::new(1, 1_000, remap)]);
+
+        h.agent.step();
+        assert!(h.requests.settled().is_empty(), "nothing settled yet");
+
+        h.clock.set_now(1_000 + DEFAULT_TTL_MS + 1);
+        let report = h.agent.step();
+
+        assert_eq!(report.expired, vec![5173]);
+        assert_eq!(h.requests.settled(), vec![1]);
+    }
+
+    #[test]
     fn a_port_already_recorded_is_not_forwarded_again() {
         let mut h = Harness::new();
         h.store
@@ -2077,6 +2450,113 @@ mod tests {
             h.herdr.titles(),
             vec!["Port 5173 not forwarded".to_string()],
             "one notification, however many times the forward is retried"
+        );
+    }
+
+    #[test]
+    fn an_applied_request_is_settled_where_the_process_that_wrote_it_can_see_it() {
+        // Only this agent knows the forward was made. Keeping that to itself is
+        // what left `status` on the other machine reporting "pending: 1" for
+        // the rest of the session.
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173), request(2, 8080)]);
+
+        let report = h.agent.step();
+
+        assert_eq!(report.applied, vec![5173, 8080]);
+        assert_eq!(
+            h.requests.settled(),
+            vec![2],
+            "the whole settled run is named, once"
+        );
+    }
+
+    #[test]
+    fn a_request_nothing_here_will_ever_apply_is_settled_too() {
+        // Expired and not-ours both leave the request unapplicable forever.
+        // Left unsettled they stall the mark, and everything queued behind them
+        // stays pending in the writer's eyes for as long as the session lasts.
+        let mut h = Harness::new();
+        let mut elsewhere = request(1, 5173);
+        elsewhere.host = "someone-elses-box".to_string();
+        h.requests.set(vec![elsewhere, request(2, 8080)]);
+        h.clock.set_now(1_000 + DEFAULT_TTL_MS + 1);
+
+        let report = h.agent.step();
+
+        assert_eq!(report.expired, vec![8080]);
+        assert_eq!(h.requests.settled(), vec![2]);
+    }
+
+    #[test]
+    fn a_failed_forward_leaves_the_mark_where_it_was() {
+        // Settling a request the agent has not managed to apply is the one way
+        // this mark can lose a forward: nothing ever offers it again.
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173), request(2, 8080)]);
+        h.ssh.lock().forward_error = Some("cannot listen".to_string());
+
+        h.agent.step();
+
+        assert!(
+            h.requests.settled().is_empty(),
+            "nothing was applied, so nothing may be marked applied"
+        );
+    }
+
+    #[test]
+    fn a_restarted_agent_does_not_re_open_a_port_the_user_has_since_stopped() {
+        // The agent's cursor lives in memory and an attach ends. On the next
+        // one the request is still in the remote document and still inside its
+        // ten-minute TTL, and the record that would have masked it is gone
+        // because the user ran `stop`.
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173)]);
+        assert_eq!(h.agent.step().applied, vec![5173]);
+
+        h.store
+            .remove("buildbox", 5173)
+            .expect("the user stopped it");
+        h.ssh.lock().forwards.clear();
+        h.restart();
+
+        let report = h.agent.step();
+
+        assert!(report.applied.is_empty(), "{report:?}");
+        assert!(
+            h.ssh.lock().forwards.is_empty(),
+            "a request applied by the previous agent is not a fresh intent"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_mark_stops_the_pass_instead_of_guessing_zero() {
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173)]);
+        h.requests.lock().mark_error = Some("ssh: connection closed".to_string());
+
+        let report = h.agent.step();
+
+        assert!(!report.is_clean());
+        assert!(
+            h.ssh.lock().forwards.is_empty(),
+            "not knowing what was applied is not licence to apply it again"
+        );
+
+        h.requests.lock().mark_error = None;
+        assert_eq!(h.agent.step().applied, vec![5173], "and it retries");
+    }
+
+    #[test]
+    fn the_mark_is_read_once_and_not_on_every_pass() {
+        let mut h = Harness::new();
+        h.requests.set(vec![request(1, 5173)]);
+        h.agent.step();
+        h.requests.lock().mark_error = Some("ssh: connection closed".to_string());
+
+        assert!(
+            h.agent.step().is_clean(),
+            "the mark is this agent's own from here on"
         );
     }
 
@@ -2254,6 +2734,72 @@ mod tests {
 
         assert!(report.offered.is_empty());
         assert!(h.ssh.lock().forwards.is_empty());
+    }
+
+    /// A record for remote 5173 that landed on local 15173, which is what
+    /// `add --local-port` leaves behind once the agent has applied it.
+    fn remapped(host: &str, remote_port: u16, local_port: u16) -> Forward {
+        Forward {
+            spec: ForwardSpec {
+                host: host.to_string(),
+                remote_port,
+                local_port,
+                remote_bind: LOOPBACK_V4.to_string(),
+                origin: Origin::Explicit,
+                pane_id: Some("w1:p1".to_string()),
+            },
+            created_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn a_remapped_forward_is_not_offered_again_under_the_port_it_forwards() {
+        // Discovery sees the port the *remote* is listening on. A record is
+        // keyed by the local port it was given, so a remapped forward is
+        // invisible to a lookup by remote port unless one is asked for.
+        let mut h = Harness::discovering();
+        h.store
+            .upsert(remapped("buildbox", 5173, 15173))
+            .expect("seed the remap");
+
+        let report = h.agent.step();
+
+        assert!(
+            report.offered.is_empty(),
+            "5173 is already forwarded, at 15173"
+        );
+        assert!(h.herdr.lock().notifications.is_empty());
+    }
+
+    #[test]
+    fn an_allowlist_does_not_open_a_second_forward_beside_a_remap() {
+        // The worse half of the same lookup: with a rule for this workspace the
+        // listener is not merely re-offered, it is forwarded again — a second
+        // tunnel to the same server, on the port the user moved it off.
+        let mut h = Harness::with(Settings {
+            auto: vec![AutoRule {
+                workspace: "w1".to_string(),
+                ports: vec![5173],
+            }],
+            ..Settings::default()
+        })
+        .with_listener();
+        h.store
+            .upsert(remapped("buildbox", 5173, 15173))
+            .expect("seed the remap");
+
+        let report = h.agent.step();
+
+        assert!(report.auto.is_empty(), "{report:?}");
+        assert!(
+            h.ssh.lock().forwards.is_empty(),
+            "the remote port is forwarded already"
+        );
+        assert_eq!(
+            h.store.list().expect("store read").len(),
+            1,
+            "one forward per remote port"
+        );
     }
 
     #[test]
@@ -2845,6 +3391,170 @@ mod tests {
             REMOTE_REQUESTS_COMMAND.contains("herdr/plugins/portfwd"),
             "the plugin state directory Herdr itself would use"
         );
+    }
+
+    /// Run one of the remote snippets through a shell with a hand-built
+    /// environment, as [`run_remote_requests_command`] does.
+    fn run_snippet(command: &str, state_dir: &Path) -> String {
+        let out = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .env("HERDR_PLUGIN_STATE_DIR", state_dir)
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("run the snippet");
+        assert!(
+            out.status.success(),
+            "the snippet exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn an_applied_request_stops_being_pending_for_the_process_that_wrote_it() {
+        // End to end for the reported symptom, minus the ssh no test may
+        // reach for: the plugin queues a request, the agent settles it the only
+        // way it can from the far side of a master, and the plugin's own view
+        // of the queue has to agree.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = crate::request::RequestLog::open(dir.path()).expect("request log");
+        let request = log.enqueue(spec(5173), 1).expect("enqueue");
+        assert_eq!(log.pending().expect("pending").len(), 1);
+
+        run_snippet(&remote_mark_command(request.id), dir.path());
+
+        assert!(
+            log.pending().expect("pending").is_empty(),
+            "the agent applied it; nothing is waiting for the agent"
+        );
+    }
+
+    #[test]
+    fn the_mark_the_agent_writes_is_the_mark_it_reads_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = crate::request::RequestLog::open(dir.path()).expect("request log");
+        log.enqueue(spec(5173), 1).expect("enqueue");
+
+        assert_eq!(
+            parse_mark(&run_snippet(REMOTE_MARK_COMMAND, dir.path())),
+            0,
+            "a host nothing has applied on yet"
+        );
+        run_snippet(&remote_mark_command(4), dir.path());
+        assert_eq!(parse_mark(&run_snippet(REMOTE_MARK_COMMAND, dir.path())), 4);
+    }
+
+    #[test]
+    fn the_mark_only_ever_moves_forward() {
+        // Two laptops attached to one host both settle what they applied. A
+        // mark that went backwards would re-offer a request the other one has
+        // already dealt with, and the user stopped.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = crate::request::RequestLog::open(dir.path()).expect("request log");
+        log.enqueue(spec(5173), 1).expect("enqueue");
+
+        run_snippet(&remote_mark_command(9), dir.path());
+        run_snippet(&remote_mark_command(3), dir.path());
+
+        assert_eq!(parse_mark(&run_snippet(REMOTE_MARK_COMMAND, dir.path())), 9);
+    }
+
+    #[test]
+    fn a_junk_mark_file_does_not_wedge_the_agent_out_of_settling_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = crate::request::RequestLog::open(dir.path()).expect("request log");
+        log.enqueue(spec(5173), 1).expect("enqueue");
+        std::fs::write(log.ack_path(), "not a number\nat all\n").expect("plant junk");
+
+        run_snippet(&remote_mark_command(2), dir.path());
+
+        assert_eq!(parse_mark(&run_snippet(REMOTE_MARK_COMMAND, dir.path())), 2);
+    }
+
+    #[test]
+    fn a_host_with_no_request_file_has_nowhere_to_put_a_mark_and_says_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        run_snippet(&remote_mark_command(7), dir.path());
+        assert_eq!(run_snippet(REMOTE_MARK_COMMAND, dir.path()), "");
+        assert!(!dir.path().join(crate::request::ACK_FILE).exists());
+    }
+
+    #[test]
+    fn the_mark_snippet_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = crate::request::RequestLog::open(dir.path()).expect("request log");
+        log.enqueue(spec(5173), 1).expect("enqueue");
+        run_snippet(&remote_mark_command(1), dir.path());
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("requests.acked."))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn the_mark_command_interpolates_a_number_and_nothing_else() {
+        // Invariant 9: the only snippet here that is not a constant, and the
+        // only thing it interpolates is a `u64`.
+        for id in [7u64, 1_234_567, u64::MAX] {
+            let command = remote_mark_command(id);
+            assert!(
+                command.starts_with(remote_state_dir!()),
+                "the same directory list as the other two snippets: {command}"
+            );
+            assert_eq!(
+                command.matches(&id.to_string()).count(),
+                2,
+                "the id appears where it is compared and where it is written, \
+                 and nowhere else: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mark_read_over_the_master_parses_what_it_finds() {
+        let ssh = FakeSsh::default();
+        ssh.answer(REMOTE_MARK_COMMAND, "12\n");
+        let source = RemoteRequests::new(ssh.clone(), "buildbox.example", "/tmp/x.ctl");
+
+        assert_eq!(source.settled_mark().expect("a readable mark"), 12);
+
+        ssh.answer(REMOTE_MARK_COMMAND, "");
+        assert_eq!(
+            source.settled_mark().expect("no mark is not a failure"),
+            0,
+            "a host nothing has applied on yet"
+        );
+    }
+
+    #[test]
+    fn a_mark_that_cannot_be_written_is_an_error_the_pass_reports() {
+        let ssh = FakeSsh::default();
+        ssh.refuse(&remote_mark_command(3), "ssh: connection closed");
+        let source = RemoteRequests::new(ssh, "buildbox.example", "/tmp/x.ctl");
+
+        assert!(source.settled(3).is_err());
+    }
+
+    #[test]
+    fn the_local_request_log_settles_a_request_through_its_own_lock() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = crate::request::RequestLog::open(dir.path()).expect("request log");
+        log.enqueue(spec(5173), 1).expect("enqueue");
+        log.enqueue(spec(8080), 1).expect("enqueue");
+        let source = LocalRequests::new(log);
+
+        source.settled(1).expect("settle");
+
+        assert_eq!(source.settled_mark().expect("mark"), 1);
+        let pending = source.pending().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, 2);
     }
 
     #[test]

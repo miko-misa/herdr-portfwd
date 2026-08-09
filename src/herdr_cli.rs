@@ -230,15 +230,12 @@ impl<S: SshRunner> RemoteHerdr<S> {
 
 impl<S: SshRunner> HerdrRunner for RemoteHerdr<S> {
     fn run(&self, argv: &[String]) -> Result<CommandOutput> {
-        let command = remote_command_line(&self.bin, argv)?;
+        let command = remote_report_line(&self.bin, argv)?;
         match self.ssh.exec(&self.target, &self.control_path, &command) {
-            Ok(stdout) => Ok(CommandOutput {
-                status: 0,
-                stdout,
-                stderr: String::new(),
-            }),
-            // ssh reports the remote command's own exit status, so herdr's 1
-            // and 2 survive the hop and classify exactly as they do locally.
+            Ok(stdout) => Ok(parse_report(&stdout)),
+            // Reached when the snippet itself never ran: ssh could not connect,
+            // or the remote login shell could not parse it. Then the status and
+            // the stderr really are ssh's, and 255 classifies as such.
             Err(SshError::Command { code, stderr, .. }) => Ok(CommandOutput {
                 status: code,
                 stdout: String::new(),
@@ -479,6 +476,74 @@ fn or_no_output(stderr: &str) -> &str {
         "no output on stderr"
     } else {
         stderr
+    }
+}
+
+/// Separates a remote invocation's stdout from the status and stderr the
+/// snippet appends after it. Newline-delimited on both sides so it cannot be
+/// mistaken for part of a JSON document.
+const REPORT_MARKER: &str = "\n#herdr-portfwd:status=";
+
+/// Wrap a remote `herdr` call so its status and stderr come back *on stdout*.
+///
+/// Without this the error object never arrives. `SshRunner::exec` reports a
+/// failed remote command through `SshError::Command`, whose `stderr` has
+/// already been reduced to the first line worth showing — which on the remote
+/// path is whatever spoke first: a control socket ssh had to fall back from, or
+/// the login shell's rc noise. The refusal herdr printed after it is dropped,
+/// and the log reads "herdr refused the request: Warning: Permanently added
+/// ...". Nothing on this side can put that back, because it is gone before this
+/// module is handed anything.
+///
+/// So the snippet keeps the three streams apart itself: herdr's stdout goes
+/// straight through on fd 3, its stderr is captured, and status and stderr are
+/// printed after a marker. The snippet exits 0 whatever herdr did, so a non-zero
+/// exit from here on genuinely means ssh, not herdr.
+///
+/// Fixed text plus [`remote_command_line`]'s already-quoted words: no caller
+/// string reaches the shell unquoted (invariant 9).
+fn remote_report_line(bin: &str, argv: &[String]) -> Result<String> {
+    let command = remote_command_line(bin, argv)?;
+    Ok(format!(
+        "{{ e=$({command} 2>&1 1>&3 3>&-); s=$?; \
+         printf '{marker}%s\\n%s' \"$s\" \"$e\"; }} 3>&1",
+        marker = REPORT_MARKER
+    ))
+}
+
+/// Split what [`remote_report_line`] printed back into one [`CommandOutput`].
+///
+/// Falls back to "all of it is stdout, and the call succeeded" when the marker
+/// is absent: ssh already told us the command exited zero, and a remote shell
+/// too strange to run the snippet at all would have failed instead. The *last*
+/// marker wins, so a payload that happens to contain the text cannot hide the
+/// real one.
+fn parse_report(stdout: &str) -> CommandOutput {
+    let Some((head, tail)) = stdout.rsplit_once(REPORT_MARKER) else {
+        return CommandOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        };
+    };
+    let Some((status, stderr)) = tail.split_once('\n') else {
+        return CommandOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        };
+    };
+    match status.trim().parse() {
+        Ok(status) => CommandOutput {
+            status,
+            stdout: head.to_string(),
+            stderr: stderr.to_string(),
+        },
+        Err(_) => CommandOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        },
     }
 }
 
@@ -1211,13 +1276,12 @@ mod tests {
         let client = HerdrCli::remote(Arc::clone(&ssh), "buildbox", "/tmp/hpf/buildbox.ctl");
         let panes = client.pane_list().expect("the canned response must parse");
         assert_eq!(panes[0].pane_id, "w1:p1");
-        assert_eq!(
-            ssh.execs(),
-            vec![(
-                "buildbox".to_string(),
-                PathBuf::from("/tmp/hpf/buildbox.ctl"),
-                "'herdr' 'pane' 'list'".to_string(),
-            )]
+        let (target, control_path, command) = ssh.execs().remove(0);
+        assert_eq!(target, "buildbox");
+        assert_eq!(control_path, PathBuf::from("/tmp/hpf/buildbox.ctl"));
+        assert!(
+            command.contains("'herdr' 'pane' 'list'"),
+            "the argv reaches the remote quoted word by word: {command}"
         );
     }
 
@@ -1231,9 +1295,9 @@ mod tests {
             .shell_pid("w1:p1; rm -rf $HOME")
             .expect("the canned response must parse");
         let (_, _, command) = ssh.execs().remove(0);
-        assert_eq!(
-            command,
-            "'herdr' 'pane' 'process-info' '--pane' 'w1:p1; rm -rf $HOME'"
+        assert!(
+            command.contains("'herdr' 'pane' 'process-info' '--pane' 'w1:p1; rm -rf $HOME'"),
+            "{command}"
         );
     }
 
@@ -1249,7 +1313,10 @@ mod tests {
             .workspace_list()
             .expect("the canned response must parse");
         let (_, _, command) = ssh.execs().remove(0);
-        assert_eq!(command, "'/opt/my herdr/bin' 'workspace' 'list'");
+        assert!(
+            command.contains("'/opt/my herdr/bin' 'workspace' 'list'"),
+            "{command}"
+        );
     }
 
     #[test]
@@ -1300,6 +1367,192 @@ mod tests {
             .expect_err("a NUL cannot survive an exec and must not be sent");
         assert!(matches!(err, HerdrError::Spawn(_)), "{err:?}");
         assert!(ssh.execs().is_empty(), "nothing may be sent");
+    }
+
+    // ---- the remote report ----
+
+    /// An `SshRunner` that behaves the way `SshProcess::exec` really does:
+    /// it runs the command through a shell, and on a non-zero exit it reduces
+    /// stderr to the one line `failure_reason` keeps — dropping everything
+    /// after it. `noise` is what spoke on stderr before the remote command did:
+    /// a control socket ssh had to fall back from, or the login shell's rc
+    /// files. No ssh, no network, no herdr.
+    struct ShellSsh {
+        noise: &'static str,
+    }
+
+    impl SshRunner for ShellSsh {
+        fn ensure_master(&self, _target: &str, _control_path: &Path) -> crate::ssh::Result<()> {
+            Ok(())
+        }
+
+        fn check_master(
+            &self,
+            _target: &str,
+            _control_path: &Path,
+        ) -> crate::ssh::Result<MasterState> {
+            Ok(MasterState::Running)
+        }
+
+        fn add_forward(
+            &self,
+            _target: &str,
+            _control_path: &Path,
+            _spec: &ForwardSpec,
+        ) -> crate::ssh::Result<()> {
+            Ok(())
+        }
+
+        fn cancel_forward(
+            &self,
+            _target: &str,
+            _control_path: &Path,
+            _spec: &ForwardSpec,
+        ) -> crate::ssh::Result<()> {
+            Ok(())
+        }
+
+        fn exit_master(&self, _target: &str, _control_path: &Path) -> crate::ssh::Result<()> {
+            Ok(())
+        }
+
+        fn exec(
+            &self,
+            target: &str,
+            _control_path: &Path,
+            command: &str,
+        ) -> crate::ssh::Result<String> {
+            let out = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .arg("-c")
+                .arg(command)
+                .output()
+                .map_err(SshError::Spawn)?;
+            let code = out.status.code().unwrap_or(-1);
+            if code != 0 {
+                let stderr = format!("{}{}", self.noise, String::from_utf8_lossy(&out.stderr));
+                return Err(SshError::Command {
+                    operation: "exec",
+                    target: target.to_string(),
+                    code,
+                    stderr: crate::ssh_process::failure_reason(&stderr),
+                });
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+    }
+
+    /// A stand-in for the remote `herdr`: prints `stdout` and `stderr` and
+    /// exits `code`. Never the real binary — a test that runs one is out of
+    /// bounds.
+    fn fake_herdr(dir: &Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("herdr");
+        let script =
+            format!("#!/bin/sh\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {code}\n");
+        std::fs::write(&path, script).expect("write the stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("make it runnable");
+        path
+    }
+
+    fn remote_client(
+        dir: &Path,
+        stdout: &str,
+        stderr: &str,
+        code: i32,
+        noise: &'static str,
+    ) -> HerdrCli<RemoteHerdr<ShellSsh>> {
+        let bin = fake_herdr(dir, stdout, stderr, code);
+        HerdrCli::new(
+            RemoteHerdr::new(ShellSsh { noise }, "buildbox", "/tmp/c")
+                .with_bin(bin.to_string_lossy().into_owned()),
+        )
+    }
+
+    #[test]
+    fn a_remote_refusal_survives_whatever_spoke_on_stderr_before_it() {
+        // ssh's own diagnostics and the remote login shell's rc files both
+        // reach stderr before herdr does, and only the first line of it
+        // survives the hop. Reported through that line, every refusal on the
+        // remote path read "herdr refused the request: Warning: Permanently
+        // added ..." — the wrong text, for the wrong reason, on every failure.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let client = remote_client(
+            dir.path(),
+            "",
+            ERROR_OBJECT,
+            EXIT_REFUSED,
+            "Warning: Permanently added 'buildbox' (ED25519) to the list of known hosts.\n\
+             Control socket connect(/tmp/c): No such file or directory\n",
+        );
+
+        let err = client
+            .shell_pid("w9:p9")
+            .expect_err("herdr refused this one");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("pane_not_found: no pane w9:p9"),
+            "the error object herdr printed is the diagnostic: {text}"
+        );
+        assert!(
+            !text.contains("Permanently added"),
+            "and ssh's own chatter is not: {text}"
+        );
+    }
+
+    #[test]
+    fn a_remote_success_still_hands_back_exactly_what_herdr_printed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let client = remote_client(dir.path(), PANE_LIST_SAMPLE, "", 0, "");
+        let panes = client.pane_list().expect("a clean response must parse");
+        assert_eq!(panes[0].pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn remote_chatter_on_stderr_does_not_contaminate_a_successful_response() {
+        // A login shell that greets every non-interactive command must not turn
+        // a good response into a parse failure.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let client = remote_client(
+            dir.path(),
+            PANE_LIST_SAMPLE,
+            "motd: welcome to buildbox",
+            0,
+            "",
+        );
+        let panes = client.pane_list().expect("stderr is not the response");
+        assert_eq!(panes[0].pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn a_report_splits_into_stdout_status_and_stderr() {
+        let report = parse_report("{\"result\":1}\n\n#herdr-portfwd:status=2\nboom\n");
+        assert_eq!(report.stdout, "{\"result\":1}\n");
+        assert_eq!(report.status, 2);
+        assert_eq!(report.stderr, "boom\n");
+    }
+
+    #[test]
+    fn a_payload_that_contains_the_marker_cannot_hide_the_real_one() {
+        let report = parse_report("a\n#herdr-portfwd:status=0\nb\n#herdr-portfwd:status=1\nreal");
+        assert_eq!(report.status, 1);
+        assert_eq!(report.stderr, "real");
+        assert_eq!(report.stdout, "a\n#herdr-portfwd:status=0\nb");
+    }
+
+    #[test]
+    fn output_with_no_marker_is_taken_as_a_clean_response() {
+        // ssh said the command exited zero; a shell too strange to run the
+        // wrapper would have failed instead. Refusing to read the response
+        // would break every host whose shell is merely unusual.
+        for text in ["", PANE_LIST_SAMPLE, "#herdr-portfwd:status=x\n"] {
+            let report = parse_report(text);
+            assert_eq!(report.status, 0, "{text:?}");
+            assert_eq!(report.stdout, text);
+            assert!(report.stderr.is_empty());
+        }
     }
 
     // ---- quoting ----
