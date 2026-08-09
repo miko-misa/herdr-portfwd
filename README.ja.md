@@ -1,6 +1,6 @@
 # herdr-portfwd
 
-[![CI](https://github.com/hacnosuke/herdr-portfwd/actions/workflows/ci.yml/badge.svg)](https://github.com/hacnosuke/herdr-portfwd/actions/workflows/ci.yml)
+[![CI](https://github.com/miko-misa/herdr-portfwd/actions/workflows/ci.yml/badge.svg)](https://github.com/miko-misa/herdr-portfwd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 リモートホストの dev サーバーを手元の `localhost` に持ってきて、その転送の
@@ -51,7 +51,7 @@ HMR、OAuth の `redirect_uri`、アプリが吐く絶対 URL が壊れます。
 ## インストール
 
 ```bash
-herdr plugin install hacnosuke/herdr-portfwd
+herdr plugin install miko-misa/herdr-portfwd
 herdr server reload-config
 ```
 
