@@ -98,6 +98,13 @@ Use the issue template. The parts that actually matter for triage:
 - The shortest reproduction you can manage.
 - Relevant output from `herdr plugin log list --plugin portfwd`.
 
+## Releasing
+
+Maintainers: see [docs/RELEASING.md](docs/RELEASING.md). The one thing worth
+knowing before you touch a version number is that `Cargo.toml` and
+`herdr-plugin.toml` must carry the same one, because `herdr plugin install`
+resolves release assets from the crate version.
+
 ## Security
 
 Do not open a public issue for a vulnerability. See [SECURITY.md](SECURITY.md).

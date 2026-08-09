@@ -346,12 +346,12 @@ mod tests {
     const MIRROR_HOSTS: &str = r#"
 autostart = true
 poll_seconds = 60
-default_host = "mac-mini-honkoma"
+default_host = "build-mini"
 close_remote_on_local_close = false
 always_control = false
 
-[hosts.mac-mini-honkoma]
-target = "mac-mini-honkoma"
+[hosts.build-mini]
+target = "build-mini"
 prefix = "mini"
 api_transport = "auto"
 always_control = false
@@ -361,12 +361,12 @@ always_control = false
     fn a_herdr_mirror_hosts_file_loads_unchanged() {
         let config = parse_hosts(MIRROR_HOSTS).expect("mirror's own file must parse");
         assert_eq!(config.hosts.len(), 1);
-        assert_eq!(config.hosts[0].name, "mac-mini-honkoma");
-        assert_eq!(config.hosts[0].target, "mac-mini-honkoma");
+        assert_eq!(config.hosts[0].name, "build-mini");
+        assert_eq!(config.hosts[0].target, "build-mini");
         assert_eq!(config.hosts[0].prefix.as_deref(), Some("mini"));
         assert_eq!(
             config.default_host().map(|host| host.name.as_str()),
-            Some("mac-mini-honkoma")
+            Some("build-mini")
         );
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
