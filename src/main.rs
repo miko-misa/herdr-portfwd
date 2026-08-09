@@ -1,22 +1,2034 @@
-use anyhow::{bail, Result};
-use clap::Parser;
-use herdr_portfwd::cli::{Cli, Command};
+//! Process entry point: parse an argv, run what it names, and leave behind a
+//! plugin log entry that explains itself.
+//!
+//! Herdr spawns these commands with stdout and stderr captured into
+//! `herdr plugin log list`, so what this file prints matters as much as what it
+//! does. Reports and `--json` go to stdout; failures go to stderr and set a
+//! non-zero exit. A failure is prose even under `--json`, because a caller that
+//! got no JSON needs the reason where a log will show it, not a second format
+//! to parse. Nothing here panics on a hostile environment: a release build
+//! aborts on panic, which would leave the log with no explanation at all.
+//!
+//! This is also the only place the real `ssh`, the real `herdr`, the real state
+//! files and the real terminal are chosen. Every module below composes over
+//! traits precisely so that this file is the single seam where they are picked.
+//!
+//! # When a command was not told enough
+//!
+//! The manifest invokes `add` and `stop` with no port, because a person picks
+//! one. A plugin action runs headless, so there is nobody here to ask and no
+//! guarantee stdin will ever reach EOF — blocking a pane-less action on a read
+//! would hang Herdr's command log instead of filling it. Drawing a pane on a
+//! terminal this process does not have is no better.
+//!
+//! But Herdr *can* open a pane, and this plugin declares two. So the rule is
+//! [`route`]:
+//!
+//! - a plugin **action** asks Herdr for it —
+//!   `herdr plugin pane open --plugin <id> --entrypoint <list|picker>` — and
+//!   the pane it opens is the one that can ask the user;
+//! - a terminal draws the pane itself;
+//! - anything else refuses, naming what was missing, because a refusal in the
+//!   command log is a sentence somebody can act on.
+//!
+//! "A plugin action" is decided by [`PluginInvocation::pane_to_open`] from the
+//! variables Herdr injects, not by looking at the terminal: an action carries
+//! `HERDR_PLUGIN_ACTION_ID`, a pane command carries
+//! `HERDR_PLUGIN_ENTRYPOINT_ID` and must never ask for another pane, and
+//! `HERDR_BIN_PATH` is what proves there is a Herdr on the other end at all.
+//!
+//! **Herdr is asked before the terminal is consulted.** Herdr pipes an action's
+//! stdout and stderr but leaves its stdin alone, so an action spawned by a
+//! server running in the user's foreground terminal — `herdr server`, or
+//! `herdr --no-session` — inherits that terminal on stdin. Looking at
+//! `is_terminal()` first would draw the pane into the plugin log and then read
+//! keys off the terminal Herdr itself is reading, taking the user's keystrokes
+//! and never reaching EOF.
+//!
+//! `--json` is never interactive, since a caller parsing JSON is not sitting at
+//! a keyboard either. Neither is a redirected stdout: a pane reads keys from
+//! stdin and paints frames to stdout, so both ends have to be the terminal or
+//! there is nowhere to draw.
 
-fn main() -> Result<()> {
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use anyhow::{bail, Context as _, Result};
+use clap::Parser;
+use serde::Serialize;
+
+use herdr_portfwd::actions::{
+    Actions, AddOutcome, Applied, DropReason, Env, HostHerdr, ListReport, Liveness, OpenOutcome,
+    Placement, PlacementReason, ReconcileReport, ReconcileTrigger, ScanReport, StatusReport,
+    StopOutcome, SystemOpener, SystemPorts, Where,
+};
+use herdr_portfwd::cli::{Cli, Command, PaneEntrypoint};
+use herdr_portfwd::config::HostsConfig;
+use herdr_portfwd::context::{Invoked, PluginInvocation};
+use herdr_portfwd::herdr::{HerdrClient, Notification};
+use herdr_portfwd::herdr_cli::{HerdrCli, LocalHerdr};
+use herdr_portfwd::local_agent;
+use herdr_portfwd::request::RequestLog;
+use herdr_portfwd::ssh::{control_socket_path, MasterState, SshRunner};
+use herdr_portfwd::ssh_process::SshProcess;
+use herdr_portfwd::state::Store;
+use herdr_portfwd::types::{AttributedListener, Host, Origin, PaneRef};
+use herdr_portfwd::ui::{
+    self, Exit, ForwardRow, ListActions, ListSnapshot, ListenerRow, PickerActions, PickerSnapshot,
+    Status,
+};
+
+/// Anything went wrong. One code, because a plugin log reads the message, not
+/// the number.
+const EXIT_FAILURE: u8 = 1;
+
+/// Ctrl+C, by the usual shell convention. Distinct from a failure so a pane the
+/// user interrupted does not read as a broken plugin.
+const EXIT_INTERRUPTED: u8 = 130;
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Attach { .. }
-        | Command::LocalAgent { .. }
-        | Command::Scan
-        | Command::Add { .. }
-        | Command::List
-        | Command::Stop { .. }
-        | Command::StopAll
-        | Command::OpenUrl { .. }
-        | Command::Reconcile { .. }
-        | Command::PaneUi { .. }
-        | Command::Status => {
-            bail!("not implemented yet — this is the repository scaffold")
+    match run(cli) {
+        Ok(code) => code,
+        Err(err) => {
+            report_error(&err);
+            ExitCode::from(EXIT_FAILURE)
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<ExitCode> {
+    let host = cli.host.clone();
+    let json = cli.json;
+    wired(host, json, |ctx| ctx.dispatch(cli.command))
+}
+
+/// Print a failure the way a plugin log has to read it: what failed, then why,
+/// all on stderr so stdout stays parseable.
+fn report_error(err: &anyhow::Error) {
+    let mut out = io::stderr().lock();
+    let _ = writeln!(out, "herdr-portfwd: {err}");
+    for cause in err.chain().skip(1) {
+        let _ = writeln!(out, "  caused by: {cause}");
+    }
+}
+
+/// Write to stdout, ignoring a closed pipe. A reader that hung up does not
+/// undo the work already done, and panicking here would replace a useful log
+/// line with a crash.
+fn write_out(text: &str) {
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
+// ---------------------------------------------------------------------------
+// wiring
+// ---------------------------------------------------------------------------
+
+/// Everything the real world is plugged into, plus the two globals that shape
+/// output.
+struct Ctx<'a> {
+    actions: Actions<'a>,
+    /// The invoking server's client, kept concretely so workspace labels — which
+    /// are not on [`HerdrClient`] — are still reachable for rendering.
+    herdr: &'a HerdrCli<LocalHerdr>,
+    json: bool,
+    /// Whether stdin is a terminal, and whether stdout is. Both matter and
+    /// they are not the same question: a pane reads its keys from stdin and
+    /// paints its frames to stdout, so `herdr-portfwd add > out` has a keyboard
+    /// and nowhere to draw. Fields rather than calls, because `is_terminal()`
+    /// cannot be faked: every test runs with stdin at `/dev/null`, so the
+    /// branch that opens a pane would otherwise be the one user-facing
+    /// behaviour nothing can cover.
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    /// How Herdr started this process, read once at the edge. What a command
+    /// with no port does about that is a pure function of it; see [`route`].
+    plugin: PluginInvocation,
+}
+
+/// Build the real wiring and hand it to `run`.
+///
+/// A closure rather than a returned value because [`Actions`] borrows every
+/// piece: the trait objects have to outlive it, and locals in one frame are the
+/// simplest way to say so.
+fn wired<T>(
+    host: Option<String>,
+    json: bool,
+    run: impl FnOnce(&Ctx<'_>) -> Result<T>,
+) -> Result<T> {
+    let ssh = SshProcess::new();
+    let herdr = HerdrCli::local();
+    let ports = SystemPorts;
+    let opener = SystemOpener;
+    let store = Store::from_env().context("opening the forward state file")?;
+    let requests = RequestLog::from_env().context("opening the request log")?;
+    let env = Env::from_process(host)?;
+    let host_herdr = HostServers {
+        control_dir: env.control_dir.clone(),
+        fallback: &herdr,
+    };
+    let ctx = Ctx {
+        actions: Actions {
+            ssh: &ssh,
+            herdr: &herdr,
+            host_herdr: &host_herdr,
+            ports: &ports,
+            opener: &opener,
+            store: &store,
+            requests: &requests,
+            probe: None,
+            env,
+        },
+        herdr: &herdr,
+        json,
+        stdin_terminal: io::stdin().is_terminal(),
+        stdout_terminal: io::stdout().is_terminal(),
+        plugin: PluginInvocation::from_env(),
+    };
+    run(&ctx)
+}
+
+/// Resolves a host to the Herdr server that owns its panes.
+///
+/// Under herdr-mirror the panes whose `shell_pid`s attribution walks live on
+/// the host's own server, not on the local one showing mirrored copies of them,
+/// so the client has to run the *remote* `herdr` over our control master. Under
+/// `herdr --remote` there is no master on this side and the invoking server
+/// already is the host's, so the fallback is the right answer there.
+///
+/// A live master is the same signal [`Actions::locate`] uses to decide
+/// placement, and asking for it costs no network: `ssh -O check` only talks to
+/// a local socket.
+struct HostServers<'a> {
+    control_dir: PathBuf,
+    fallback: &'a dyn HerdrClient,
+}
+
+impl HostHerdr for HostServers<'_> {
+    fn client(&self, host: &Host) -> herdr_portfwd::actions::Result<Box<dyn HerdrClient + '_>> {
+        let path = control_socket_path(&self.control_dir, &host.name)?;
+        let ssh = SshProcess::new();
+        if matches!(
+            ssh.check_master(&host.target, &path),
+            Ok(MasterState::Running)
+        ) {
+            return Ok(Box::new(HerdrCli::remote(ssh, host.target.clone(), path)));
+        }
+        Ok(Box::new(BorrowedHerdr(self.fallback)))
+    }
+}
+
+/// A `HerdrClient` that owns nothing, so a borrowed one can be boxed.
+struct BorrowedHerdr<'a>(&'a dyn HerdrClient);
+
+impl HerdrClient for BorrowedHerdr<'_> {
+    fn pane_list(&self) -> herdr_portfwd::herdr::Result<Vec<PaneRef>> {
+        self.0.pane_list()
+    }
+
+    fn pane_list_labelled(&self) -> herdr_portfwd::herdr::Result<Vec<PaneRef>> {
+        self.0.pane_list_labelled()
+    }
+
+    fn shell_pid(&self, pane_id: &str) -> herdr_portfwd::herdr::Result<Option<u32>> {
+        self.0.shell_pid(pane_id)
+    }
+
+    fn notify(&self, notification: &Notification) -> herdr_portfwd::herdr::Result<()> {
+        self.0.notify(notification)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dispatch
+// ---------------------------------------------------------------------------
+
+/// Which of the two panes an invocation opens.
+///
+/// Named rather than matched inline so the mapping is something a test can
+/// assert: the manifest declares both entrypoints the same way, and swapping
+/// them shows up only as the wrong overlay in front of a user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    /// The overlay of live forwards, with stop keys.
+    Manager,
+    /// The popup over attributed listeners.
+    Picker,
+}
+
+fn pane_for(entrypoint: PaneEntrypoint) -> Pane {
+    match entrypoint {
+        PaneEntrypoint::List => Pane::Manager,
+        PaneEntrypoint::Picker => Pane::Picker,
+    }
+}
+
+/// The `[[panes]] id` Herdr knows this pane by, for
+/// `plugin pane open --entrypoint <id>`.
+///
+/// The inverse of [`pane_for`]: Herdr hands the id back as the `pane-ui`
+/// subcommand when it launches the pane, so these two functions have to agree
+/// or a request for one pane returns the other.
+fn entrypoint_id(pane: Pane) -> &'static str {
+    match pane {
+        Pane::Manager => "list",
+        Pane::Picker => "picker",
+    }
+}
+
+/// Whether this invocation may take over the terminal.
+///
+/// Both ends of it, not just stdin. A pane reads keys from stdin and paints
+/// frames to stdout, and [`ui::terminal_size`] measures stdout; deciding from
+/// stdin alone meant `herdr-portfwd add > add.txt` from an interactive shell
+/// put the terminal in raw mode, drew the picker into `add.txt` at a guessed
+/// 80x24, and sat waiting for keys with nothing on screen. The user got neither
+/// the report nor the refusal that names what was missing.
+///
+/// `--json` is never interactive however the process was started: a caller
+/// parsing JSON is not sitting at a keyboard, and a pane would write a screen
+/// full of drawing where the report should be.
+fn interactive(json: bool, stdin_terminal: bool, stdout_terminal: bool) -> bool {
+    stdin_terminal && stdout_terminal && !json
+}
+
+/// What a command does about input it was not given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route<'a> {
+    /// It was told enough, or has an answer without asking: run it.
+    Run,
+    /// Draw the pane here, on this terminal.
+    Pane,
+    /// Headless, but Herdr is on the other end: ask it to open the pane, and
+    /// name this plugin as `--plugin <id>`.
+    AskHerdr(&'a str),
+    /// Nobody to draw for and no Herdr to ask. Report what was missing.
+    Refuse,
+}
+
+/// Where an invocation that may need to ask the user something goes.
+///
+/// Pure, and total over the three inputs, because this is the whole reason the
+/// manifest's `add` and `stop` actions do anything at all: with only the first
+/// input they were dead, taking the refusal path from every keybinding and
+/// every command-palette entry, and no test could see it because the deciding
+/// value was a terminal that tests do not have.
+///
+/// What Herdr injected outranks what stdin happens to be. Herdr pipes an
+/// action's stdout and stderr and leaves stdin inherited, so a server running
+/// in the user's foreground terminal — `herdr server`, `herdr --no-session` —
+/// hands its own tty to every action it spawns. Asking `is_terminal()` first
+/// drew the picker into the plugin log and then read keys off the terminal
+/// Herdr was reading: the user's keystrokes disappeared, EOF never came, and
+/// the action held one of Herdr's in-flight command slots forever.
+fn route<'a>(
+    interactive: bool,
+    nothing_was_named: bool,
+    plugin: &'a PluginInvocation,
+) -> Route<'a> {
+    if !nothing_was_named {
+        // The user already named a port; there is nothing left to ask, even at
+        // a terminal.
+        return Route::Run;
+    }
+    if let Some(plugin_id) = plugin.pane_to_open() {
+        return Route::AskHerdr(plugin_id);
+    }
+    if interactive {
+        return Route::Pane;
+    }
+    Route::Refuse
+}
+
+/// Where a `pane-ui` invocation goes.
+///
+/// It already names a pane, so nothing is missing — but `pane-ui list` is
+/// declared twice in the manifest: as the `list` **pane**, and as the
+/// "Port: manage forwards" **action**. Herdr runs an action headless with both
+/// output streams captured, so drawing there paints one frame of the overlay
+/// into the plugin log, hits EOF, and exits 0 without a user ever seeing it —
+/// the same dead action [`route`] fixes for `add` and `stop`. So only the
+/// action asks; the pane Herdr then launches carries
+/// `HERDR_PLUGIN_ENTRYPOINT_ID`, draws, and cannot ask again.
+fn pane_route<'a>(interactive: bool, plugin: &'a PluginInvocation) -> Route<'a> {
+    if let Some(plugin_id) = plugin.pane_to_open() {
+        return Route::AskHerdr(plugin_id);
+    }
+    // A pane Herdr launched draws whatever its streams are: Herdr owns them,
+    // and it is the one that asked for this pane.
+    if interactive || plugin.kind() == Invoked::Pane {
+        return Route::Pane;
+    }
+    Route::Refuse
+}
+
+impl Ctx<'_> {
+    fn dispatch(&self, command: Command) -> Result<ExitCode> {
+        match command {
+            Command::Attach { host, herdr_args } => self.attach(&host, herdr_args),
+            Command::LocalAgent { host, oneshot } => self.local_agent(&host, oneshot),
+            Command::Scan => self.scan(),
+            Command::Add { port, local_port } => self.add(port, local_port),
+            Command::List => self.list(),
+            Command::Stop { port } => self.stop(port),
+            Command::StopAll => self.stop_all(),
+            Command::OpenUrl { url } => self.open_url(url.as_deref()),
+            Command::Reconcile { startup, event } => self.reconcile(startup, event),
+            Command::PaneUi { entrypoint } => self.pane_ui(entrypoint),
+            Command::Status => self.status(),
+        }
+    }
+
+    /// True when this invocation may take over the terminal.
+    fn interactive(&self) -> bool {
+        interactive(self.json, self.stdin_terminal, self.stdout_terminal)
+    }
+
+    /// Where this invocation goes when it was not told which port to act on.
+    fn route(&self, nothing_was_named: bool) -> Route<'_> {
+        route(self.interactive(), nothing_was_named, &self.plugin)
+    }
+
+    /// Ask Herdr to open one of the declared panes, because this process has no
+    /// terminal to draw one on.
+    ///
+    /// The pane Herdr launches gets `HERDR_PLUGIN_ENTRYPOINT_ID`, which is what
+    /// stops it from arriving back here and asking for another one.
+    fn ask_herdr(&self, plugin_id: &str, pane: Pane) -> Result<ExitCode> {
+        let entrypoint = entrypoint_id(pane);
+        self.herdr
+            .open_pane(plugin_id, entrypoint)
+            .with_context(|| format!("asking Herdr to open the {entrypoint} pane"))?;
+        let report = serde_json::json!({
+            "opened_pane": entrypoint,
+            "plugin": plugin_id,
+        });
+        self.emit(&report, |_| format!("opening the {entrypoint} pane\n"))?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Render a declared pane — or, when Herdr ran this argv as an *action*
+    /// rather than as the pane, ask it to open the pane properly.
+    fn pane_ui(&self, entrypoint: PaneEntrypoint) -> Result<ExitCode> {
+        let pane = pane_for(entrypoint);
+        match pane_route(self.interactive(), &self.plugin) {
+            Route::AskHerdr(plugin_id) => self.ask_herdr(plugin_id, pane),
+            Route::Pane => self.open(pane),
+            // Nowhere to draw and nobody to ask. Drawing anyway would write a
+            // screenful of escape sequences into whatever captured stdout and
+            // exit 0, which reads as success and shows the user nothing.
+            Route::Run | Route::Refuse => {
+                let id = entrypoint_id(pane);
+                bail!(
+                    "the {id} pane has no terminal to draw on: run it from a terminal, \
+                     or let Herdr open it with `herdr plugin pane open --plugin {} \
+                     --entrypoint {id}`",
+                    herdr_portfwd::PLUGIN_ID
+                )
+            }
+        }
+    }
+
+    fn open(&self, pane: Pane) -> Result<ExitCode> {
+        match pane {
+            Pane::Manager => self.manager_pane(),
+            Pane::Picker => self.picker_pane(),
+        }
+    }
+
+    fn emit<T: Serialize>(&self, value: &T, human: impl FnOnce(&T) -> String) -> Result<()> {
+        let text = if self.json {
+            let mut text =
+                serde_json::to_string_pretty(value).context("serializing the report as JSON")?;
+            text.push('\n');
+            text
+        } else {
+            human(value)
+        };
+        write_out(&text);
+        Ok(())
+    }
+
+    // -- attach / local-agent -----------------------------------------------
+
+    fn attach(&self, name: &str, herdr_args: Vec<String>) -> Result<ExitCode> {
+        let host = named_host(&self.actions.env.hosts, name)?;
+        let outcome = local_agent::attach_main(host, herdr_args)?;
+        if !outcome.agent_started {
+            // Not fatal — the session itself ran — but the agent was the whole
+            // point of going through `attach`, so it must not vanish silently.
+            let mut err = io::stderr().lock();
+            let _ = writeln!(
+                err,
+                "herdr-portfwd: the port-forward agent never started; \
+                 forwards requested from the remote were not applied"
+            );
+        }
+        // The session's own output already went to the terminal; only `--json`
+        // adds anything of its own.
+        let summary = serde_json::json!({
+            "status": outcome.status,
+            "signal": outcome.signal,
+            "agent_started": outcome.agent_started,
+        });
+        self.emit(&summary, |_| String::new())?;
+        Ok(exit_code_for(outcome.status, outcome.signal))
+    }
+
+    fn local_agent(&self, name: &str, oneshot: bool) -> Result<ExitCode> {
+        let host = named_host(&self.actions.env.hosts, name)?;
+        let summary = local_agent::local_agent_main(host, oneshot)?;
+        let value = serde_json::json!({
+            "reason": format!("{:?}", summary.reason),
+            "steps": summary.steps,
+            "applied": summary.applied,
+            "offered": summary.offered,
+            "auto": summary.auto,
+        });
+        self.emit(&value, |_| {
+            format!(
+                "agent stopped after {} passes: {} applied, {} offered, {} auto\n",
+                summary.steps, summary.applied, summary.offered, summary.auto
+            )
+        })?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    // -- the actions --------------------------------------------------------
+
+    fn scan(&self) -> Result<ExitCode> {
+        // `scan` takes no port, so there is always something left to pick — but
+        // it is also the one command whose headless answer is complete on its
+        // own. A report of every candidate is worth reading in a plugin log, so
+        // only the terminal case draws, and the other two fall through to it
+        // rather than asking Herdr for a pane.
+        if matches!(self.route(true), Route::Pane) {
+            return self.open(Pane::Picker);
+        }
+        let report = self.actions.scan()?;
+        self.emit(&report, render_scan)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn add(&self, port: Option<u16>, local_port: Option<u16>) -> Result<ExitCode> {
+        match self.route(port.is_none() && local_port.is_none()) {
+            Route::Pane => return self.open(Pane::Picker),
+            Route::AskHerdr(plugin_id) => return self.ask_herdr(plugin_id, Pane::Picker),
+            // `add` with no port has nothing to forward, so this reaches
+            // `ActionError::NoPort` and its refusal.
+            Route::Run | Route::Refuse => {}
+        }
+        let outcome = self.actions.add(port, local_port)?;
+        self.emit(&outcome, render_add)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn list(&self) -> Result<ExitCode> {
+        let report = self.actions.list()?;
+        self.emit(&report, render_list)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn stop(&self, port: Option<u16>) -> Result<ExitCode> {
+        // The manager overlay, not the picker: stopping is picking from what is
+        // already live, and that pane is the one with the stop keys.
+        match self.route(port.is_none()) {
+            Route::Pane => return self.open(Pane::Manager),
+            Route::AskHerdr(plugin_id) => return self.ask_herdr(plugin_id, Pane::Manager),
+            Route::Run | Route::Refuse => {}
+        }
+        let outcome = self.actions.stop(port)?;
+        self.emit(&outcome, render_stop)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn stop_all(&self) -> Result<ExitCode> {
+        let outcome = self.actions.stop_all()?;
+        self.emit(&outcome, render_stop)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn open_url(&self, url: Option<&str>) -> Result<ExitCode> {
+        let outcome = self.actions.open_url(url)?;
+        self.emit(&outcome, render_open)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn reconcile(&self, startup: bool, event: bool) -> Result<ExitCode> {
+        // Startup wins when both are set: it is the permissive trigger, and the
+        // one that may dial. Guessing the restrictive one would silently skip
+        // restoring forwards.
+        let trigger = match (startup, event) {
+            (true, _) => ReconcileTrigger::Startup,
+            (false, true) => ReconcileTrigger::Event,
+            (false, false) => ReconcileTrigger::Manual,
+        };
+        let report = self.actions.reconcile(trigger)?;
+        self.emit(&report, render_reconcile)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    fn status(&self) -> Result<ExitCode> {
+        let report = self.actions.status()?;
+        self.emit(&report, render_status)?;
+        Ok(ExitCode::SUCCESS)
+    }
+
+    // -- panes --------------------------------------------------------------
+
+    fn manager_pane(&self) -> Result<ExitCode> {
+        let mut app = self.manager();
+        let (rows, status) = split_initial(app.forward_rows());
+        let (width, height) = ui::terminal_size();
+        let snapshot = ListSnapshot {
+            rows,
+            status,
+            width,
+            height,
+            ..ListSnapshot::default()
+        };
+        let outcome = ui::open_list(&mut app, snapshot).context("running the forward manager")?;
+        Ok(finish_pane(&outcome))
+    }
+
+    fn picker_pane(&self) -> Result<ExitCode> {
+        let mut app = self.manager();
+        let (rows, status) = split_initial(app.listener_rows());
+        let (width, height) = ui::terminal_size();
+        // A failed resolve is already reported through `status`; the header just
+        // loses its host name rather than the pane refusing to open.
+        let host = self
+            .actions
+            .resolve()
+            .map(|resolved| resolved.host.name)
+            .unwrap_or_default();
+        let snapshot = PickerSnapshot {
+            host,
+            rows,
+            status,
+            width,
+            height,
+            ..PickerSnapshot::default()
+        };
+        let outcome = ui::open_picker(&mut app, snapshot).context("running the port picker")?;
+        Ok(finish_pane(&outcome))
+    }
+
+    fn manager(&self) -> Manager<'_> {
+        Manager {
+            actions: &self.actions,
+            herdr: self.herdr,
+        }
+    }
+}
+
+/// Rows for the first frame, with a failure turned into a status line instead
+/// of a refusal to open: a pane that will not open cannot show why.
+fn split_initial<T>(rows: std::result::Result<Vec<T>, String>) -> (Vec<T>, Option<Status>) {
+    match rows {
+        Ok(rows) => (rows, None),
+        Err(message) => (Vec::new(), Some(Status::failed(message))),
+    }
+}
+
+/// Leave the pane's last status in the plugin log — the pane itself is gone by
+/// the time this runs — and turn its exit into a process exit.
+fn finish_pane(outcome: &ui::Outcome) -> ExitCode {
+    if let Some(status) = &outcome.status {
+        // The pane sanitized this for the screen; stderr is a second terminal
+        // that will render it, and the text can carry an ssh failure verbatim.
+        let mut err = io::stderr().lock();
+        let _ = writeln!(err, "herdr-portfwd: {}", ui::sanitize(&status.text));
+    }
+    match outcome.exit {
+        Exit::Closed => ExitCode::SUCCESS,
+        Exit::Interrupted => ExitCode::from(EXIT_INTERRUPTED),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the panes' callbacks
+// ---------------------------------------------------------------------------
+
+/// What a pane's keys do. The UI renders and reads; every effect goes back
+/// through [`Actions`], so a pane can forward exactly what an explicit `add`
+/// can and nothing more.
+struct Manager<'a> {
+    actions: &'a Actions<'a>,
+    herdr: &'a HerdrCli<LocalHerdr>,
+}
+
+impl Manager<'_> {
+    /// Panes on the invoking server, for workspace labels. Best effort: a label
+    /// that could not be fetched costs a column, and must not empty the table.
+    fn panes(&self) -> Vec<PaneRef> {
+        self.herdr.pane_list_labelled().unwrap_or_default()
+    }
+
+    fn forward_rows(&self) -> std::result::Result<Vec<ForwardRow>, String> {
+        let report = self.actions.list().map_err(|err| err.to_string())?;
+        let panes = self.panes();
+        Ok(report
+            .forwards
+            .iter()
+            .map(|status| {
+                let pane = ui::find_pane(&panes, status.forward.spec.pane_id.as_deref());
+                ForwardRow::from_forward(&status.forward, pane)
+            })
+            .collect())
+    }
+
+    fn listener_rows(&self) -> std::result::Result<Vec<ListenerRow>, String> {
+        let report = self.actions.scan().map_err(|err| err.to_string())?;
+        Ok(report
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                let port = candidate.listener.port;
+                let already = candidate.already_forwarded;
+                let attributed = AttributedListener {
+                    listener: candidate.listener,
+                    pane: candidate.pane,
+                };
+                // Same number on both ends: the picker offers no remap, because
+                // a remap has to be asked for and never implied.
+                ListenerRow::from_attributed(&attributed, port, already)
+            })
+            .collect())
+    }
+}
+
+impl ListActions for Manager<'_> {
+    fn stop(&mut self, row: &ForwardRow) -> std::result::Result<String, String> {
+        let outcome = self
+            .actions
+            .stop(Some(row.remote_port))
+            .map_err(|err| err.to_string())?;
+        Ok(stop_summary(&outcome))
+    }
+
+    fn stop_all(&mut self) -> std::result::Result<String, String> {
+        let outcome = self.actions.stop_all().map_err(|err| err.to_string())?;
+        Ok(stop_summary(&outcome))
+    }
+
+    fn rows(&mut self) -> std::result::Result<Vec<ForwardRow>, String> {
+        self.forward_rows()
+    }
+}
+
+impl PickerActions for Manager<'_> {
+    fn forward(&mut self, rows: &[ListenerRow]) -> std::result::Result<String, String> {
+        let mut forwarded: Vec<u16> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for row in rows {
+            match self.actions.add(Some(row.remote_port), None) {
+                Ok(outcome) => forwarded.push(outcome.spec.local_port),
+                Err(err) => failed.push(format!("{}: {err}", row.remote_port)),
+            }
+        }
+        if failed.is_empty() {
+            return Ok(format!("forwarded {}", ports(&forwarded)));
+        }
+        // Partial success is reported with the successes named: the user has to
+        // know which ports are now live before deciding what to do about the
+        // rest.
+        let mut message = failed.join("; ");
+        if !forwarded.is_empty() {
+            message = format!("forwarded {}, but {message}", ports(&forwarded));
+        }
+        Err(message)
+    }
+
+    fn rows(&mut self) -> std::result::Result<Vec<ListenerRow>, String> {
+        self.listener_rows()
+    }
+}
+
+fn ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn stop_summary(outcome: &StopOutcome) -> String {
+    if outcome.stopped.is_empty() {
+        // Invariant 4: nothing to cancel is a no-op, so this is a status line
+        // and not an error.
+        return format!("nothing to stop on {}", outcome.host);
+    }
+    let stopped: Vec<u16> = outcome
+        .stopped
+        .iter()
+        .map(|forward| forward.spec.remote_port)
+        .collect();
+    format!("stopped {} on {}", ports(&stopped), outcome.host)
+}
+
+// ---------------------------------------------------------------------------
+// host naming
+// ---------------------------------------------------------------------------
+
+/// The host a command named on its own command line.
+///
+/// Falls back to using the name as an ssh target when `hosts.toml` does not
+/// list it. `attach buildbox` has nothing to disambiguate — the user pointed at
+/// one host — and demanding a config file to reach an ssh alias they already
+/// have would be a second place to keep the same name. `attach` re-invokes this
+/// binary as `local-agent <name>`, so both go through this one function and
+/// cannot disagree about what the name meant.
+fn named_host(hosts: &HostsConfig, name: &str) -> Result<Host> {
+    validate_host_name(name)?;
+    Ok(hosts.by_name(name).cloned().unwrap_or_else(|| Host {
+        name: name.to_string(),
+        target: name.to_string(),
+        // No prefix: nothing claims this name labels a mirrored workspace.
+        prefix: None,
+    }))
+}
+
+/// A host name becomes a filename: `<dir>/<name>.ctl` is the control socket.
+/// A name carrying a path separator would put that socket somewhere other than
+/// the directory whose length invariant 8 checked.
+fn validate_host_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("the host name is empty");
+    }
+    if name.contains('/') || name.contains('\0') {
+        bail!("host name {name:?} cannot be used: it would not be a single path component");
+    }
+    if name == "." || name == ".." {
+        bail!("host name {name:?} cannot be used: it names a directory, not a host");
+    }
+    Ok(())
+}
+
+/// Exit the way the process `attach` supervised exited.
+///
+/// A signalled child becomes `128 + signal`, the shell convention, so a session
+/// killed with SIGTERM does not read as an ordinary failure. Anything that does
+/// not fit a `u8` — a negative placeholder status, an out-of-range signal —
+/// falls back to a plain failure rather than wrapping into a lie.
+fn exit_code_for(status: i32, signal: Option<i32>) -> ExitCode {
+    if let Some(signal) = signal {
+        return ExitCode::from(u8::try_from(128 + signal).unwrap_or(EXIT_FAILURE));
+    }
+    ExitCode::from(u8::try_from(status).unwrap_or(EXIT_FAILURE))
+}
+
+// ---------------------------------------------------------------------------
+// rendering
+// ---------------------------------------------------------------------------
+//
+// Pure `&Report -> String`, so every line a plugin log will carry is testable
+// without a process, a terminal, or a filesystem.
+
+fn origin_label(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Explicit => "explicit",
+        Origin::Offered => "offered",
+        Origin::Auto => "auto",
+    }
+}
+
+fn liveness_label(live: Liveness) -> &'static str {
+    match live {
+        Liveness::Live => "live",
+        Liveness::Missing => "missing",
+        Liveness::Unknown => "unknown",
+    }
+}
+
+fn placement_label(placement: &Where) -> String {
+    let side = match placement.placement {
+        Placement::Local => "local",
+        Placement::Remote => "remote",
+    };
+    let reason = match placement.reason {
+        PlacementReason::Forced => "HERDR_PORTFWD_MODE",
+        PlacementReason::MirrorWorkspace => "mirrored workspace",
+        PlacementReason::LiveMaster => "live control master",
+        PlacementReason::MirroredPane => "mirrored pane on this server",
+        PlacementReason::Assumed => "assumed",
+    };
+    format!("{side} ({reason})")
+}
+
+/// Why a record went away.
+///
+/// The two that carry text carry `ssh`'s stderr, which is the remote sshd's
+/// own output — the most attacker-influenced string in the program — so it goes
+/// through [`ui::sanitize`] like every other value that came off a host. A
+/// report read in a terminal must not be able to drive it.
+fn drop_reason_label(reason: &DropReason) -> String {
+    match reason {
+        DropReason::HostGone => "host is no longer configured".to_string(),
+        DropReason::PaneGone => "owning pane is gone".to_string(),
+        DropReason::MasterGone => "no control master".to_string(),
+        DropReason::Superseded => "another process changed it while this pass ran".to_string(),
+        DropReason::Unreachable(why) => format!("unreachable: {}", ui::sanitize(why)),
+        DropReason::ReAddFailed(why) => format!("could not be re-added: {}", ui::sanitize(why)),
+    }
+}
+
+/// `5173 -> 5173`, with the remap called out, because a remapped port is what
+/// breaks anything that embeds it.
+fn mapping(host: &str, remote_port: u16, local_port: u16) -> String {
+    let mut text = format!("{host}:{remote_port} -> localhost:{local_port}");
+    if remote_port != local_port {
+        text.push_str(" (remapped; URLs that embed the port will not work)");
+    }
+    text
+}
+
+fn render_add(outcome: &AddOutcome) -> String {
+    let spec = &outcome.spec;
+    let what = mapping(&spec.host, spec.remote_port, spec.local_port);
+    match outcome.applied {
+        Applied::Forwarded => format!("forwarded {what}\n"),
+        Applied::AlreadyLive => format!("already live: {what}\n"),
+        Applied::Requested => {
+            let id = outcome
+                .request_id
+                .map(|id| format!(" as request {id}"))
+                .unwrap_or_default();
+            format!(
+                "requested {what}{id}\n\
+                 this Herdr server is not on the machine that opens the port; \
+                 the local agent applies it\n"
+            )
+        }
+    }
+}
+
+fn render_open(outcome: &OpenOutcome) -> String {
+    let mut text = render_add(&outcome.add);
+    if outcome.opened {
+        text.push_str(&format!("opened {}\n", outcome.url));
+    } else {
+        text.push_str(&format!(
+            "not opened here: point a browser on your machine at {}\n",
+            outcome.url
+        ));
+    }
+    text
+}
+
+fn render_list(report: &ListReport) -> String {
+    let master = match report.master_running {
+        Some(true) => " (master running)",
+        Some(false) => " (no master)",
+        None => "",
+    };
+    let mut text = format!(
+        "{}: {} forward(s){master}, {}\n",
+        report.host,
+        report.forwards.len(),
+        placement_label(&report.placement)
+    );
+    for status in &report.forwards {
+        let spec = &status.forward.spec;
+        text.push_str(&format!(
+            "  {:>5} -> {:<5}  {:<7}  {:<8}{}\n",
+            spec.remote_port,
+            spec.local_port,
+            liveness_label(status.live),
+            origin_label(spec.origin),
+            // A pane id under `--remote` arrives in a request the remote side
+            // wrote, so it is no more trustworthy than a workspace label.
+            spec.pane_id
+                .as_deref()
+                .map(|id| format!("  pane {}", ui::sanitize(id)))
+                .unwrap_or_default(),
+        ));
+    }
+    if !report.pending.is_empty() {
+        text.push_str(&format!(
+            "  {} request(s) waiting for the local agent: {}\n",
+            report.pending.len(),
+            ports(
+                &report
+                    .pending
+                    .iter()
+                    .map(|request| request.remote_port)
+                    .collect::<Vec<_>>()
+            )
+        ));
+    }
+    text
+}
+
+fn render_stop(outcome: &StopOutcome) -> String {
+    format!("{}\n", stop_summary(outcome))
+}
+
+fn render_scan(report: &ScanReport) -> String {
+    let mut text = format!(
+        "{}: {} candidate(s), {} unattributed, {} not forwardable, {}\n",
+        report.host,
+        report.candidates.len(),
+        report.unattributed,
+        report.unforwardable,
+        placement_label(&report.placement)
+    );
+    for candidate in &report.candidates {
+        let listener = &candidate.listener;
+        let workspace = candidate
+            .pane
+            .as_ref()
+            .and_then(|pane| pane.workspace_label.clone())
+            .or_else(|| {
+                candidate
+                    .pane
+                    .as_ref()
+                    .map(|pane| pane.workspace_id.clone())
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let agent = candidate
+            .pane
+            .as_ref()
+            .and_then(|pane| pane.agent.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let mut notes: Vec<&str> = Vec::new();
+        if candidate.already_forwarded {
+            notes.push("already forwarded");
+        }
+        // `None` means the scan ran on the far side and nothing here knows what
+        // the user's machine has bound. Saying nothing beats saying the
+        // opposite of the truth.
+        if candidate.local_port_free == Some(false) {
+            notes.push("local port in use");
+        }
+        if candidate.auto_allowed {
+            notes.push("allowlisted");
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", notes.join(", "))
+        };
+        text.push_str(&format!(
+            "  {:>5}  {:<16}  {:<24}  {}{}\n",
+            listener.port,
+            ui::sanitize(&listener.process),
+            ui::sanitize(&workspace),
+            ui::sanitize(&agent),
+            notes
+        ));
+    }
+    if report.candidates.is_empty() {
+        text.push_str("  nothing to offer; listeners with no Herdr pane behind them are hidden\n");
+    }
+    text
+}
+
+fn render_reconcile(report: &ReconcileReport) -> String {
+    let trigger = match report.trigger {
+        ReconcileTrigger::Startup => "startup",
+        ReconcileTrigger::Event => "event",
+        ReconcileTrigger::Manual => "manual",
+    };
+    let mut text = format!(
+        "reconcile ({trigger}): {} kept, {} re-added, {} dropped\n",
+        report.kept.len(),
+        report.readded.len(),
+        report.dropped.len()
+    );
+    for readded in &report.readded {
+        text.push_str(&format!(
+            "  re-added {}\n",
+            mapping(
+                &readded.spec.host,
+                readded.spec.remote_port,
+                readded.spec.local_port
+            )
+        ));
+    }
+    for dropped in &report.dropped {
+        text.push_str(&format!(
+            "  dropped {}: {}\n",
+            mapping(
+                &dropped.forward.spec.host,
+                dropped.forward.spec.remote_port,
+                dropped.forward.spec.local_port
+            ),
+            drop_reason_label(&dropped.reason)
+        ));
+    }
+    text
+}
+
+fn render_status(report: &StatusReport) -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "hosts file:   {}\n",
+        show_path(&report.hosts_file)
+    ));
+    for shadowed in &report.shadowed {
+        text.push_str(&format!("  shadowed:   {}\n", shadowed.display()));
+    }
+    text.push_str(&format!("state file:   {}\n", report.state_file.display()));
+    text.push_str(&format!(
+        "request file: {}\n",
+        report.request_file.display()
+    ));
+    match &report.selected {
+        Some(selected) => text.push_str(&format!(
+            "selected:     {} (via {}), {}\n",
+            selected.name,
+            selected.source,
+            placement_label(&selected.placement)
+        )),
+        None => text.push_str(&format!(
+            "selected:     none — {}\n",
+            ui::sanitize(
+                report
+                    .selection_error
+                    .as_deref()
+                    .unwrap_or("no host could be resolved")
+            )
+        )),
+    }
+    text.push_str(&format!("pending:      {}\n", report.pending_requests));
+    for warning in &report.warnings {
+        // Config text and error strings both end up here, and `status` is what
+        // someone runs when something is already wrong.
+        text.push_str(&format!("warning:      {}\n", ui::sanitize(warning)));
+    }
+    for host in &report.hosts {
+        let master = match host.master_running {
+            Some(true) => "master running",
+            Some(false) => "no master",
+            None => "master not checked",
+        };
+        text.push_str(&format!(
+            "\n{} -> {} ({master}, {} forward(s))\n",
+            ui::sanitize(&host.host.name),
+            ui::sanitize(&host.host.target),
+            host.forwards.len()
+        ));
+        for forward in &host.forwards {
+            text.push_str(&format!(
+                "  {}  {}\n",
+                mapping(
+                    &forward.spec.host,
+                    forward.spec.remote_port,
+                    forward.spec.local_port
+                ),
+                origin_label(forward.spec.origin)
+            ));
+        }
+    }
+    if report.hosts.is_empty() {
+        text.push_str("\nno hosts configured; add [hosts.<name>] to hosts.toml\n");
+    }
+    text
+}
+
+fn show_path(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(path) => path.display().to_string(),
+        None => "none found".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use herdr_portfwd::actions::{Candidate, Dropped, ForwardStatus, HostStatus, SelectedHost};
+    use herdr_portfwd::request::Request;
+    use herdr_portfwd::types::{Forward, ForwardSpec, Listener};
+
+    fn spec(host: &str, remote: u16, local: u16) -> ForwardSpec {
+        ForwardSpec {
+            host: host.to_string(),
+            remote_port: remote,
+            local_port: local,
+            remote_bind: "127.0.0.1".to_string(),
+            origin: Origin::Explicit,
+            pane_id: Some("pane-1".to_string()),
+        }
+    }
+
+    fn forward(host: &str, remote: u16, local: u16) -> Forward {
+        Forward {
+            spec: spec(host, remote, local),
+            created_unix_ms: 1,
+        }
+    }
+
+    fn local_placement() -> Where {
+        Where {
+            placement: Placement::Local,
+            reason: PlacementReason::LiveMaster,
+        }
+    }
+
+    fn remote_placement() -> Where {
+        Where {
+            placement: Placement::Remote,
+            reason: PlacementReason::Assumed,
+        }
+    }
+
+    // -- host names ---------------------------------------------------------
+
+    #[test]
+    fn a_configured_host_keeps_its_target_and_prefix() {
+        let hosts = herdr_portfwd::config::parse_hosts(
+            r#"
+            [hosts.buildbox]
+            target = "user@10.0.0.9"
+            prefix = "build"
+            "#,
+        )
+        .expect("fixture parses");
+        let host = named_host(&hosts, "buildbox").expect("configured host resolves");
+        assert_eq!(host.target, "user@10.0.0.9");
+        assert_eq!(host.prefix.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn an_unconfigured_name_is_used_as_an_ssh_target() {
+        let hosts = HostsConfig::default();
+        let host = named_host(&hosts, "buildbox").expect("a bare ssh alias is allowed");
+        assert_eq!(host.name, "buildbox");
+        assert_eq!(host.target, "buildbox");
+        assert_eq!(host.prefix, None, "nothing claims it labels a workspace");
+    }
+
+    #[test]
+    fn a_host_name_that_would_escape_the_socket_directory_is_refused() {
+        let hosts = HostsConfig::default();
+        for name in ["../evil", "a/b", ".", "..", "", "   ", "nul\0byte"] {
+            assert!(
+                named_host(&hosts, name).is_err(),
+                "{name:?} must not become a control socket path"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_dotted_or_at_signed_name_is_still_fine() {
+        let hosts = HostsConfig::default();
+        for name in ["build.example.com", "user@host", ".hidden", "host-1_2"] {
+            assert!(named_host(&hosts, name).is_ok(), "{name:?} should resolve");
+        }
+    }
+
+    // -- exit codes ---------------------------------------------------------
+
+    #[test]
+    fn a_clean_child_exits_clean() {
+        assert_eq!(
+            format!("{:?}", exit_code_for(0, None)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    #[test]
+    fn exit_codes_at_and_past_the_byte_boundary_do_not_wrap() {
+        // 255 fits; 256 and a negative placeholder do not, and must degrade to a
+        // plain failure rather than becoming 0 or some unrelated number.
+        let failure = format!("{:?}", ExitCode::from(EXIT_FAILURE));
+        assert_eq!(
+            format!("{:?}", exit_code_for(255, None)),
+            format!("{:?}", ExitCode::from(255u8))
+        );
+        assert_eq!(format!("{:?}", exit_code_for(256, None)), failure);
+        assert_eq!(format!("{:?}", exit_code_for(-1, None)), failure);
+    }
+
+    #[test]
+    fn a_signalled_child_reports_the_shell_convention() {
+        assert_eq!(
+            format!("{:?}", exit_code_for(0, Some(15))),
+            format!("{:?}", ExitCode::from(143u8))
+        );
+        // A signal number nobody can name would push 128 + n past a byte.
+        assert_eq!(
+            format!("{:?}", exit_code_for(0, Some(200))),
+            format!("{:?}", ExitCode::from(EXIT_FAILURE))
+        );
+    }
+
+    #[test]
+    fn a_signal_outranks_the_exit_status() {
+        assert_eq!(
+            format!("{:?}", exit_code_for(0, Some(2))),
+            format!("{:?}", ExitCode::from(130u8))
+        );
+    }
+
+    // -- add / open-url -----------------------------------------------------
+
+    #[test]
+    fn a_forward_on_the_same_port_says_so_without_a_remap_note() {
+        let text = render_add(&AddOutcome {
+            spec: spec("buildbox", 5173, 5173),
+            applied: Applied::Forwarded,
+            request_id: None,
+            placement: local_placement(),
+        });
+        assert!(
+            text.contains("forwarded buildbox:5173 -> localhost:5173"),
+            "{text}"
+        );
+        assert!(!text.contains("remapped"), "{text}");
+    }
+
+    #[test]
+    fn a_remap_is_always_called_out() {
+        let text = render_add(&AddOutcome {
+            spec: spec("buildbox", 5173, 15173),
+            applied: Applied::Forwarded,
+            request_id: None,
+            placement: local_placement(),
+        });
+        assert!(
+            text.contains("remapped"),
+            "a remap must never be silent: {text}"
+        );
+    }
+
+    #[test]
+    fn a_request_explains_that_nothing_is_live_yet() {
+        let text = render_add(&AddOutcome {
+            spec: spec("buildbox", 5173, 5173),
+            applied: Applied::Requested,
+            request_id: Some(7),
+            placement: remote_placement(),
+        });
+        assert!(text.contains("requested"), "{text}");
+        assert!(text.contains("request 7"), "{text}");
+        assert!(text.contains("local agent"), "{text}");
+    }
+
+    #[test]
+    fn a_request_with_no_id_still_renders() {
+        let text = render_add(&AddOutcome {
+            spec: spec("buildbox", 5173, 5173),
+            applied: Applied::Requested,
+            request_id: None,
+            placement: remote_placement(),
+        });
+        assert!(text.starts_with("requested"), "{text}");
+    }
+
+    #[test]
+    fn an_unopened_url_tells_the_user_where_to_point_a_browser() {
+        let text = render_open(&OpenOutcome {
+            url: "http://localhost:5173/app".to_string(),
+            add: AddOutcome {
+                spec: spec("buildbox", 5173, 5173),
+                applied: Applied::Requested,
+                request_id: Some(1),
+                placement: remote_placement(),
+            },
+            opened: false,
+        });
+        assert!(text.contains("http://localhost:5173/app"), "{text}");
+        assert!(text.contains("not opened here"), "{text}");
+    }
+
+    #[test]
+    fn an_opened_url_is_reported_as_opened() {
+        let text = render_open(&OpenOutcome {
+            url: "http://127.0.0.1:8787/".to_string(),
+            add: AddOutcome {
+                spec: spec("buildbox", 8787, 8787),
+                applied: Applied::Forwarded,
+                request_id: None,
+                placement: local_placement(),
+            },
+            opened: true,
+        });
+        assert!(text.contains("opened http://127.0.0.1:8787/"), "{text}");
+    }
+
+    // -- list ---------------------------------------------------------------
+
+    #[test]
+    fn an_empty_list_still_names_the_host() {
+        let text = render_list(&ListReport {
+            host: "buildbox".to_string(),
+            master_running: Some(false),
+            forwards: Vec::new(),
+            pending: Vec::new(),
+            placement: local_placement(),
+        });
+        assert!(text.contains("buildbox: 0 forward(s)"), "{text}");
+        assert!(text.contains("no master"), "{text}");
+    }
+
+    #[test]
+    fn a_list_reports_each_forwards_liveness_and_origin() {
+        let mut missing = forward("buildbox", 8787, 8787);
+        missing.spec.origin = Origin::Offered;
+        let text = render_list(&ListReport {
+            host: "buildbox".to_string(),
+            master_running: Some(true),
+            forwards: vec![
+                ForwardStatus {
+                    forward: forward("buildbox", 5173, 5173),
+                    live: Liveness::Live,
+                },
+                ForwardStatus {
+                    forward: missing,
+                    live: Liveness::Missing,
+                },
+            ],
+            pending: Vec::new(),
+            placement: local_placement(),
+        });
+        assert!(text.contains("live"), "{text}");
+        assert!(text.contains("missing"), "{text}");
+        assert!(text.contains("offered"), "{text}");
+        assert!(text.contains("pane pane-1"), "{text}");
+    }
+
+    #[test]
+    fn pending_requests_are_listed_when_the_forward_is_not_ours_to_apply() {
+        let text = render_list(&ListReport {
+            host: "buildbox".to_string(),
+            master_running: None,
+            forwards: Vec::new(),
+            pending: vec![Request::new(1, 0, spec("buildbox", 5173, 5173))],
+            placement: remote_placement(),
+        });
+        assert!(text.contains("1 request(s) waiting"), "{text}");
+        assert!(text.contains("5173"), "{text}");
+    }
+
+    // -- stop ---------------------------------------------------------------
+
+    #[test]
+    fn stopping_nothing_is_reported_as_a_no_op() {
+        // Invariant 4: this is success, and the wording must not read as one.
+        let text = render_stop(&StopOutcome {
+            host: "buildbox".to_string(),
+            stopped: Vec::new(),
+        });
+        assert_eq!(text, "nothing to stop on buildbox\n");
+    }
+
+    #[test]
+    fn stopping_several_names_every_port() {
+        let text = render_stop(&StopOutcome {
+            host: "buildbox".to_string(),
+            stopped: vec![
+                forward("buildbox", 5173, 5173),
+                forward("buildbox", 8787, 8787),
+            ],
+        });
+        assert!(text.contains("5173, 8787"), "{text}");
+    }
+
+    // -- scan ---------------------------------------------------------------
+
+    fn candidate(port: u16, pane: Option<PaneRef>) -> Candidate {
+        Candidate {
+            listener: Listener {
+                port,
+                bind: "127.0.0.1".to_string(),
+                pid: 42,
+                process: "node".to_string(),
+            },
+            pane,
+            already_forwarded: false,
+            local_port_free: Some(true),
+            auto_allowed: false,
+        }
+    }
+
+    fn pane(label: &str) -> PaneRef {
+        PaneRef {
+            pane_id: "pane-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            workspace_label: Some(label.to_string()),
+            agent: Some("claude".to_string()),
+            shell_pid: Some(100),
+        }
+    }
+
+    #[test]
+    fn a_scan_with_nothing_to_offer_explains_the_filter() {
+        let text = render_scan(&ScanReport {
+            host: "buildbox".to_string(),
+            candidates: Vec::new(),
+            unattributed: 12,
+            unforwardable: 3,
+            placement: local_placement(),
+        });
+        assert!(text.contains("12 unattributed"), "{text}");
+        assert!(text.contains("3 not forwardable"), "{text}");
+        assert!(text.contains("nothing to offer"), "{text}");
+    }
+
+    #[test]
+    fn a_scan_row_carries_the_workspace_and_agent() {
+        let text = render_scan(&ScanReport {
+            host: "buildbox".to_string(),
+            candidates: vec![candidate(5173, Some(pane("mini: scholion")))],
+            unattributed: 0,
+            unforwardable: 0,
+            placement: local_placement(),
+        });
+        assert!(text.contains("mini: scholion"), "{text}");
+        assert!(text.contains("claude"), "{text}");
+    }
+
+    #[test]
+    fn a_scan_row_with_no_pane_renders_placeholders() {
+        let text = render_scan(&ScanReport {
+            host: "buildbox".to_string(),
+            candidates: vec![candidate(5173, None)],
+            unattributed: 1,
+            unforwardable: 0,
+            placement: local_placement(),
+        });
+        assert!(text.contains("5173"), "{text}");
+        assert!(!text.contains("nothing to offer"), "{text}");
+    }
+
+    #[test]
+    fn remote_terminal_escapes_never_reach_the_log_verbatim() {
+        // Process names and workspace labels come off the far side; a raw escape
+        // sequence in one would drive the terminal reading the log.
+        let mut hostile = candidate(5173, Some(pane("\u{1b}]0;pwned\u{7}")));
+        hostile.listener.process = "no\u{1b}[2Jde".to_string();
+        let text = render_scan(&ScanReport {
+            host: "buildbox".to_string(),
+            candidates: vec![hostile],
+            unattributed: 0,
+            unforwardable: 0,
+            placement: local_placement(),
+        });
+        assert!(!text.contains('\u{1b}'), "escape survived: {text:?}");
+        assert!(!text.contains('\u{7}'), "bell survived: {text:?}");
+    }
+
+    #[test]
+    fn candidate_notes_are_all_reported_together() {
+        let mut busy = candidate(5173, Some(pane("mini: scholion")));
+        busy.already_forwarded = true;
+        busy.local_port_free = Some(false);
+        busy.auto_allowed = true;
+        let text = render_scan(&ScanReport {
+            host: "buildbox".to_string(),
+            candidates: vec![busy],
+            unattributed: 0,
+            unforwardable: 0,
+            placement: local_placement(),
+        });
+        assert!(text.contains("already forwarded"), "{text}");
+        assert!(text.contains("local port in use"), "{text}");
+        assert!(text.contains("allowlisted"), "{text}");
+    }
+
+    #[test]
+    fn a_scan_from_the_far_side_does_not_claim_the_local_port_is_taken() {
+        // Under `herdr --remote` nothing here can know what the user's machine
+        // has bound, and every candidate is a listener on this one.
+        let mut unknown = candidate(5173, Some(pane("mini: scholion")));
+        unknown.local_port_free = None;
+        let text = render_scan(&ScanReport {
+            host: "buildbox".to_string(),
+            candidates: vec![unknown],
+            unattributed: 0,
+            unforwardable: 0,
+            placement: remote_placement(),
+        });
+        assert!(
+            !text.contains("local port in use"),
+            "an unknown port must not read as a taken one: {text}"
+        );
+    }
+
+    // -- reconcile ----------------------------------------------------------
+
+    #[test]
+    fn a_reconcile_that_changed_nothing_still_says_which_trigger_ran() {
+        for (startup, event, expected) in [
+            (true, false, "startup"),
+            (false, true, "event"),
+            (false, false, "manual"),
+            // Both flags at once: startup wins, because it is the trigger
+            // allowed to dial, and picking the other would skip restoring.
+            (true, true, "startup"),
+        ] {
+            let trigger = match (startup, event) {
+                (true, _) => ReconcileTrigger::Startup,
+                (false, true) => ReconcileTrigger::Event,
+                (false, false) => ReconcileTrigger::Manual,
+            };
+            let text = render_reconcile(&ReconcileReport {
+                trigger,
+                kept: Vec::new(),
+                readded: Vec::new(),
+                dropped: Vec::new(),
+            });
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_drop_reason_renders_a_sentence() {
+        let reasons = [
+            DropReason::HostGone,
+            DropReason::PaneGone,
+            DropReason::MasterGone,
+            DropReason::Unreachable("control path too long".to_string()),
+            DropReason::ReAddFailed("connection closed".to_string()),
+        ];
+        for reason in reasons {
+            let text = render_reconcile(&ReconcileReport {
+                trigger: ReconcileTrigger::Startup,
+                kept: Vec::new(),
+                readded: Vec::new(),
+                dropped: vec![Dropped {
+                    forward: forward("buildbox", 5173, 5173),
+                    reason: reason.clone(),
+                }],
+            });
+            assert!(text.contains("dropped buildbox:5173"), "{text}");
+            assert!(
+                text.trim_end().lines().count() == 2,
+                "one line per dropped forward: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_readded_forward_is_distinguishable_from_a_dropped_one() {
+        let text = render_reconcile(&ReconcileReport {
+            trigger: ReconcileTrigger::Startup,
+            kept: vec![forward("buildbox", 3000, 3000)],
+            readded: vec![forward("buildbox", 5173, 5173)],
+            dropped: vec![Dropped {
+                forward: forward("buildbox", 8787, 8787),
+                reason: DropReason::PaneGone,
+            }],
+        });
+        assert!(text.contains("1 kept, 1 re-added, 1 dropped"), "{text}");
+        assert!(text.contains("re-added buildbox:5173"), "{text}");
+        assert!(text.contains("dropped buildbox:8787"), "{text}");
+    }
+
+    // -- status -------------------------------------------------------------
+
+    fn empty_status() -> StatusReport {
+        StatusReport {
+            hosts_file: None,
+            shadowed: Vec::new(),
+            warnings: Vec::new(),
+            state_file: PathBuf::from("/state/forwards.json"),
+            request_file: PathBuf::from("/state/requests.json"),
+            selected: None,
+            selection_error: Some("no hosts are configured".to_string()),
+            hosts: Vec::new(),
+            pending_requests: 0,
+        }
+    }
+
+    #[test]
+    fn status_with_nothing_configured_says_what_to_do() {
+        let text = render_status(&empty_status());
+        assert!(text.contains("none found"), "{text}");
+        assert!(text.contains("no hosts are configured"), "{text}");
+        assert!(text.contains("hosts.toml"), "{text}");
+    }
+
+    #[test]
+    fn status_reports_shadowed_files_and_warnings_rather_than_hiding_them() {
+        let mut report = empty_status();
+        report.hosts_file = Some(PathBuf::from("/c/herdr-portfwd/hosts.toml"));
+        report.shadowed = vec![PathBuf::from("/c/herdr-mirror/hosts.toml")];
+        report.warnings = vec!["skipping host [hosts.x]: target is empty".to_string()];
+        let text = render_status(&report);
+        assert!(text.contains("/c/herdr-mirror/hosts.toml"), "{text}");
+        assert!(text.contains("target is empty"), "{text}");
+    }
+
+    #[test]
+    fn status_lists_each_host_with_its_master_and_forwards() {
+        let mut report = empty_status();
+        report.selected = Some(SelectedHost {
+            name: "buildbox".to_string(),
+            source: "explicit",
+            placement: local_placement(),
+        });
+        report.selection_error = None;
+        report.hosts = vec![HostStatus {
+            host: Host {
+                name: "buildbox".to_string(),
+                target: "user@10.0.0.9".to_string(),
+                prefix: Some("build".to_string()),
+            },
+            master_running: Some(true),
+            forwards: vec![forward("buildbox", 5173, 5173)],
+        }];
+        report.pending_requests = 2;
+        let text = render_status(&report);
+        assert!(text.contains("buildbox -> user@10.0.0.9"), "{text}");
+        assert!(text.contains("master running"), "{text}");
+        assert!(text.contains("pending:      2"), "{text}");
+        assert!(text.contains("local (live control master)"), "{text}");
+    }
+
+    #[test]
+    fn an_unchecked_master_is_not_reported_as_absent() {
+        let mut report = empty_status();
+        report.hosts = vec![HostStatus {
+            host: Host {
+                name: "buildbox".to_string(),
+                target: "buildbox".to_string(),
+                prefix: None,
+            },
+            master_running: None,
+            forwards: Vec::new(),
+        }];
+        let text = render_status(&report);
+        assert!(text.contains("master not checked"), "{text}");
+        assert!(!text.contains("no master"), "{text}");
+    }
+
+    // -- interactive routing --------------------------------------------------
+
+    #[test]
+    fn a_terminal_gets_a_pane_and_anything_else_gets_a_report() {
+        assert!(interactive(false, true, true), "a person at a terminal");
+        assert!(
+            !interactive(false, false, false),
+            "a headless plugin action"
+        );
+        assert!(
+            !interactive(true, true, true),
+            "--json is never interactive, terminal or not"
+        );
+        assert!(!interactive(true, false, false));
+    }
+
+    #[test]
+    fn a_pane_needs_a_terminal_at_both_ends_of_it() {
+        // `herdr-portfwd add > add.txt` from an interactive shell: a keyboard
+        // on stdin, and nowhere to draw. Deciding from stdin alone put the tty
+        // in raw mode and painted a blind picker into `add.txt`, so the user
+        // got neither the report nor the refusal.
+        assert!(
+            !interactive(false, true, false),
+            "stdout is redirected: the frames would go into the redirect target"
+        );
+        // And the mirror image: a script feeding keys in with the screen still
+        // attached has no way to answer what the pane draws.
+        assert!(!interactive(false, false, true), "stdin is not a terminal");
+    }
+
+    /// The environment Herdr injects for a plugin action.
+    fn action_invocation() -> PluginInvocation {
+        PluginInvocation {
+            action_id: Some("portfwd.add".to_string()),
+            entrypoint_id: None,
+            plugin_id: Some("portfwd".to_string()),
+            herdr_bin: Some("/opt/herdr/bin/herdr".to_string()),
+        }
+    }
+
+    /// The environment a pane command gets: the same, plus the entrypoint id.
+    fn pane_invocation() -> PluginInvocation {
+        PluginInvocation {
+            entrypoint_id: Some("picker".to_string()),
+            ..action_invocation()
+        }
+    }
+
+    #[test]
+    fn a_command_told_which_port_to_act_on_never_opens_a_pane() {
+        // `scan` always has something left to pick, so it passes `true`; `add
+        // 5173` and `stop 5173` do not.
+        for interactive in [true, false] {
+            for plugin in [
+                PluginInvocation::default(),
+                action_invocation(),
+                pane_invocation(),
+            ] {
+                assert_eq!(
+                    route(interactive, false, &plugin),
+                    Route::Run,
+                    "the user already named a port"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_that_was_not_told_enough_goes_where_it_can_ask() {
+        let shell = PluginInvocation::default();
+        let action = action_invocation();
+        let pane = pane_invocation();
+        // An action Herdr injected no bin path into: there is nobody to ask.
+        let no_herdr = PluginInvocation {
+            herdr_bin: None,
+            ..action_invocation()
+        };
+        let cases: &[(&str, bool, &PluginInvocation, Route<'_>)] = &[
+            (
+                "a person at a terminal draws it here",
+                true,
+                &shell,
+                Route::Pane,
+            ),
+            (
+                // Herdr pipes an action's stdout and stderr but leaves stdin
+                // inherited, so a foreground `herdr server` hands its own tty
+                // to every action it spawns. Drawing there would read keys off
+                // the terminal Herdr is reading and never reach EOF.
+                "an action that inherited a terminal still asks Herdr, not the tty",
+                true,
+                &action,
+                Route::AskHerdr("portfwd"),
+            ),
+            (
+                "a headless action asks Herdr for the pane instead of refusing",
+                false,
+                &action,
+                Route::AskHerdr("portfwd"),
+            ),
+            (
+                "a pane command must not ask for another pane: that recurses",
+                false,
+                &pane,
+                Route::Refuse,
+            ),
+            (
+                "a shell invocation gets a sentence it can act on",
+                false,
+                &shell,
+                Route::Refuse,
+            ),
+            (
+                "an action with no herdr to ask still refuses",
+                false,
+                &no_herdr,
+                Route::Refuse,
+            ),
+        ];
+        for (what, interactive, plugin, expected) in cases {
+            assert_eq!(route(*interactive, true, plugin), *expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_pane_command_never_asks_herdr_to_open_a_pane_whatever_it_is_running() {
+        // The recursion guard, on its own: a pane whose command asked for a
+        // pane would launch a command that asked again.
+        let pane = pane_invocation();
+        for nothing_was_named in [true, false] {
+            assert!(
+                !matches!(route(false, nothing_was_named, &pane), Route::AskHerdr(_)),
+                "a pane command asked Herdr for another pane"
+            );
+        }
+    }
+
+    /// The environment Herdr injects for the `list` action, whose command is
+    /// the `list` pane's own argv.
+    fn manage_forwards_action() -> PluginInvocation {
+        PluginInvocation {
+            action_id: Some("portfwd.list".to_string()),
+            ..action_invocation()
+        }
+    }
+
+    #[test]
+    fn the_manage_forwards_action_asks_herdr_for_the_pane_instead_of_drawing() {
+        // `[[actions]] id = "list"` runs `pane-ui list`, and Herdr runs an
+        // action headless with both streams captured. Drawing there paints one
+        // frame of the overlay into the plugin log, hits EOF on stdin, and
+        // exits 0: the palette entry whose whole purpose is that pane showed
+        // the user nothing.
+        let action = manage_forwards_action();
+        for interactive in [true, false] {
+            assert_eq!(
+                pane_route(interactive, &action),
+                Route::AskHerdr("portfwd"),
+                "an action must ask Herdr for the pane, whatever its streams are"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_herdr_launched_draws_and_never_asks_for_another() {
+        // The pane command carries HERDR_PLUGIN_ENTRYPOINT_ID. If it asked, the
+        // pane Herdr opened would open a pane, whose command would ask again.
+        let pane = pane_invocation();
+        for interactive in [true, false] {
+            assert_eq!(pane_route(interactive, &pane), Route::Pane);
+        }
+    }
+
+    #[test]
+    fn a_pane_with_nowhere_to_draw_and_nobody_to_ask_refuses() {
+        // A hook, or a shell pipeline. Drawing would write a screenful of
+        // escape sequences into whatever captured stdout and exit 0.
+        let shell = PluginInvocation::default();
+        assert_eq!(pane_route(false, &shell), Route::Refuse);
+        assert_eq!(pane_route(true, &shell), Route::Pane, "a person at a tty");
+    }
+
+    #[test]
+    fn each_pane_entrypoint_opens_the_pane_the_manifest_describes() {
+        // `[[panes]] id = "list"` is the overlay of live forwards, and
+        // `id = "picker"` is the popup over listeners. Swapped, both still run.
+        assert_eq!(pane_for(PaneEntrypoint::List), Pane::Manager);
+        assert_eq!(pane_for(PaneEntrypoint::Picker), Pane::Picker);
+    }
+
+    #[test]
+    fn the_entrypoint_this_binary_asks_for_is_the_one_it_would_be_launched_with() {
+        // `entrypoint_id` names the pane to Herdr and `pane_for` reads Herdr's
+        // launch back. Disagreeing means asking for one pane and drawing the
+        // other.
+        for entrypoint in [PaneEntrypoint::List, PaneEntrypoint::Picker] {
+            let pane = pane_for(entrypoint);
+            let id = entrypoint_id(pane);
+            let parsed = Cli::try_parse_from(["herdr-portfwd", "pane-ui", id])
+                .unwrap_or_else(|err| panic!("herdr launches `pane-ui {id}`: {err}"));
+            match parsed.command {
+                Command::PaneUi { entrypoint } => assert_eq!(pane_for(entrypoint), pane),
+                other => panic!("expected pane-ui, got {other:?}"),
+            }
+        }
+        assert_eq!(entrypoint_id(Pane::Manager), "list");
+        assert_eq!(entrypoint_id(Pane::Picker), "picker");
+    }
+
+    // -- hostile text on every path out ---------------------------------------
+
+    /// What a remote can put in front of a local terminal: an OSC title change
+    /// terminated by a bell, a screen clear, and a bidi override that reorders
+    /// a rendered line without changing its width.
+    const HOSTILE: &str = "\u{1b}]0;pwned\u{7}\u{1b}[2J\u{202e}3715";
+
+    fn assert_nothing_a_terminal_would_obey(text: &str, what: &str) {
+        for (ch, name) in [
+            ('\u{1b}', "an escape"),
+            ('\u{7}', "a bell"),
+            ('\u{202e}', "a bidi override"),
+        ] {
+            assert!(!text.contains(ch), "{name} survived {what}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn an_ssh_failure_cannot_drive_the_terminal_reading_a_reconcile_report() {
+        // `DropReason`'s text is `ssh`'s stderr, which is the remote sshd's own
+        // output: the most attacker-influenced string in the program.
+        for reason in [
+            DropReason::Unreachable(HOSTILE.to_string()),
+            DropReason::ReAddFailed(HOSTILE.to_string()),
+        ] {
+            let text = render_reconcile(&ReconcileReport {
+                trigger: ReconcileTrigger::Event,
+                kept: Vec::new(),
+                readded: Vec::new(),
+                dropped: vec![Dropped {
+                    forward: forward("buildbox", 5173, 5173),
+                    reason,
+                }],
+            });
+            assert_nothing_a_terminal_would_obey(&text, "a drop reason");
+            assert!(text.contains("pwned"), "the reason itself is still there");
+        }
+    }
+
+    #[test]
+    fn a_pane_id_from_a_remote_request_is_sanitized_in_the_list() {
+        // Under `--remote` the pane id arrives in a request the remote wrote.
+        let mut hostile = forward("buildbox", 5173, 5173);
+        hostile.spec.pane_id = Some(HOSTILE.to_string());
+        let text = render_list(&ListReport {
+            host: "buildbox".to_string(),
+            master_running: Some(true),
+            forwards: vec![ForwardStatus {
+                forward: hostile,
+                live: Liveness::Live,
+            }],
+            pending: Vec::new(),
+            placement: remote_placement(),
+        });
+        assert_nothing_a_terminal_would_obey(&text, "a pane id");
+    }
+
+    #[test]
+    fn a_hostile_warning_or_host_name_is_sanitized_in_status() {
+        let mut report = empty_status();
+        report.warnings = vec![format!("skipping host: {HOSTILE}")];
+        report.selection_error = Some(format!("unknown host {HOSTILE}"));
+        report.hosts = vec![HostStatus {
+            host: Host {
+                name: HOSTILE.to_string(),
+                target: HOSTILE.to_string(),
+                prefix: None,
+            },
+            master_running: None,
+            forwards: Vec::new(),
+        }];
+        let text = render_status(&report);
+        assert_nothing_a_terminal_would_obey(&text, "a status report");
+    }
+
+    // -- shared helpers -----------------------------------------------------
+
+    #[test]
+    fn every_placement_reason_has_wording() {
+        for reason in [
+            PlacementReason::Forced,
+            PlacementReason::MirrorWorkspace,
+            PlacementReason::LiveMaster,
+            PlacementReason::MirroredPane,
+            PlacementReason::Assumed,
+        ] {
+            for placement in [Placement::Local, Placement::Remote] {
+                let text = placement_label(&Where { placement, reason });
+                assert!(!text.contains("()"), "empty reason for {reason:?}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_port_list_of_one_has_no_separator() {
+        assert_eq!(ports(&[5173]), "5173");
+        assert_eq!(ports(&[]), "");
+        assert_eq!(ports(&[0, 65535]), "0, 65535");
+    }
+
+    #[test]
+    fn every_render_ends_with_exactly_one_newline_per_line() {
+        // A report that forgets its trailing newline runs into the next log
+        // entry; one that doubles it pads the log.
+        let texts = [
+            render_stop(&StopOutcome {
+                host: "buildbox".to_string(),
+                stopped: Vec::new(),
+            }),
+            render_add(&AddOutcome {
+                spec: spec("buildbox", 5173, 5173),
+                applied: Applied::Forwarded,
+                request_id: None,
+                placement: local_placement(),
+            }),
+            render_status(&empty_status()),
+        ];
+        for text in texts {
+            assert!(text.ends_with('\n'), "{text:?}");
+            assert!(!text.ends_with("\n\n"), "{text:?}");
         }
     }
 }

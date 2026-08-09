@@ -60,9 +60,18 @@ herdr server reload-config
 
 This also links the CLI at `~/.local/bin/herdr-portfwd`.
 
-Hosts are read from `~/.config/herdr-mirror/hosts.toml` when it exists, so
-[herdr-mirror](https://github.com/nikok6/herdr-mirror) users need no extra
-configuration. Otherwise create `~/.config/herdr-portfwd/hosts.toml`:
+Hosts are read from the **first** of these files that exists:
+
+1. `~/.config/herdr-portfwd/hosts.toml`
+2. `~/.config/herdr-mirror/hosts.toml`
+
+The format is the same, so [herdr-mirror](https://github.com/nikok6/herdr-mirror)
+users need no extra configuration. If both files exist the herdr-portfwd one
+wins and the herdr-mirror one is ignored entirely — they are not merged.
+`herdr-portfwd status` prints the file it loaded and lists the other as
+`shadowed`, so a host that seems to have gone missing is one line away.
+
+To configure hosts yourself, create `~/.config/herdr-portfwd/hosts.toml`:
 
 ```toml
 [hosts.buildbox]
@@ -118,7 +127,7 @@ forward, its owning pane, and a key to stop it.
 | Action | Does |
 | --- | --- |
 | `portfwd.scan` | list attributed remote listeners and forward the chosen ones |
-| `portfwd.add` | forward a port you type |
+| `portfwd.add` | forward a port; opens the picker when no port was named |
 | `portfwd.list` | overlay of live forwards, with stop keys |
 | `portfwd.stop` | stop a selected forward |
 | `portfwd.stop-all` | stop every forward for the current host |
@@ -164,6 +173,60 @@ require_pane_attribution = true
 workspace = "scholion"
 ports = [5173, 8787]
 ```
+
+## Troubleshooting
+
+### Start with `status`
+
+```bash
+herdr-portfwd status
+```
+
+It answers instead of failing, which is the point: it is what to run when
+something is already wrong. It prints which `hosts.toml` was loaded and which
+files that shadows, where the state and request files live, which host this
+invocation resolves to **and by which rule**, whether a control master is up
+per host, the forwards recorded for each, and how many requests are still
+waiting for the local agent. `--json` if you want to grep it.
+
+The full log of what Herdr ran is `herdr plugin log list --plugin portfwd` — on
+the machine running the server, which under `herdr --remote` is the remote one.
+
+### `--host`: act on a host other than the one that was picked
+
+Every command takes it, and it beats every other signal — the mirror prefix on
+the invoking workspace, `default_host`, and the only-one-host-configured rule:
+
+```bash
+herdr-portfwd list --host buildbox
+```
+
+`HERDR_PORTFWD_HOST` does the same from a shell. Reach for it when `status`
+reports the wrong host, or none: *"cannot tell which host to use"* means several
+hosts are configured and nothing about the invocation pointed at one.
+
+### `HERDR_PORTFWD_MODE`: override which side the tool thinks it is on
+
+Only a process on *your* machine can open a port on it, so the plugin has to
+know which side of the SSH connection it is running on. Nothing Herdr injects
+says so, so it works it out: a mirrored workspace prefix, then a live control
+master here, then a mirrored pane on this server, and otherwise it assumes it is
+on the remote and records a request for the local agent. `status` reports both
+the answer and the reason, for example `local (live control master)`.
+
+When that inference is wrong, say so:
+
+```bash
+HERDR_PORTFWD_MODE=local herdr-portfwd add 5173    # open the port from here
+HERDR_PORTFWD_MODE=remote herdr-portfwd add 5173   # record a request for the local agent
+```
+
+The value wins over every rule above, and `status` then reads
+`local (HERDR_PORTFWD_MODE)`. Anything other than `local` or `remote` is
+ignored rather than fatal. Set it per command rather than exporting it: `local`
+where the tool is not on your machine binds a port nobody can reach, and
+`remote` on your own machine leaves a request that only
+`herdr-portfwd attach <host>` starts an agent to apply.
 
 ## Security
 

@@ -13,6 +13,15 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::todo, clippy::dbg_macro)]
 
+/// The plugin id this crate is registered under.
+///
+/// It is `id` in `herdr-plugin.toml`, repeated here because talking back to
+/// Herdr means naming the plugin: `plugin pane open --plugin <id>`. Herdr
+/// injects the same value as `HERDR_PLUGIN_ID`, which is preferred when it is
+/// there; this is the fallback, and a test in `tests/cli.rs` reads the manifest
+/// to keep the two from drifting apart.
+pub const PLUGIN_ID: &str = "portfwd";
+
 pub mod actions;
 pub mod cli;
 pub mod config;

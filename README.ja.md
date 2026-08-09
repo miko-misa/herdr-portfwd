@@ -57,9 +57,18 @@ herdr server reload-config
 
 `~/.local/bin/herdr-portfwd` に CLI も張られます。
 
-ホスト定義は `~/.config/herdr-mirror/hosts.toml` があればそれを読むので、
-[herdr-mirror](https://github.com/nikok6/herdr-mirror) を使っているなら追加の設定は
-不要です。そうでなければ `~/.config/herdr-portfwd/hosts.toml` を作ってください:
+ホスト定義は、次のうち**最初に見つかった**ファイルから読みます:
+
+1. `~/.config/herdr-portfwd/hosts.toml`
+2. `~/.config/herdr-mirror/hosts.toml`
+
+書式は同じなので、[herdr-mirror](https://github.com/nikok6/herdr-mirror) を
+使っているなら追加の設定は不要です。両方のファイルがある場合は herdr-portfwd 側が
+優先され、herdr-mirror 側は完全に無視されます——マージはしません。
+`herdr-portfwd status` が、読み込んだファイルと、それに隠された（`shadowed`）
+ファイルを表示するので、ホストが消えたように見えるときは 1 行で分かります。
+
+自分で書く場合は `~/.config/herdr-portfwd/hosts.toml` を作ってください:
 
 ```toml
 [hosts.buildbox]
@@ -115,7 +124,7 @@ Cmd+クリックではなく Ctrl+クリックなのは、端末のマウスレ�
 | アクション | 動作 |
 | --- | --- |
 | `portfwd.scan` | 帰属済みのリモートリスナーを一覧し、選んだものを転送 |
-| `portfwd.add` | 入力したポートを転送 |
+| `portfwd.add` | ポートを転送（ポート未指定ならピッカーを開く） |
 | `portfwd.list` | 生きている転送のオーバーレイ（停止キー付き） |
 | `portfwd.stop` | 選んだ転送を停止 |
 | `portfwd.stop-all` | 現在のホストの転送をすべて停止 |
@@ -161,6 +170,62 @@ require_pane_attribution = true
 workspace = "scholion"
 ports = [5173, 8787]
 ```
+
+## うまく動かないとき
+
+### まず `status`
+
+```bash
+herdr-portfwd status
+```
+
+何かがすでにおかしいときに実行するコマンドなので、失敗せずに「報告」します。
+読み込んだ `hosts.toml` とそれが隠しているファイル、状態ファイルとリクエスト
+ファイルの場所、この呼び出しがどのホストに解決されたか**とその理由**、ホストごとの
+コントロールマスターの有無、記録されている転送、ローカルエージェント待ちの
+リクエスト数を表示します。grep したいときは `--json` を付けてください。
+
+Herdr が実行したコマンドの記録は `herdr plugin log list --plugin portfwd` に
+あります。サーバーが動いているマシン側——`herdr --remote` ならリモート側——です。
+
+### `--host`: 選ばれたのと違うホストを対象にする
+
+すべてのコマンドで使え、他のどの手掛かりよりも優先されます（呼び出し元
+ワークスペースのミラー接頭辞、`default_host`、ホストが 1 つだけという規則、
+いずれよりも強い）:
+
+```bash
+herdr-portfwd list --host buildbox
+```
+
+シェルからは `HERDR_PORTFWD_HOST` でも同じことができます。`status` が違うホストを
+指している、あるいは何も選べていないときに使ってください。*"cannot tell which host
+to use"* は、複数のホストが設定されていて、呼び出しからはどれとも決められなかった、
+という意味です。
+
+### `HERDR_PORTFWD_MODE`: どちら側にいるかの判定を上書きする
+
+あなたのマシンにポートを開けるのは、そのマシン上のプロセスだけです。そのため
+プラグインは、自分が SSH 接続のどちら側で動いているかを知る必要があります。
+Herdr が渡す情報にそれを示すものはないので、次の順で推定します: ミラーされた
+ワークスペースの接頭辞、ここで生きているコントロールマスター、このサーバーに
+ミラーされたペイン、いずれでもなければリモート側とみなしてローカルエージェント宛の
+リクエストを記録する。`status` は結論と理由の両方を、たとえば
+`local (live control master)` のように表示します。
+
+その推定が外れているときは、明示してください:
+
+```bash
+HERDR_PORTFWD_MODE=local herdr-portfwd add 5173    # ここでポートを開く
+HERDR_PORTFWD_MODE=remote herdr-portfwd add 5173   # ローカルエージェント宛にリクエストを記録
+```
+
+この値は上のどの規則よりも優先され、`status` は `local (HERDR_PORTFWD_MODE)` と
+表示します。`local` / `remote` 以外の値は致命的エラーにはせず無視します。export
+せず、コマンドごとに指定してください。あなたのマシンでないところで `local` に
+すると誰も到達できないポートを開き、自分のマシンで `remote` にすると、
+`herdr-portfwd attach <host>` でエージェントを起動しない限り、誰も適用しない
+リクエストが残ります。
 
 ## セキュリティ
 
