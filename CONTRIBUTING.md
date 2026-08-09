@@ -17,7 +17,7 @@ can agree on the shape before you spend time on it.
 ## Setup
 
 ```bash
-git clone https://github.com/hacnosuke/herdr-portfwd
+git clone https://github.com/miko-misa/herdr-portfwd
 cd herdr-portfwd
 just check
 ```

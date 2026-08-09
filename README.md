@@ -1,6 +1,6 @@
 # herdr-portfwd
 
-[![CI](https://github.com/hacnosuke/herdr-portfwd/actions/workflows/ci.yml/badge.svg)](https://github.com/hacnosuke/herdr-portfwd/actions/workflows/ci.yml)
+[![CI](https://github.com/miko-misa/herdr-portfwd/actions/workflows/ci.yml/badge.svg)](https://github.com/miko-misa/herdr-portfwd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A [Herdr](https://herdr.dev) plugin that brings dev-server ports from your
@@ -54,7 +54,7 @@ exists, but it is opt-in per workspace.
 ## Install
 
 ```bash
-herdr plugin install hacnosuke/herdr-portfwd
+herdr plugin install miko-misa/herdr-portfwd
 herdr server reload-config
 ```
 
