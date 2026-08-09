@@ -87,11 +87,45 @@ tool splits into two halves that talk through a serialized request:
   plugin (remote) ─> requests.json (remote)
                                 │  polled over the local agent's own SSH master
                      local-agent (local) ─────────────────> ssh -L
+                                │  writes back how far it got, over the same
+                                v  master
+                     requests.acked (remote)
+                                │  folded into every read of the queue, so the
+                                v  plugin's own view agrees
+                     list / status (remote)
                     └──────────────────────────────────────┘
 ```
 
 The same request record drives both paths. Only the transport differs, and only
 `local_agent` knows about the difference.
+
+### Settling a request
+
+A request is *settled* once the applier knows what became of it: applied,
+skipped as somebody else's, or expired. Only the applier can know that, and
+under `--remote` the applier is not the process that wrote the request. So the
+mark saying how far it has got travels back to the writer, in a second file
+beside the queue.
+
+- **`requests.json`** is written under this crate's lock, only by processes that
+  link this crate. It carries the queue and its own high-water mark.
+- **`requests.acked`** is one decimal integer, replaced by a rename. The local
+  agent reaches a remote state directory only as a shell command over an SSH
+  master, where it cannot take that lock — but a single integer under a single
+  writer can be replaced safely from a shell, and a truncated read of one is
+  impossible to misread. The request file itself is never rewritten from over
+  there: a lost enqueue is a Ctrl+click that silently did nothing.
+
+Every read of the queue folds the mark in. That is what keeps `list` and
+`status` — which run wherever the *plugin* runs, so under `--remote` on the far
+side from the agent — from reporting an applied request as still waiting, and
+what keeps a restarted agent from re-opening a port the user has since stopped.
+
+The mark only ever advances, and only over an unbroken run of settled requests.
+A request the agent could not apply — the local port is held by a different
+forward, the master refused it — stays pending and is retried, until its TTL
+makes it expired, which *is* a settlement. Marking a request the agent merely
+tried to apply is the one move that loses a forward with nothing said.
 
 ### Why the local agent owns its own SSH ControlMaster
 
@@ -140,6 +174,11 @@ be cycle-guarded and depth-capped: PID reuse can produce a loop.
 Silent forwarding is never the default. L2's candidate set is already filtered
 by attribution, so infrastructure ports never reach a notification.
 
+An L1 action over a port L2 or L3 already opened is not a no-op: it **pins** the
+forward. The record becomes explicit, so the `reconcile` that follows the owning
+pane exiting keeps a port the user asked to keep. Never the reverse — a
+detection over a pinned forward leaves the pin alone.
+
 ## Port numbering: same number, or fail loudly
 
 The local port defaults to the same number as the remote port, because the
@@ -162,7 +201,7 @@ Leaf modules have no dependencies on each other and are independently testable.
 | `ssh` | ControlMaster lifecycle, `-O forward/cancel/check` | `SshRunner` trait |
 | `discover` | `lsof`/`ss`/`ps` parsing, ancestry attribution | pure functions over fixtures |
 | `state` | `forwards.json`, advisory locking, atomic replace | filesystem, `tempfile` in tests |
-| `request` | `requests.json`, the mode-bridging record | pure serde + file edge |
+| `request` | `requests.json` + `requests.acked`, the mode-bridging record | pure serde + file edge |
 | `actions` | add / stop / stop-all / scan / open-url / list | composed over traits |
 | `local_agent` | `--remote` polling loop, offer/apply | composed over traits |
 | `ui` | manager pane rendering and key handling | pure render from a snapshot |
@@ -192,7 +231,12 @@ These are the properties tests must defend.
 7. Nothing is forwarded without an L1 action, an accepted L2 offer, or an L3
    allowlist match.
 8. Paths that become Unix socket addresses are length-checked before use.
-9. No user-controlled string reaches a shell. Commands are argv arrays.
+9. No user-controlled string reaches a shell. Commands started on this machine
+   are argv arrays. `ssh` hands a remote command to the remote login shell, so
+   over there the rule is kept from the other side instead: the snippets that
+   locate the request file and move the applier's mark are fixed text whose only
+   interpolation is a `u64`, and a `herdr` argv is quoted word by word so it
+   survives exactly one round of shell parsing.
 10. A command that was not told enough goes to the one place that can ask: a
     plugin action asks Herdr to open the pane (fact 8), a terminal draws it
     itself, and anything else refuses with what was missing named. The injected
@@ -208,6 +252,16 @@ These are the properties tests must defend.
     `GatewayPorts`, and a request's `remote_bind` is clamped to loopback rather
     than obeyed. A remote decides *that* a forward is wanted, never *where* it
     goes.
+12. A request is settled — applied, skipped, or expired — exactly once, and only
+    by the applier, which is the only party that knows what became of it. A
+    settled request is never applied again: not by a re-read, not by being
+    written back, not by a restarted agent. One the applier could not apply is
+    not settled; it stays pending and is retried until its TTL expires it.
+13. A record answers a request only when it describes the same forward, not
+    merely when it sits on the same local port. Two forwards can want one local
+    port, and invariant 1 governs that collision wherever it is met: `add` on
+    this machine and the local agent applying a request must both report it
+    rather than treat the other forward as the one that was asked for.
 
 ## Non-goals for v1
 

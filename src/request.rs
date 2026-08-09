@@ -13,8 +13,17 @@
 //!
 //! Requests are also idempotent and self-expiring: the agent may read the same
 //! file twice, and a request nobody consumed must not be applied hours later.
+//!
+//! Only the applier knows a request was applied, and under `herdr --remote` the
+//! applier is not the process that wrote the request — it is the local agent,
+//! reaching this directory through a shell on the far side of an SSH master. It
+//! therefore records what it finished with in a second file, [`ACK_FILE`], and
+//! everything here folds that mark in before answering. That is what keeps
+//! `list` and `status` — which run wherever the *plugin* runs — from reporting
+//! an applied request as still waiting, and what keeps a restarted agent from
+//! opening a port the user has since stopped.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +32,17 @@ use crate::types::{ForwardSpec, Origin};
 
 /// File holding pending requests, inside the state directory.
 pub const REQUEST_FILE: &str = "requests.json";
+
+/// File carrying the applier's high-water mark, next to [`REQUEST_FILE`].
+///
+/// A separate file because the two have different writers. Requests are written
+/// under this crate's lock by a process that links this crate; the mark is
+/// written by the applier, which under `herdr --remote` can only reach this
+/// directory as a shell command over SSH and cannot take that lock. One decimal
+/// integer and nothing else, so the writer needs no more than a temp file and a
+/// rename, a truncated read is impossible to misinterpret, and a missing file
+/// simply means "nothing applied yet".
+pub const ACK_FILE: &str = "requests.acked";
 
 /// Schema version stamped into the file. Informational: every field is
 /// optional on the way in.
@@ -130,15 +150,6 @@ pub enum Push {
     Stale,
 }
 
-/// What one poll of the log yielded.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Due {
-    /// Requests to apply, oldest id first.
-    pub ready: Vec<Request>,
-    /// Requests nobody consumed in time. Reported, never applied.
-    pub expired: Vec<Request>,
-}
-
 /// On-disk shape. Every field defaults so an older reader survives a newer
 /// writer, and a partially-understood document still yields its requests.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -167,6 +178,7 @@ impl Queue {
 /// second copy of that discipline would be a second chance to get it wrong.
 pub struct RequestLog {
     file: JsonFile<Queue>,
+    ack_path: PathBuf,
 }
 
 impl RequestLog {
@@ -177,6 +189,7 @@ impl RequestLog {
     pub fn with_reporter(dir: impl AsRef<Path>, reporter: Reporter) -> Result<Self> {
         Ok(Self {
             file: JsonFile::open(dir.as_ref(), REQUEST_FILE, reporter)?,
+            ack_path: dir.as_ref().join(ACK_FILE),
         })
     }
 
@@ -190,10 +203,30 @@ impl RequestLog {
         self.file.path()
     }
 
+    /// Where the applier records what it has finished with.
+    pub fn ack_path(&self) -> &Path {
+        &self.ack_path
+    }
+
+    /// The applier's high-water mark, or zero when there is none.
+    ///
+    /// A missing, unreadable or nonsensical file reads as zero rather than as
+    /// an error. The mark can only ever *remove* requests, so the safe reading
+    /// of a damaged one is "nothing has been applied", which at worst leaves a
+    /// request pending that the agent will recognise and skip.
+    fn ack_mark(&self) -> u64 {
+        std::fs::read_to_string(&self.ack_path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     /// Queue a request, allocating its id under the same lock that writes it.
     /// Two processes enqueueing at once therefore cannot collide on an id.
     pub fn enqueue(&self, spec: ForwardSpec, created_unix_ms: u64) -> Result<Request> {
-        self.file.update(|queue| {
+        let mark = self.ack_mark();
+        self.file.update(move |queue| {
+            settle_to(queue, mark);
             let request = Request::new(queue.next_id(), created_unix_ms, spec);
             apply_push(queue, request.clone());
             queue.version = REQUEST_VERSION;
@@ -204,56 +237,70 @@ impl RequestLog {
     /// Offer a request built elsewhere — a retry, or one relayed from another
     /// machine. Ids at or below the high-water mark are dropped.
     pub fn push(&self, request: Request) -> Result<Push> {
-        self.file.update(|queue| {
+        let mark = self.ack_mark();
+        self.file.update(move |queue| {
+            settle_to(queue, mark);
             let outcome = apply_push(queue, request);
             queue.version = REQUEST_VERSION;
             outcome
         })
     }
 
-    /// Look without consuming.
+    /// Look without consuming. What `list` and `status` report as waiting for
+    /// the applier, so it has to account for what the applier already did.
     pub fn pending(&self) -> Result<Vec<Request>> {
         let mut queue = self.file.read()?;
+        settle_to(&mut queue, self.ack_mark());
         normalize(&mut queue.pending);
         Ok(queue.pending)
     }
 
-    /// Consume everything pending, splitting it into what is still applicable
-    /// at `now_unix_ms` and what timed out. Both halves advance the high-water
-    /// mark: an expired request must not come back by being written again.
-    pub fn take_due(&self, now_unix_ms: u64, ttl_ms: u64) -> Result<Due> {
-        self.file.update(|queue| {
-            normalize(&mut queue.pending);
-            let taken = std::mem::take(&mut queue.pending);
-            if let Some(highest) = taken.iter().map(|r| r.id).max() {
-                queue.last_consumed_id = queue.last_consumed_id.max(highest);
-            }
+    /// Record that the applier has finished with every request up to and
+    /// including `id` — applied, skipped, or expired — and drop them.
+    ///
+    /// Deliberately *not* "hand me everything pending and mark it consumed":
+    /// the applier learns what happened to a request only after it has tried,
+    /// and a forward that failed has to stay pending for the next pass. A
+    /// take-then-apply API advances the mark past exactly those, which is a
+    /// dropped forward with nothing said. The applier names what it settled.
+    ///
+    /// For an applier that cannot link this crate — the local agent, which
+    /// reaches a remote state directory only through a shell — the equivalent
+    /// is writing [`ACK_FILE`], which every read here folds in.
+    pub fn consume_through(&self, id: u64) -> Result<Vec<Request>> {
+        let mark = self.ack_mark().max(id);
+        self.file.update(move |queue| {
+            let settled = settle_to(queue, mark);
             queue.version = REQUEST_VERSION;
-            let (expired, ready) = taken
-                .into_iter()
-                .partition(|r| r.is_expired(now_unix_ms, ttl_ms));
-            Due { ready, expired }
+            settled
         })
     }
 
-    /// Drop everything pending without applying it, advancing the high-water
-    /// mark so none of it can be re-offered. For `stop-all`, where queued
-    /// requests are exactly what the user just said they did not want.
-    pub fn clear(&self) -> Result<Vec<Request>> {
-        self.file.update(|queue| {
-            let dropped = std::mem::take(&mut queue.pending);
-            if let Some(highest) = dropped.iter().map(|r| r.id).max() {
-                queue.last_consumed_id = queue.last_consumed_id.max(highest);
-            }
-            queue.version = REQUEST_VERSION;
-            dropped
-        })
-    }
-
-    /// Highest id consumed so far.
+    /// Highest id settled so far, by whichever applier got there.
     pub fn last_consumed_id(&self) -> Result<u64> {
-        Ok(self.file.read()?.last_consumed_id)
+        Ok(self.file.read()?.last_consumed_id.max(self.ack_mark()))
     }
+}
+
+/// Carry `mark` into `queue` and drop everything it covers, returning what was
+/// dropped.
+///
+/// The high-water mark is the whole idempotency story: a request at or below it
+/// has been applied, skipped or expired, and must never be applied again — not
+/// by a re-read, not by a re-write, and not by an agent that restarted.
+fn settle_to(queue: &mut Queue, mark: u64) -> Vec<Request> {
+    queue.last_consumed_id = queue.last_consumed_id.max(mark);
+    let cut = queue.last_consumed_id;
+    let mut settled = Vec::new();
+    queue.pending.retain(|request| {
+        if request.id <= cut {
+            settled.push(request.clone());
+            false
+        } else {
+            true
+        }
+    });
+    settled
 }
 
 /// Queue a request into `queue`, enforcing the idempotency rules. Pure, so the
@@ -457,10 +504,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let (log, recorder) = recording_log(dir.path());
         assert!(log.pending().expect("read").is_empty());
-        assert_eq!(
-            log.take_due(NOW, DEFAULT_TTL_MS).expect("take"),
-            Due::default()
-        );
+        assert!(log.consume_through(9).expect("consume").is_empty());
         assert!(recorder.messages().is_empty());
     }
 
@@ -517,23 +561,46 @@ mod tests {
         // unrelated one.
         let dir = tempfile::tempdir().expect("temp dir");
         let log = log_in(dir.path());
-        log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
-        log.take_due(NOW, DEFAULT_TTL_MS).expect("take");
+        let first = log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
+        log.consume_through(first.id).expect("consume");
         let next = log.enqueue(spec("buildbox", 3000), NOW).expect("enqueue");
         assert_eq!(next.id, 2);
     }
 
     #[test]
-    fn taking_the_same_log_twice_applies_a_request_once() {
+    fn consuming_the_same_request_twice_settles_it_once() {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = log_in(dir.path());
         log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
 
-        let first = log.take_due(NOW, DEFAULT_TTL_MS).expect("take");
-        let second = log.take_due(NOW, DEFAULT_TTL_MS).expect("take again");
+        let first = log.consume_through(1).expect("consume");
+        let second = log.consume_through(1).expect("consume again");
 
-        assert_eq!(first.ready.len(), 1);
-        assert!(second.ready.is_empty(), "a second read must not re-apply");
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty(), "a second consume must not re-apply");
+    }
+
+    #[test]
+    fn consuming_settles_everything_at_or_below_the_id_and_nothing_above() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = log_in(dir.path());
+        for port in [5173u16, 3000, 8080] {
+            log.enqueue(spec("buildbox", port), NOW).expect("enqueue");
+        }
+
+        let settled = log.consume_through(2).expect("consume");
+
+        assert_eq!(
+            settled.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "only what the applier said it finished with"
+        );
+        let pending = log.pending().expect("read");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].id, 3,
+            "a request the applier has not reached stays pending"
+        );
     }
 
     #[test]
@@ -541,7 +608,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = log_in(dir.path());
         let request = log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
-        log.take_due(NOW, DEFAULT_TTL_MS).expect("take");
+        log.consume_through(request.id).expect("consume");
 
         assert_eq!(log.push(request).expect("push"), Push::Stale);
         assert!(log.pending().expect("read").is_empty());
@@ -597,47 +664,30 @@ mod tests {
     }
 
     #[test]
-    fn expired_requests_are_reported_and_never_returned_as_ready() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let log = log_in(dir.path());
-        log.enqueue(spec("buildbox", 5173), NOW).expect("stale one");
-        log.enqueue(spec("buildbox", 3000), NOW + DEFAULT_TTL_MS)
-            .expect("fresh one");
-
-        let due = log
-            .take_due(NOW + DEFAULT_TTL_MS + 1, DEFAULT_TTL_MS)
-            .expect("take");
-
-        assert_eq!(due.ready.len(), 1);
-        assert_eq!(due.ready[0].local_port, 3000);
-        assert_eq!(due.expired.len(), 1);
-        assert_eq!(due.expired[0].local_port, 5173);
-    }
-
-    #[test]
-    fn an_expired_request_cannot_be_pushed_back_in() {
+    fn a_request_the_applier_gave_up_on_cannot_be_pushed_back_in() {
+        // The applier settles an expired request the same way it settles an
+        // applied one: by naming it. Coming back through a re-write would be a
+        // forward the user asked for a quarter of an hour ago.
         let dir = tempfile::tempdir().expect("temp dir");
         let log = log_in(dir.path());
         let request = log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
-        let due = log
-            .take_due(NOW + DEFAULT_TTL_MS + 1, DEFAULT_TTL_MS)
-            .expect("take");
-        assert_eq!(due.expired.len(), 1);
+        assert!(request.is_expired(NOW + DEFAULT_TTL_MS + 1, DEFAULT_TTL_MS));
+        log.consume_through(request.id).expect("consume");
 
         assert_eq!(log.push(request).expect("push"), Push::Stale);
+        assert!(log.pending().expect("read").is_empty());
     }
 
     #[test]
-    fn ready_requests_come_back_in_the_order_they_were_queued() {
+    fn pending_requests_come_back_in_the_order_they_were_queued() {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = log_in(dir.path());
         for port in [5173u16, 3000, 8080] {
             log.enqueue(spec("buildbox", port), NOW).expect("enqueue");
         }
         let ports: Vec<u16> = log
-            .take_due(NOW, DEFAULT_TTL_MS)
-            .expect("take")
-            .ready
+            .pending()
+            .expect("read")
             .iter()
             .map(|r| r.local_port)
             .collect();
@@ -645,14 +695,113 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_pending_requests_and_bars_their_return() {
+    fn consuming_everything_bars_its_return() {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = log_in(dir.path());
         let request = log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
 
-        assert_eq!(log.clear().expect("clear").len(), 1);
+        assert_eq!(log.consume_through(u64::MAX).expect("consume").len(), 1);
         assert!(log.pending().expect("read").is_empty());
         assert_eq!(log.push(request).expect("push"), Push::Stale);
+    }
+
+    // -- the applier's mark, written from outside this crate ----------------
+
+    /// What the local agent's shell snippet leaves on a remote host: one
+    /// decimal integer, written by a rename.
+    fn write_ack(log: &RequestLog, mark: u64) {
+        fs::write(log.ack_path(), format!("{mark}\n")).expect("write the mark");
+    }
+
+    #[test]
+    fn a_request_the_applier_marked_applied_is_no_longer_pending() {
+        // The bug this exists for: the agent applied the request and forwarded
+        // the port, and `status` went on reporting it as waiting for the agent
+        // until the file was deleted by hand.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = log_in(dir.path());
+        let request = log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
+
+        write_ack(&log, request.id);
+
+        assert!(
+            log.pending().expect("read").is_empty(),
+            "an applied request is not waiting for anybody"
+        );
+        assert_eq!(log.last_consumed_id().expect("read"), request.id);
+    }
+
+    #[test]
+    fn the_appliers_mark_leaves_later_requests_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = log_in(dir.path());
+        log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
+        let later = log.enqueue(spec("buildbox", 3000), NOW).expect("enqueue");
+
+        write_ack(&log, 1);
+
+        let pending = log.pending().expect("read");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, later.id);
+    }
+
+    #[test]
+    fn a_marked_request_cannot_be_re_queued_and_does_not_reuse_its_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = log_in(dir.path());
+        let request = log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
+        write_ack(&log, request.id);
+
+        assert_eq!(
+            log.push(request).expect("push"),
+            Push::Stale,
+            "a mark bars a replay exactly as a local consume does"
+        );
+        let next = log.enqueue(spec("buildbox", 3000), NOW).expect("enqueue");
+        assert_eq!(next.id, 2, "ids stay past everything the applier settled");
+    }
+
+    #[test]
+    fn a_write_prunes_what_the_applier_has_already_settled() {
+        // The applier cannot take this crate's lock from a remote shell, so the
+        // file only shrinks when a writer that *can* touches it next.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = log_in(dir.path());
+        log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
+        write_ack(&log, 1);
+
+        log.enqueue(spec("buildbox", 3000), NOW).expect("enqueue");
+
+        let raw = fs::read_to_string(log.path()).expect("read the file back");
+        assert!(
+            !raw.contains("5173"),
+            "the settled request is still there:\n{raw}"
+        );
+        assert!(raw.contains("3000"));
+    }
+
+    #[test]
+    fn an_unusable_mark_file_reads_as_nothing_applied() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (log, recorder) = recording_log(dir.path());
+        log.enqueue(spec("buildbox", 5173), NOW).expect("enqueue");
+
+        for junk in [
+            "",
+            "   ",
+            "not a number",
+            "-1",
+            "9\n9",
+            "18446744073709551616",
+        ] {
+            fs::write(log.ack_path(), junk).expect("write junk");
+            assert_eq!(
+                log.pending().expect("read").len(),
+                1,
+                "{junk:?} must not settle anything"
+            );
+        }
+        assert!(recorder.messages().is_empty(), "and it is not a failure");
     }
 
     #[test]
@@ -709,7 +858,7 @@ mod tests {
         for port in 5000..5010u16 {
             log.enqueue(spec("buildbox", port), NOW).expect("enqueue");
         }
-        log.take_due(NOW, DEFAULT_TTL_MS).expect("take");
+        log.consume_through(u64::MAX).expect("consume");
 
         let leftovers: Vec<String> = fs::read_dir(dir.path())
             .expect("read dir")
@@ -770,26 +919,27 @@ mod tests {
             }
         });
 
+        // What the agent does: read, decide, then settle exactly what it
+        // reached. The two steps are not one lock, so the consume must not take
+        // anything the read did not hand over.
         let consumer = log_in(dir.path());
         let mut seen: Vec<u64> = Vec::new();
+        let consume = |seen: &mut Vec<u64>| {
+            let batch = consumer.pending().expect("read");
+            if let Some(highest) = batch.iter().map(|r| r.id).max() {
+                consumer.consume_through(highest).expect("consume");
+                seen.extend(batch.iter().map(|r| r.id));
+            }
+        };
         // Bounded so a regression that drops requests fails the test instead of
         // spinning here forever.
         let mut polls = 0;
         while seen.len() < total as usize && polls < 100_000 {
-            let due = consumer.take_due(NOW, DEFAULT_TTL_MS).expect("take");
-            seen.extend(due.ready.iter().map(|r| r.id));
-            assert!(due.expired.is_empty());
+            consume(&mut seen);
             polls += 1;
         }
         writer.join().expect("writer thread panicked");
-        seen.extend(
-            consumer
-                .take_due(NOW, DEFAULT_TTL_MS)
-                .expect("final take")
-                .ready
-                .iter()
-                .map(|r| r.id),
-        );
+        consume(&mut seen);
 
         let mut unique = seen.clone();
         unique.sort_unstable();

@@ -215,6 +215,56 @@ pub fn pad_to_width(text: &str, width: usize) -> String {
     out
 }
 
+/// Cut an already-painted line to `max` cells.
+///
+/// [`truncate_to_width`] is only ever handed sanitized text, so it may cut
+/// anywhere; a finished frame line has colour codes in it, and cutting one in
+/// half would send the tail of an escape sequence to the terminal as text. This
+/// copies every sequence through whole, counts only glyphs, and closes with a
+/// reset when it cut a painted line, so a colour opened before the cut cannot
+/// leak into the rest of the pane.
+///
+/// A frame that overflowed its pane would wrap, and a wrapped line costs a row
+/// the height budget already spent — the status line alone can carry an ssh
+/// error of any length — so every line goes through here on the way in.
+fn clamp_line(line: &str, max: usize) -> String {
+    if display_width(line) <= max {
+        return line.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    let mut painted = false;
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            painted = true;
+            out.push(ch);
+            for next in chars.by_ref() {
+                out.push(next);
+                if matches!(next, '\u{40}'..='\u{7e}') && next != '[' && next != 'O' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push(TRUNCATION_MARK);
+    if painted {
+        out.push_str(RESET);
+    }
+    out
+}
+
 /// Pad on the left to `width` cells.
 pub fn pad_left(text: &str, width: usize) -> String {
     let have = display_width(text);
@@ -260,6 +310,18 @@ fn paint(text: &str, code: &str, color: bool) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Re-enter reverse video after every reset inside `line`.
+///
+/// `RESET` clears *all* attributes, reverse video included, so a highlighted row
+/// would stop being highlighted at its first painted cell — the yellow local
+/// port of a remapped forward closes with a reset, and everything right of it
+/// would render as an ordinary row. SGR has no portable "reset colour but keep
+/// the rest", so the row re-asserts the highlight immediately after each reset
+/// instead, with no glyph in between.
+fn keep_reverse(line: &str) -> String {
+    line.replace(RESET, &format!("{RESET}{REVERSE}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +450,9 @@ pub struct ListSnapshot {
     pub title: String,
     pub rows: Vec<ForwardRow>,
     pub selected: usize,
+    /// First row on screen. What the pane remembers of its own scrolling; see
+    /// [`scroll_top`] for why it is remembered rather than recomputed.
+    pub top: usize,
     pub status: Option<Status>,
     pub width: usize,
     pub height: usize,
@@ -400,6 +465,7 @@ impl Default for ListSnapshot {
             title: "Port forwards".to_string(),
             rows: Vec::new(),
             selected: 0,
+            top: 0,
             status: None,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
@@ -428,6 +494,8 @@ pub struct PickerSnapshot {
     pub host: String,
     pub rows: Vec<ListenerRow>,
     pub selected: usize,
+    /// First row on screen; see [`ListSnapshot::top`].
+    pub top: usize,
     pub status: Option<Status>,
     pub width: usize,
     pub height: usize,
@@ -440,6 +508,7 @@ impl Default for PickerSnapshot {
             host: String::new(),
             rows: Vec::new(),
             selected: 0,
+            top: 0,
             status: None,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
@@ -496,21 +565,56 @@ pub fn step_selection(selected: usize, len: usize, delta: isize) -> usize {
     }
 }
 
-/// Half-open range of rows to draw so that `selected` stays visible.
-pub fn visible_window(len: usize, selected: usize, capacity: usize) -> (usize, usize) {
+/// Where the table is scrolled to after `selected` is brought back into view.
+///
+/// The offset is carried in the snapshot rather than derived from the selection
+/// alone, because a formula over `selected` has to pick a place for a selection
+/// that is off screen, and any fixed choice pins the highlight there: anchoring
+/// it to the bottom row means walking up from the end of a long list scrolls the
+/// whole table on every keypress while the highlight never moves. Moving the
+/// offset by the least it takes is what makes the highlight travel the pane
+/// first and the table scroll only once it reaches an edge.
+pub fn scroll_top(top: usize, len: usize, selected: usize, capacity: usize) -> usize {
+    if len == 0 || capacity == 0 {
+        return 0;
+    }
+    let selected = selected.min(len - 1);
+    let last = len.saturating_sub(capacity);
+    let top = top.min(last);
+    if selected < top {
+        return selected;
+    }
+    if selected >= top + capacity {
+        return (selected + 1 - capacity).min(last);
+    }
+    top
+}
+
+/// Half-open range of rows to draw: the pane's own offset, corrected by
+/// [`scroll_top`] so `selected` is always on screen even when the offset is
+/// stale — rendering stays a pure function of the snapshot it is handed.
+pub fn visible_window(top: usize, len: usize, selected: usize, capacity: usize) -> (usize, usize) {
     if len == 0 || capacity == 0 {
         return (0, 0);
     }
-    if len <= capacity {
-        return (0, len);
-    }
-    let selected = selected.min(len - 1);
-    let start = selected.saturating_sub(capacity - 1).min(len - capacity);
-    (start, start + capacity)
+    let start = scroll_top(top, len, selected, capacity);
+    (start, (start + capacity).min(len))
 }
 
 fn row_capacity(height: usize) -> usize {
     height.saturating_sub(CHROME_LINES).max(1)
+}
+
+/// Rows a frame of this height can draw, allowing for the overflow line it adds
+/// when the table does not fit. Shared with the drivers so the offset they keep
+/// is measured against the window that is actually drawn.
+fn rows_on_screen(height: usize, count: usize) -> usize {
+    let capacity = row_capacity(height);
+    if count > capacity {
+        capacity.saturating_sub(1).max(1)
+    } else {
+        capacity
+    }
 }
 
 fn origin_label(origin: Origin) -> &'static str {
@@ -547,8 +651,11 @@ impl Frame {
         }
     }
 
+    /// Every line the frame carries goes through here, so nothing reaches the
+    /// pane wider than the pane is: a line that overflows wraps, and a wrapped
+    /// line costs a row nothing budgeted for.
     fn push(&mut self, line: String) {
-        self.lines.push(line.trim_end().to_string());
+        self.lines.push(clamp_line(line.trim_end(), self.width));
     }
 
     fn blank(&mut self) {
@@ -556,11 +663,14 @@ impl Frame {
     }
 
     /// A selected row is padded to the full width first so reverse video covers
-    /// the whole line rather than stopping at the last glyph.
+    /// the whole line rather than stopping at the last glyph, and its inner
+    /// resets are patched so the highlight covers every cell rather than
+    /// stopping at the first painted one.
     fn push_row(&mut self, line: String, selected: bool) {
         if selected && self.color {
-            let padded = pad_to_width(&line, self.width);
-            self.lines.push(format!("{REVERSE}{padded}{RESET}"));
+            let padded = pad_to_width(&clamp_line(&line, self.width), self.width);
+            self.lines
+                .push(format!("{REVERSE}{}{RESET}", keep_reverse(&padded)));
         } else {
             self.push(line);
         }
@@ -595,6 +705,15 @@ fn overflow_line(above: usize, below: usize) -> String {
     }
 }
 
+/// The note a forward row carries after its last column.
+fn list_note(row: &ForwardRow) -> &'static str {
+    if row.is_remapped() {
+        "remapped"
+    } else {
+        ""
+    }
+}
+
 /// Column widths for the forward table, with the workspace column absorbing
 /// whatever is left over.
 struct ListLayout {
@@ -621,8 +740,20 @@ impl ListLayout {
         let remote = 6;
         let local = 5;
         let origin = 8;
-        let fixed = 2 + host + remote + local + agent + origin + GAP * 5;
-        let workspace = width.saturating_sub(fixed + GAP).clamp(8, 40);
+        // Everything `row` emits other than the workspace column, counted
+        // exactly once each: the marker, the five other columns, the five gaps
+        // between the six columns, and — only when a row carries one — the gap
+        // and cells of the trailing note. Leaving the note out here spends its
+        // cells on the workspace column and starts the note past the right
+        // edge, where it wraps and costs a line the frame had budgeted.
+        let note = rows
+            .iter()
+            .map(|row| display_width(list_note(row)))
+            .max()
+            .unwrap_or(0);
+        let trailing = if note == 0 { 0 } else { GAP + note };
+        let fixed = 2 + host + remote + local + agent + origin + GAP * 5 + trailing;
+        let workspace = width.saturating_sub(fixed).clamp(8, 40);
         Self {
             host,
             remote,
@@ -655,7 +786,7 @@ impl ListLayout {
         } else {
             local
         };
-        let note = if row.is_remapped() { "remapped" } else { "" };
+        let note = list_note(row);
         let note = if note.is_empty() {
             String::new()
         } else {
@@ -700,14 +831,9 @@ pub fn render_list(snapshot: &ListSnapshot) -> String {
     let layout = ListLayout::compute(&snapshot.rows, width);
     frame.push(header_line(&layout.header(), snapshot.color));
 
-    let capacity = row_capacity(snapshot.height);
-    let capacity = if count > capacity {
-        capacity.saturating_sub(1).max(1)
-    } else {
-        capacity
-    };
+    let capacity = rows_on_screen(snapshot.height, count);
     let selected = snapshot.selected.min(count - 1);
-    let (start, end) = visible_window(count, selected, capacity);
+    let (start, end) = visible_window(snapshot.top, count, selected, capacity);
     for (index, row) in snapshot.rows[start..end].iter().enumerate() {
         let index = start + index;
         frame.push_row(
@@ -724,6 +850,27 @@ pub fn render_list(snapshot: &ListSnapshot) -> String {
     frame.push_status(snapshot.status.as_ref());
     frame.push(paint(&hint_line(&LIST_HINTS), DIM, snapshot.color));
     frame.finish()
+}
+
+/// The notes a listener row carries after its last column, with the colour each
+/// is painted in. One function so the width the layout reserves and the text the
+/// row draws cannot drift apart.
+fn picker_notes(row: &ListenerRow) -> Vec<(String, &'static str)> {
+    let mut notes = Vec::new();
+    if row.already_forwarded {
+        notes.push(("forwarded".to_string(), DIM));
+    }
+    if row.is_remapped() {
+        notes.push((format!("local {} remapped", row.local_port), YELLOW));
+    }
+    notes
+}
+
+/// Cells [`picker_notes`] occupies once joined, separators included.
+fn picker_notes_width(row: &ListenerRow) -> usize {
+    let notes = picker_notes(row);
+    let text: usize = notes.iter().map(|(text, _)| display_width(text)).sum();
+    text + notes.len().saturating_sub(1)
 }
 
 /// Column widths for the listener table.
@@ -753,8 +900,13 @@ impl PickerLayout {
             12,
         );
         let port = 5;
-        let fixed = 3 + port + bind + process + agent + GAP * 4;
-        let workspace = width.saturating_sub(fixed + GAP).clamp(8, 40);
+        // As in `ListLayout::compute`: the marker, the four other columns, the
+        // four gaps between the five columns, and the trailing notes with their
+        // own gap when a row carries any.
+        let note = rows.iter().map(picker_notes_width).max().unwrap_or(0);
+        let trailing = if note == 0 { 0 } else { GAP + note };
+        let fixed = 3 + port + bind + process + agent + GAP * 4 + trailing;
+        let workspace = width.saturating_sub(fixed).clamp(8, 40);
         Self {
             port,
             bind,
@@ -783,17 +935,10 @@ impl PickerLayout {
             if selected { ">" } else { " " },
             if row.marked { "*" } else { " " },
         );
-        let mut notes = Vec::new();
-        if row.already_forwarded {
-            notes.push(paint("forwarded", DIM, color));
-        }
-        if row.is_remapped() {
-            notes.push(paint(
-                &format!("local {} remapped", row.local_port),
-                YELLOW,
-                color,
-            ));
-        }
+        let notes: Vec<String> = picker_notes(row)
+            .iter()
+            .map(|(text, code)| paint(text, code, color))
+            .collect();
         format!(
             "{marker}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
             rcell(&row.remote_port.to_string(), self.port),
@@ -835,14 +980,9 @@ pub fn render_picker(snapshot: &PickerSnapshot) -> String {
     frame.push(header_line(&layout.header(), snapshot.color));
 
     let count = snapshot.rows.len();
-    let capacity = row_capacity(snapshot.height);
-    let capacity = if count > capacity {
-        capacity.saturating_sub(1).max(1)
-    } else {
-        capacity
-    };
+    let capacity = rows_on_screen(snapshot.height, count);
     let selected = snapshot.selected.min(count - 1);
-    let (start, end) = visible_window(count, selected, capacity);
+    let (start, end) = visible_window(snapshot.top, count, selected, capacity);
     for (index, row) in snapshot.rows[start..end].iter().enumerate() {
         let index = start + index;
         frame.push_row(
@@ -1279,6 +1419,15 @@ where
                 }
                 ListCommand::Ignore => {}
             }
+            // After every key, not only the ones that move: a stop or a refresh
+            // changes how many rows there are, and the offset has to stay a
+            // place the shortened table still has.
+            snapshot.top = scroll_top(
+                snapshot.top,
+                snapshot.rows.len(),
+                snapshot.selected,
+                rows_on_screen(snapshot.height, snapshot.rows.len()),
+            );
         }
     }
 }
@@ -1391,6 +1540,12 @@ where
                 }
                 PickerCommand::Ignore => {}
             }
+            snapshot.top = scroll_top(
+                snapshot.top,
+                snapshot.rows.len(),
+                snapshot.selected,
+                rows_on_screen(snapshot.height, snapshot.rows.len()),
+            );
         }
     }
 }
@@ -1561,6 +1716,41 @@ mod tests {
         ref_width(&line[..at])
     }
 
+    /// Whether reverse video is in force at every glyph of `line`.
+    ///
+    /// Written against the bytes rather than reusing the module's own painting,
+    /// because the bug it exists for is precisely that the row *looks* wrapped
+    /// in a highlight — it starts with the code and ends with a reset — while an
+    /// inner reset silently turns the highlight off partway across.
+    fn reverse_video_throughout(line: &str) -> bool {
+        let mut reverse = false;
+        let mut covered = true;
+        let mut chars = line.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                let mut sequence = String::new();
+                for next in chars.by_ref() {
+                    sequence.push(next);
+                    if matches!(next, '\u{40}'..='\u{7e}') && next != '[' && next != 'O' {
+                        break;
+                    }
+                }
+                match sequence.as_str() {
+                    "[7m" => reverse = true,
+                    // What `paint` closes every cell with, and what clears
+                    // reverse video along with the colour it meant to close.
+                    "[0m" | "[m" => reverse = false,
+                    _ => {}
+                }
+                continue;
+            }
+            if !reverse {
+                covered = false;
+            }
+        }
+        covered
+    }
+
     fn body_lines(page: &str) -> Vec<&str> {
         page.lines().collect()
     }
@@ -1716,18 +1906,48 @@ mod tests {
 
     #[test]
     fn the_window_follows_the_selection_downward() {
-        assert_eq!(visible_window(10, 0, 4), (0, 4));
-        assert_eq!(visible_window(10, 3, 4), (0, 4));
-        assert_eq!(visible_window(10, 4, 4), (1, 5));
-        assert_eq!(visible_window(10, 9, 4), (6, 10));
+        assert_eq!(visible_window(0, 10, 0, 4), (0, 4));
+        assert_eq!(visible_window(0, 10, 3, 4), (0, 4));
+        assert_eq!(visible_window(0, 10, 4, 4), (1, 5));
+        assert_eq!(visible_window(0, 10, 9, 4), (6, 10));
+    }
+
+    #[test]
+    fn the_window_holds_still_until_the_selection_reaches_its_top_edge() {
+        // The bug this pins: a window derived from the selection alone put it
+        // on the bottom row, so every step up scrolled the whole table by one
+        // and the highlight never moved. Walking up from the end of a 20-row
+        // list in a 5-row window, the first four steps must move the highlight
+        // inside a window that does not budge.
+        let (len, capacity) = (20, 5);
+        let mut top = scroll_top(0, len, len - 1, capacity);
+        assert_eq!(visible_window(top, len, 19, capacity), (15, 20));
+        for selected in [18, 17, 16, 15] {
+            top = scroll_top(top, len, selected, capacity);
+            assert_eq!(
+                visible_window(top, len, selected, capacity),
+                (15, 20),
+                "the table scrolled while the highlight had room to climb"
+            );
+        }
+        // Only now, with the selection on the top row, does the table move —
+        // and by exactly one row, not a windowful.
+        top = scroll_top(top, len, 14, capacity);
+        assert_eq!(visible_window(top, len, 14, capacity), (14, 19));
     }
 
     #[test]
     fn the_window_degenerates_safely() {
-        assert_eq!(visible_window(0, 0, 5), (0, 0));
-        assert_eq!(visible_window(5, 0, 0), (0, 0));
-        assert_eq!(visible_window(4, 0, 4), (0, 4));
-        assert_eq!(visible_window(4, 99, 2), (2, 4));
+        assert_eq!(visible_window(0, 0, 0, 5), (0, 0));
+        assert_eq!(visible_window(0, 5, 0, 0), (0, 0));
+        assert_eq!(visible_window(0, 4, 0, 4), (0, 4));
+        assert_eq!(visible_window(0, 4, 99, 2), (2, 4));
+        // An offset from a longer table the pane no longer has: corrected
+        // rather than trusted, so rendering cannot slice out of range.
+        assert_eq!(visible_window(99, 4, 0, 2), (0, 2));
+        assert_eq!(visible_window(99, 4, 3, 2), (2, 4));
+        assert_eq!(visible_window(3, 4, 3, 9), (0, 4));
+        assert_eq!(scroll_top(9, 0, 0, 4), 0);
     }
 
     // ---- list rendering --------------------------------------------------
@@ -1851,6 +2071,144 @@ mod tests {
             "a remapped port must say so: {remapped:?}"
         );
         assert!(remapped.contains("8787") && remapped.contains("18787"));
+    }
+
+    #[test]
+    fn no_rendered_line_outgrows_the_pane_it_is_drawn_in() {
+        // Measured with `ref_width`, not the module's own measure: a line that
+        // overflows wraps in the terminal, which both misaligns the table and
+        // costs a row the height budget never allowed for.
+        let long = "ssh forward failed for buildbox (exit 255): bind [127.0.0.1]:5173: \
+                    Address already in use";
+        for width in [MIN_WIDTH, 40, 56, 72, DEFAULT_WIDTH, 100, 132] {
+            let mut list = plain_list(vec![
+                row("buildbox", 5173, 5173, Some("mini: scholion")),
+                row("buildbox", 8787, 18787, Some("実験用ワークスペース")),
+                row("a-rather-long-hostname", 3000, 3000, None),
+            ]);
+            list.width = width;
+            list.status = Some(Status::failed(long));
+            let page = render_list(&list);
+            for line in page.lines() {
+                assert!(
+                    ref_width(line) <= width,
+                    "a {}-cell line in a {width}-cell pane: {line:?}",
+                    ref_width(line)
+                );
+            }
+            assert!(page.lines().count() <= list.height, "{page}");
+
+            let mut forwarded = listener_row(5173, "Code Helper (Plugin)", Some("mini: scholion"));
+            forwarded.already_forwarded = true;
+            let mut moved = listener_row(8787, "workerd", Some("実験用ワークスペース"));
+            moved.local_port = 18787;
+            let mut picker = plain_picker(vec![forwarded, moved]);
+            picker.width = width;
+            picker.status = Some(Status::failed(long));
+            let page = render_picker(&picker);
+            for line in page.lines() {
+                assert!(
+                    ref_width(line) <= width,
+                    "a {}-cell line in a {width}-cell pane: {line:?}",
+                    ref_width(line)
+                );
+            }
+            assert!(page.lines().count() <= picker.height, "{page}");
+        }
+    }
+
+    #[test]
+    fn the_remapped_note_is_paid_for_by_the_layout_rather_than_hung_off_the_edge() {
+        // The note is a column like any other: if the layout does not reserve
+        // its cells and the gap before it, the workspace column spends them and
+        // the note starts past the right edge, where it wraps.
+        let snapshot = plain_list(vec![row("buildbox", 8787, 18787, Some("mini: api"))]);
+        assert_eq!(
+            snapshot.width, DEFAULT_WIDTH,
+            "the pane a user actually has"
+        );
+        let page = render_list(&snapshot);
+        let line = row_line(&page, "18787");
+        assert!(
+            line.ends_with("remapped"),
+            "the note was cut or pushed off: {line:?}"
+        );
+        assert!(
+            ref_width(line) <= DEFAULT_WIDTH,
+            "a {}-cell row in an {DEFAULT_WIDTH}-cell pane: {line:?}",
+            ref_width(line)
+        );
+    }
+
+    #[test]
+    fn a_picker_note_is_paid_for_by_the_layout_rather_than_hung_off_the_edge() {
+        let mut both = listener_row(8787, "workerd", Some("mini: api"));
+        both.local_port = 18787;
+        both.already_forwarded = true;
+        let snapshot = plain_picker(vec![both]);
+        let page = render_picker(&snapshot);
+        let line = row_line(&page, "18787");
+        assert!(
+            line.ends_with("forwarded local 18787 remapped"),
+            "the notes were cut or pushed off: {line:?}"
+        );
+        assert!(
+            ref_width(line) <= DEFAULT_WIDTH,
+            "a {}-cell row in an {DEFAULT_WIDTH}-cell pane: {line:?}",
+            ref_width(line)
+        );
+    }
+
+    #[test]
+    fn a_status_too_long_for_the_pane_is_cut_rather_than_wrapped_over_the_footer() {
+        // A refusal carries an ssh error verbatim, and there is no bound on one.
+        // The footer under it is the pane's only documentation.
+        let mut snapshot = plain_list(vec![row("buildbox", 5173, 5173, Some("mini: scholion"))]);
+        snapshot.status = Some(Status::failed(
+            "ssh forward failed for buildbox (exit 255): bind [127.0.0.1]:5173: Address \
+             already in use; channel_setup_fwd_listener_tcpip: cannot listen to port 5173",
+        ));
+        let page = render_list(&snapshot);
+        let status = row_line(&page, "ssh forward failed");
+        assert!(
+            ref_width(status) <= snapshot.width,
+            "a {}-cell status in a {}-cell pane: {status:?}",
+            ref_width(status),
+            snapshot.width
+        );
+        assert!(
+            status.ends_with(TRUNCATION_MARK),
+            "a cut status must say it was cut: {status:?}"
+        );
+        assert!(page.contains("q close"), "the footer went missing:\n{page}");
+    }
+
+    #[test]
+    fn the_highlight_covers_every_cell_of_a_selected_row_including_painted_ones() {
+        // A row wrapped in reverse video still loses the highlight at its first
+        // painted cell, because the reset that closes the colour closes the
+        // highlight too. Checking the first and last bytes of the line cannot
+        // see that; walking its escape sequences can.
+        let mut list = plain_list(vec![row("buildbox", 8787, 18787, Some("mini: api"))]);
+        list.color = true;
+        let page = render_list(&list);
+        let line = row_line(&page, "18787");
+        assert!(
+            reverse_video_throughout(line),
+            "the highlight stopped partway across the row: {line:?}"
+        );
+
+        let mut both = listener_row(8787, "workerd", Some("mini: api"));
+        both.local_port = 18787;
+        both.already_forwarded = true;
+        let mut picker = plain_picker(vec![both]);
+        picker.color = true;
+        let page = render_picker(&picker);
+        let line = row_line(&page, "18787");
+        assert!(
+            reverse_video_throughout(line),
+            "the highlight stopped partway across the row: {line:?}"
+        );
     }
 
     #[test]
@@ -2490,6 +2848,114 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_picker(app, snapshot, &mut input, &mut out).expect("streams never fail");
         (outcome, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Hands over one keystroke per read, the way a terminal does.
+    ///
+    /// A slice yields every byte in one read, so a whole burst of keys is
+    /// applied between two frames — which hides anything the pane forgets from
+    /// one redraw to the next.
+    struct Keystrokes<'a> {
+        keys: &'a [u8],
+    }
+
+    impl Read for Keystrokes<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.keys.split_first() {
+                Some((first, rest)) if !buf.is_empty() => {
+                    buf[0] = *first;
+                    self.keys = rest;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    /// The frames a pane drew, one per repaint.
+    fn frames(screen: &str) -> Vec<&str> {
+        screen.split("\x1b[2J").skip(1).collect()
+    }
+
+    #[test]
+    fn walking_up_a_long_table_moves_the_highlight_before_it_scrolls_the_pane() {
+        // End, then Up, in a pane that shows five of twenty rows. Anchoring the
+        // window to the selection alone put the highlight on the bottom line and
+        // left it there, so every Up scrolled the whole table under a highlight
+        // that never moved.
+        let rows: Vec<ForwardRow> = (0..20)
+            .map(|i| row("buildbox", 9000 + i, 9000 + i, Some("mini: scholion")))
+            .collect();
+        let mut app = FakeList {
+            rows: rows.clone(),
+            ..FakeList::default()
+        };
+        let snapshot = ListSnapshot {
+            rows,
+            height: 12,
+            color: false,
+            ..ListSnapshot::default()
+        };
+        let mut input = Keystrokes { keys: b"Gkk" };
+        let mut out: Vec<u8> = Vec::new();
+        run_list(&mut app, snapshot, &mut input, &mut out).expect("streams never fail");
+        let screen = String::from_utf8_lossy(&out).into_owned();
+        let drawn = frames(&screen);
+        assert_eq!(drawn.len(), 4, "one frame per key, plus the first");
+
+        let marked = |frame: &str| {
+            body_lines(frame)
+                .into_iter()
+                .find(|line| line.starts_with("> "))
+                .unwrap_or_else(|| panic!("no highlighted row in:\n{frame}"))
+                .to_string()
+        };
+        assert!(marked(drawn[1]).contains("9019"), "{}", drawn[1]);
+        assert!(marked(drawn[2]).contains("9018"), "{}", drawn[2]);
+        assert!(marked(drawn[3]).contains("9017"), "{}", drawn[3]);
+        for frame in &drawn[1..] {
+            for port in 9015..=9019 {
+                assert!(
+                    frame.contains(&port.to_string()),
+                    "row {port} left the window while the highlight had room to \
+                     climb:\n{frame}"
+                );
+            }
+            assert!(
+                !frame.contains("9014"),
+                "the table scrolled instead of moving the highlight:\n{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_picker_scrolls_the_way_the_manager_does() {
+        // The same offset, kept by the other driver: two loops, two places to
+        // forget it.
+        let rows: Vec<ListenerRow> = (0..20)
+            .map(|i| listener_row(9000 + i, "node", Some("mini: scholion")))
+            .collect();
+        let mut app = FakePicker {
+            rows: rows.clone(),
+            ..FakePicker::default()
+        };
+        let snapshot = PickerSnapshot {
+            host: "buildbox".into(),
+            rows,
+            height: 12,
+            color: false,
+            ..PickerSnapshot::default()
+        };
+        let mut input = Keystrokes { keys: b"Gk" };
+        let mut out: Vec<u8> = Vec::new();
+        run_picker(&mut app, snapshot, &mut input, &mut out).expect("streams never fail");
+        let screen = String::from_utf8_lossy(&out).into_owned();
+        let drawn = frames(&screen);
+        let last = drawn.last().copied().unwrap_or_default();
+        assert!(
+            last.contains("9019") && !last.contains("9014"),
+            "the table scrolled instead of moving the highlight:\n{last}"
+        );
     }
 
     fn two_forwards() -> Vec<ForwardRow> {

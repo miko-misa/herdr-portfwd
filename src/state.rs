@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::types::Forward;
+use crate::types::{Forward, ForwardSpec, Origin};
 
 /// File holding the recorded forwards, inside the state directory.
 pub const STATE_FILE: &str = "forwards.json";
@@ -158,6 +158,23 @@ impl Store {
             .find(|f| f.spec.host == host && f.spec.local_port == local_port))
     }
 
+    /// The record forwarding `remote_port` from `host`, whatever local port it
+    /// landed on.
+    ///
+    /// The key of a record is its *local* port, because that is what a cancel
+    /// has to name. Discovery asks the other question: it sees a port on the
+    /// far side and needs to know whether anything already forwards it. For a
+    /// forward the user remapped the two numbers differ, and asking [`get`]
+    /// with a remote port finds nothing at all.
+    ///
+    /// [`get`]: Store::get
+    pub fn get_remote(&self, host: &str, remote_port: u16) -> Result<Option<Forward>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|f| f.spec.host == host && f.spec.remote_port == remote_port))
+    }
+
     /// Record `forward`, replacing any record with the same host and local
     /// port. Returns the record it displaced.
     pub fn upsert(&self, forward: Forward) -> Result<Option<Forward>> {
@@ -221,6 +238,39 @@ impl Store {
             out
         })
     }
+}
+
+/// Fold a fresh intent into a record that already covers the same port.
+///
+/// Adding a forward that is already live is idempotent, but it is not always a
+/// no-op: an explicit `add`, or a Ctrl+click on a URL, over a forward the agent
+/// opened by itself is the user pinning that port. Left as it was, the record
+/// still says the forward belongs to a pane, and `reconcile` cancels it the
+/// moment that pane exits — killing the port the user had just asked to keep.
+///
+/// Only that one upgrade, and never the reverse: an automatic detection over a
+/// pinned forward leaves the pin alone. `None` when the record already says
+/// everything the new intent does, so the caller can skip a write.
+///
+/// Only the origin is compared here, so **the caller must first have decided
+/// that `existing` really is the record `intent` describes** — same remote port
+/// and same remote bind, not merely the same local port. A record is keyed by
+/// its local port, and two different forwards can want the same one; folding an
+/// intent into the wrong record pins a forward nobody asked to pin and answers
+/// the request with someone else's port.
+pub fn promoted(existing: &Forward, intent: &ForwardSpec) -> Option<Forward> {
+    if intent.origin != Origin::Explicit || existing.spec.origin == Origin::Explicit {
+        return None;
+    }
+    let mut promoted = existing.clone();
+    promoted.spec.origin = Origin::Explicit;
+    // The pane the user asked from, when there was one. A pinned forward
+    // outlives its pane either way; this only keeps the record honest about
+    // where the intent came from.
+    if intent.pane_id.is_some() {
+        promoted.spec.pane_id = intent.pane_id.clone();
+    }
+    Some(promoted)
 }
 
 /// Last writer for a `(host, local_port)` wins, then the set is sorted so the
@@ -654,6 +704,87 @@ mod tests {
 
     fn store_in(dir: &Path) -> Store {
         Store::open(dir).expect("opening a store in a temp dir should work")
+    }
+
+    fn remapped(host: &str, remote_port: u16, local_port: u16) -> Forward {
+        let mut forward = forward(host, remote_port);
+        forward.spec.local_port = local_port;
+        forward
+    }
+
+    #[test]
+    fn a_record_can_be_found_by_the_remote_port_it_forwards() {
+        // Discovery only ever sees the port on the far side. Looking a remapped
+        // forward up by that number has to find it, or the listener reads as
+        // unforwarded and gets forwarded a second time.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(dir.path());
+        store
+            .upsert(remapped("buildbox", 5173, 15173))
+            .expect("seed");
+
+        assert!(store.get("buildbox", 5173).expect("read").is_none());
+        let found = store
+            .get_remote("buildbox", 5173)
+            .expect("read")
+            .expect("the remap is a forward of 5173");
+        assert_eq!(found.spec.local_port, 15173);
+        assert!(store
+            .get_remote("someone-else", 5173)
+            .expect("read")
+            .is_none());
+        assert!(store.get_remote("buildbox", 15173).expect("read").is_none());
+    }
+
+    #[test]
+    fn an_explicit_intent_pins_a_record_the_agent_made() {
+        let mut auto = forward("buildbox", 5173);
+        auto.spec.origin = Origin::Auto;
+        auto.spec.pane_id = Some("w1:p1".into());
+        let mut intent = auto.spec.clone();
+        intent.origin = Origin::Explicit;
+        intent.pane_id = Some("w2:p9".into());
+
+        let promoted = promoted(&auto, &intent).expect("an explicit add upgrades it");
+
+        assert_eq!(promoted.spec.origin, Origin::Explicit);
+        assert_eq!(promoted.spec.pane_id.as_deref(), Some("w2:p9"));
+        assert_eq!(
+            promoted.created_unix_ms, auto.created_unix_ms,
+            "pinning is not a new forward"
+        );
+    }
+
+    #[test]
+    fn nothing_downgrades_a_pinned_record() {
+        let pinned = forward("buildbox", 5173);
+        for origin in [Origin::Auto, Origin::Offered] {
+            let mut intent = pinned.spec.clone();
+            intent.origin = origin;
+            assert!(
+                promoted(&pinned, &intent).is_none(),
+                "{origin:?} must not overwrite a pin"
+            );
+        }
+        assert!(
+            promoted(&pinned, &pinned.spec).is_none(),
+            "and a pin over a pin is not a write"
+        );
+    }
+
+    #[test]
+    fn an_explicit_intent_with_no_pane_keeps_the_one_on_the_record() {
+        let mut auto = forward("buildbox", 5173);
+        auto.spec.origin = Origin::Auto;
+        auto.spec.pane_id = Some("w1:p1".into());
+        let mut intent = auto.spec.clone();
+        intent.origin = Origin::Explicit;
+        intent.pane_id = None;
+
+        let promoted = promoted(&auto, &intent).expect("still an upgrade");
+
+        assert_eq!(promoted.spec.origin, Origin::Explicit);
+        assert_eq!(promoted.spec.pane_id.as_deref(), Some("w1:p1"));
     }
 
     fn recording_store(dir: &Path) -> (Store, Arc<Recorder>) {
