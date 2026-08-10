@@ -5,6 +5,161 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-10
+
+### Fixed
+
+- `list` and the manager pane showed only the host the invocation resolved to,
+  so a forward on any other host was invisible — and unstoppable, because `stop`
+  narrowed the same way and answered *"nothing to stop on <that one host>"*
+  while the port stayed up. Both now cover every host. Two machines forwarding a
+  port each was enough to meet this, and the pane's own `HOST` column had been
+  there for the case all along.
+
+  The pane's header said `Port forwards (1 live)` either way, so nothing on
+  screen told "there is one" from "you are being shown one". It now reads
+  `(3 live, all hosts)`, or `(1 of 3 live, host buildbox only)` when a filter is
+  on.
+
+- `--host`, and the `HERDR_PORTFWD_HOST` it reads, narrow the manager pane's
+  *filter* rather than the listing behind it. The pane built its rows from a
+  narrowed listing while its own filter — the thing the header describes — was
+  still "all hosts", so `HERDR_PORTFWD_HOST=mini herdr-portfwd pane-ui list`
+  drew one machine's row under `(1 live, all hosts)` and `h` had no other host
+  left to reveal. The pane holds every row now and opens on the filter the flag
+  asked for, which makes the flag and the `h` key the same mechanism: the header
+  is right at every step of the cycle, and `X` still stops exactly what is
+  drawn.
+
+- `enter` on a row stops that row's forward, on that row's host. It matches the
+  record by host and both ports, so a row whose record was rewritten between the
+  frame being drawn and the key being pressed stops nothing rather than
+  cancelling whatever took its place.
+
+- `stop <port>` searches every host. A port on two hosts is refused with both
+  named rather than guessed at, and a `stop --host <one>` that finds nothing now
+  says which host does have that port instead of reporting an empty result.
+
+- The manager and picker panes no longer render a listing they could not get as
+  an empty world. `HERDR_PORTFWD_HOST=stale-name herdr-portfwd pane-ui list`
+  drew `(0 live, all hosts)` over *"No forwards are live on any host."* while
+  `herdr-portfwd list` in the same moment found two forwards on two machines:
+  the host name resolved to nothing, the listing failed, and the pane fell back
+  to an empty table it then described as the world. It now says *"Could not list
+  the forwards."* under a header claiming no count and no scope, with the reason
+  — `unknown host "stale-name"; configured: ...` — on the status line and `r` to
+  try again. `list --host gone-host` has always refused rather than printed a
+  world; the pane refuses to speak for hosts it never reached.
+
+- `herdr-portfwd stop-all --help` and `--host`'s own help describe what they now
+  do. `stop-all` still read *"Stop every forward for the selected host"* after
+  it had started stopping every host's, and `--host` still read *"Host to act
+  on"* after it had become a narrowing — the destructive command describing a
+  blast radius smaller than the one it has. The manifest description, both
+  READMEs and the clap doc comment are now checked against each other and
+  against a measured `stop-all`, so no one of them can be corrected on its own
+  again.
+
+- A record file that could not be read is reported instead of being read as a
+  world with nothing in it. `chmod 000 forwards.json` with a forward live on
+  each of two hosts left every manager frame saying `(0 live, all hosts)` over
+  *"No forwards are live on any host."* — a positive claim about every machine,
+  from a process that had read nothing — and the same went for a file truncated
+  mid-write and for a record carrying an `origin` this binary is too old to
+  know. `state` degraded all three to an empty document with a warning on
+  stderr, which the first frame's clear-screen erased and which under Herdr goes
+  to the plugin log instead, so the reason reached nobody either. A read now
+  answers with the records or with why it has none: `list`, `status`, `stop`,
+  `reconcile` and the panes refuse and name the file, and the manager pane opens
+  on *"Could not list the forwards."* with the reason on its status line, where
+  `h`, `enter`, `X` and `r` all leave it standing.
+
+- A pass that could not read the records no longer sets them aside. Quarantine —
+  moving a file to `<name>.corrupt` and starting over — is for bytes that were
+  read and understood not to be ours; an unreadable file's bytes were never
+  seen, and starting over on top of them is what turned a permission problem
+  into two lost forwards. Move such a file aside yourself, or fix its
+  permissions and it comes straight back.
+
+- The manager pane counts forwards that are actually live, and marks the ones
+  that are not. `herdr-portfwd list` reported `8788 live` and `54321 missing` in
+  the same moment the pane above it said `(2 live, all hosts)`, drew both rows
+  identically and offered the stop key on the dead one: the pane built its rows
+  from `ForwardStatus` and dropped the `live` field, so a count of *records* was
+  printed under the word `live`. A master dies under a user whenever a laptop
+  sleeps or a link drops — that is the ordinary way a record goes stale, and it
+  is why liveness is computed at all. The header now reads
+  `(1 live, 1 not live, all hosts)`, the stale row is marked `not live`, and the
+  same correction reaches every other sentence built the same way: what a filter
+  is hiding (`1 live, 1 not live on other hosts`), the filtered header's total
+  (`1 live of 3 recorded, host mini only` — the hidden rows are records, not
+  live forwards), and the empty table, which now says *"No forwards are recorded
+  on any host."* because the absence of a record is a fact about the file that
+  was read and not about any port.
+
+  Where this Herdr server is not the machine that binds the port — under
+  `herdr --remote`, where the local agent opens it — nothing here can check, and
+  the screen says `not checked` rather than choosing between the other two
+  answers. That third state is why the wording is generated from a tally instead
+  of written out: a sentence with a slot for "live" and one for "not live" has
+  nowhere to put it.
+
+- `herdr-portfwd status` reports a record file it could not read instead of
+  becoming the failure. Its own doc comment says it "reports failures instead of
+  becoming one" and both READMEs send users here first when something is already
+  wrong — which is exactly when `forwards.json` may be the thing that is wrong —
+  but a damaged one made it exit with nothing printed: not the path of the
+  broken file, not the configured hosts, not the request queue that was
+  perfectly readable. Each failure is now a field (`state_error`,
+  `request_error`) and everything else is still gathered and printed, in
+  `--json` as well. What could not be read is left blank rather than reported as
+  zero: `forwards unknown` beside the host, `pending: unknown`, `null` in the
+  JSON. The exit code is unchanged — non-zero, like every other command that
+  could not do what it was asked — because reporting a failure and being one are
+  different things and only the second loses the report.
+
+- A status explaining why a pane's table is empty survives keys that could not
+  change it. `h` overwrote it with *"there is nothing to filter"* whenever the
+  snapshot held no rows, so one keystroke turned a screen that named the wrong
+  host into one that only said there was nothing to narrow. `enter` and `X`
+  ("nothing to stop") and the picker's `enter` ("nothing to forward") were the
+  same shape: each reports on a listing, and there was none. `r` is the one key
+  that can change the answer, and a refresh that succeeds retires both the
+  failure and its message.
+
+### Added
+
+- `h` on the manager pane shows one host at a time, cycling through every host
+  that has a forward and back to all of them. The header names the active
+  filter, and a filtered view with nothing in it says how many forwards are live
+  on the other hosts rather than reading as an empty world.
+
+### Changed
+
+- `X` on the manager pane, and the `stop-all` action, now mean **everything
+  shown**: every forward on every host, or on the filtered host when the filter
+  is on. The footer says `X stop shown` and the manifest description says the
+  same, because "every forward belonging to the invoking host" stopped being
+  something a user could point at once the pane showed more than one host.
+  `herdr-portfwd stop-all --host <name>` is the old behaviour.
+
+- `herdr-portfwd list` prints a first line saying how much of the world it is —
+  `2 forward(s) on 2 host(s)`, or `... on <host> only (--host); other hosts not
+  shown` — with the per-host header, master state and placement kept underneath,
+  one section per host. `--json` changes shape with it: `scope` and `hosts`
+  replace the old top-level `host`, `master_running`, `forwards`, `pending` and
+  `placement`, which now live in each `hosts` entry.
+
+- `herdr-portfwd status --json` gains `state_error` and `request_error`, and
+  `pending_requests` and each `hosts[].forwards` become nullable: `null` where a
+  file could not be read, so a reader can tell "nothing recorded" from "nothing
+  learned". Both are `null` only when the matching `*_error` says why.
+
+- A recorded forward whose host has left `hosts.toml` is listed and can be
+  stopped rather than being hidden until the next `reconcile`. It is an open
+  port either way, and the listing is the one screen that can do something about
+  it.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added

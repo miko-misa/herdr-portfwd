@@ -32,8 +32,24 @@ use crate::types::{Forward, ForwardSpec, Origin};
 /// File holding the recorded forwards, inside the state directory.
 pub const STATE_FILE: &str = "forwards.json";
 
-/// Schema version stamped into the file. Readers ignore it: every field is
-/// optional on the way in, so an older binary can still read a newer file.
+/// Schema version stamped into the file. Readers ignore it, and forward
+/// compatibility goes exactly as far as serde's own default: unknown *fields*
+/// on a record, and unknown sections beside `forwards`, are skipped, so a newer
+/// writer's extra keys do not stop an older binary reading the records it does
+/// understand.
+///
+/// It does not go one step further, and the claim that it did — "every field is
+/// optional on the way in" — was false of [`Forward`]. Nothing here is
+/// `#[serde(default)]`, deliberately: none of a record's fields has a
+/// meaningful default. A forward with no host, or with local port 0, is not a
+/// degraded record but a wrong one, and `origin` decides whether `reconcile`
+/// may cancel that port — guessed as `Auto` it drops a forward the user pinned,
+/// guessed as `Explicit` it strands one nobody asked to keep. So an unrecognised
+/// value takes the whole document down, on purpose.
+///
+/// What that must never mean is an empty world: a document that could not be
+/// read is reported as [`StateError::Damaged`] rather than answered as "there
+/// are no forwards".
 pub const STATE_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -54,13 +70,39 @@ pub enum StateError {
          records where another user could rewrite them"
     )]
     UnsafeStateDir { path: String, why: String },
+    /// The file is there and nothing could be learned from it.
+    ///
+    /// Not the same as an absent or empty file, which says truthfully that
+    /// there are no records. This says the opposite: that this process knows
+    /// nothing about what is live, so every caller of a read has to be able to
+    /// tell the two apart — the distinction `ui::Listing` draws one layer up,
+    /// where an unreadable document used to arrive as an empty world and a pane
+    /// stamped it "0 live, all hosts".
+    ///
+    /// The file's own name leads, and the full path trails: a pane clamps a
+    /// status line to its width, and a state path is long enough that a message
+    /// beginning with it arrives as a truncated directory and no reason at all.
+    #[error("{file} {why}, so this process knows nothing of what it holds: {path}")]
+    Damaged {
+        file: String,
+        path: String,
+        why: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;
 
-/// Where a degraded read is announced. Warnings go to stderr by default, which
-/// Herdr captures per plugin command (`herdr plugin log list`). Tests install
-/// their own sink instead of scraping the process's stderr.
+/// Where a file set aside as unparseable is announced. Warnings go to stderr by
+/// default, which Herdr captures per plugin command (`herdr plugin log list`).
+/// Tests install their own sink instead of scraping the process's stderr.
+///
+/// Only a quarantine is announced this way, and only because it moved a file:
+/// that is a thing that happened to the user's disk, not an answer to anyone's
+/// question. A *read* that learned nothing is not reported here — it is
+/// returned, as [`StateError::Damaged`]. A warning is not a return value: it
+/// goes to a plugin log nobody is looking at, or to a terminal the next frame
+/// clears, and the caller carries on holding a default document it has no way
+/// to tell from a real one.
 pub type Reporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The default sink: stderr, prefixed so it is attributable in a plugin log.
@@ -142,6 +184,11 @@ impl Store {
     }
 
     /// Every recorded forward, ordered by host then local port.
+    ///
+    /// An empty vector is a fact about the file: there are no records. A file
+    /// this process could not read is [`StateError::Damaged`] instead, because
+    /// "no records" is a claim about every host and an unreadable file supports
+    /// no claim at all.
     pub fn list(&self) -> Result<Vec<Forward>> {
         Ok(self.file.read()?.forwards)
     }
@@ -294,8 +341,9 @@ fn dedupe_by_key(forwards: &mut Vec<Forward>) {
     *forwards = kept;
 }
 
-/// On-disk shape. Every field defaults, so a truncated-but-valid document or a
-/// document from another version still loads.
+/// On-disk shape. The envelope's own fields default, so a document from another
+/// version, or one that never got a `forwards` key, still loads. The records
+/// inside it do not: see [`STATE_VERSION`].
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct StateDoc {
     #[serde(default)]
@@ -339,22 +387,21 @@ where
         &self.path
     }
 
-    /// Read under a shared lock. A missing, empty, unreadable, or malformed
-    /// file degrades to the default document with a reported warning; it never
-    /// panics and never writes.
+    /// Read under a shared lock. A missing or empty file is the default
+    /// document: that is what "there are no records yet" looks like on disk.
+    ///
+    /// Anything else that yields nothing — the file could not be read, or its
+    /// bytes are not this document — is [`StateError::Damaged`], never a
+    /// default. A default here is an answer, and it is the wrong one: it says
+    /// there is nothing live on any host, which this process has just failed to
+    /// find out. It never panics and never writes.
     pub fn read(&self) -> Result<T> {
         let _lock = FileLock::acquire(&self.lock_path, LockMode::Shared)?;
-        Ok(match read_doc(&self.path) {
-            Loaded::Value(value) => value,
-            Loaded::Absent => T::default(),
-            Loaded::Damaged(why) => {
-                self.report(&format!(
-                    "{} {why}; continuing as if there were no records",
-                    self.path.display()
-                ));
-                T::default()
-            }
-        })
+        match read_doc(&self.path) {
+            Loaded::Value(value) => Ok(value),
+            Loaded::Absent => Ok(T::default()),
+            Loaded::Unreadable(why) | Loaded::Unparseable(why) => Err(self.damaged(why)),
+        }
     }
 
     /// Read, mutate, and atomically replace under one exclusive lock.
@@ -363,7 +410,13 @@ where
         let mut doc = match read_doc(&self.path) {
             Loaded::Value(value) => value,
             Loaded::Absent => T::default(),
-            Loaded::Damaged(why) => {
+            // Nothing was learned about the bytes, so there is nothing to
+            // conclude about them. Setting the file aside here would move
+            // records that may be perfectly good — an intact file this process
+            // simply may not open is the reported case — and starting over
+            // would then lose every one of them. The read failure is the answer.
+            Loaded::Unreadable(why) => return Err(self.damaged(why)),
+            Loaded::Unparseable(why) => {
                 // Never overwrite bytes we could not parse: the file may belong
                 // to something else entirely. Move it aside first, so starting
                 // over is recoverable rather than a silent wipe.
@@ -391,6 +444,19 @@ where
 
     fn report(&self, message: &str) {
         (self.reporter)(message);
+    }
+
+    fn damaged(&self, why: String) -> StateError {
+        StateError::Damaged {
+            file: self
+                .path
+                .file_name()
+                .unwrap_or(self.path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            path: self.path.display().to_string(),
+            why,
+        }
     }
 }
 
@@ -457,15 +523,21 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 
 enum Loaded<T> {
     Value(T),
+    /// No file, or nothing in it. The one shape that really does mean "no
+    /// records".
     Absent,
-    Damaged(String),
+    /// The bytes could not be got at all. Says nothing about what they are, so
+    /// nothing may be done to them.
+    Unreadable(String),
+    /// The bytes were read and are not this document.
+    Unparseable(String),
 }
 
 fn read_doc<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Loaded::Absent,
-        Err(err) => return Loaded::Damaged(format!("could not be read ({err})")),
+        Err(err) => return Loaded::Unreadable(format!("could not be read ({err})")),
     };
     // A zero-byte file is what an interrupted create leaves behind, and it says
     // the same thing as no file at all. Not worth a warning.
@@ -474,7 +546,7 @@ fn read_doc<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
     }
     match serde_json::from_slice(&bytes) {
         Ok(value) => Loaded::Value(value),
-        Err(err) => Loaded::Damaged(format!("is not valid JSON ({err})")),
+        Err(err) => Loaded::Unparseable(format!("could not be understood ({err})")),
     }
 }
 
@@ -1044,21 +1116,103 @@ mod tests {
         assert!(recorder.messages().is_empty());
     }
 
+    /// A read that learned nothing must not answer the question. This is the
+    /// bottom of the reported bug: `list` returned `Ok([])`, so every caller
+    /// above — up to the manager pane — had a well-formed empty world in its
+    /// hands and no way to tell it from a real one.
     #[test]
-    fn truncated_json_degrades_to_no_forwards_and_reports_it() {
+    fn truncated_json_is_a_damaged_read_rather_than_an_empty_one() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (store, recorder) = recording_store(dir.path());
         fs::write(store.path(), br#"{"version":1,"forwards":[{"host":"build"#)
             .expect("write truncated file");
 
+        let Err(err) = store.list() else {
+            panic!("a file that could not be parsed was answered as no forwards");
+        };
+
+        assert!(matches!(err, StateError::Damaged { .. }), "{err:?}: {err}");
         assert!(
-            store
-                .list()
-                .expect("a corrupt file must not be fatal")
-                .is_empty(),
-            "a truncated file means no known records, not a panic"
+            err.to_string()
+                .contains(&store.path().display().to_string()),
+            "the reason has to name the file: {err}"
         );
-        assert_eq!(recorder.messages().len(), 1, "the degradation is reported");
+        assert!(
+            recorder.messages().is_empty(),
+            "a read that returns its reason has nothing to warn about: {:?}",
+            recorder.messages()
+        );
+    }
+
+    /// A record the reader does not understand — a newer `origin`, say — is not
+    /// a partly-readable document. See [`STATE_VERSION`] for why the record
+    /// type is strict, and why that must surface rather than empty the world.
+    #[test]
+    fn an_unknown_value_inside_a_record_is_a_damaged_read_too() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _recorder) = recording_store(dir.path());
+        fs::write(
+            store.path(),
+            br#"{"version":2,"forwards":[
+                {"host":"buildbox","remote_port":5173,"local_port":5173,
+                 "remote_bind":"127.0.0.1","origin":"pinned-by-a-newer-plugin",
+                 "pane_id":null,"created_unix_ms":1}
+            ]}"#,
+        )
+        .expect("write a record from a newer writer");
+
+        let Err(err) = store.list() else {
+            panic!("an unreadable record was answered as no forwards at all");
+        };
+        assert!(matches!(err, StateError::Damaged { .. }), "{err:?}: {err}");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_opened_is_a_damaged_read_and_stays_untouched() {
+        // The reported reproduction: records fully intact, the file merely not
+        // readable by this process. Nothing may be concluded about its contents
+        // — least of all that there are none — and nothing may be done to it.
+        //
+        // SAFETY: geteuid reads a process property and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root reads it regardless; there is nothing to refuse.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, recorder) = recording_store(dir.path());
+        store.upsert(forward("buildbox", 5173)).expect("seed");
+        let bytes = fs::read(store.path()).expect("the seeded records");
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let Err(read_err) = store.list() else {
+            panic!("an unreadable file was answered as no forwards");
+        };
+        assert!(
+            matches!(read_err, StateError::Damaged { .. }),
+            "{read_err:?}: {read_err}"
+        );
+
+        // And a *write* over it must not set it aside either: quarantine is for
+        // bytes that were read and understood not to be ours. These were never
+        // read, and starting over here throws away two live forwards.
+        let Err(write_err) = store.upsert(forward("buildbox", 3000)) else {
+            panic!("a mutation started over on top of records it never read");
+        };
+        assert!(
+            matches!(write_err, StateError::Damaged { .. }),
+            "{write_err:?}: {write_err}"
+        );
+        assert!(
+            !quarantine_path(store.path()).exists(),
+            "an unreadable file was quarantined, which loses the records in it"
+        );
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).expect("chmod back");
+        assert_eq!(
+            fs::read(store.path()).expect("file still there"),
+            bytes,
+            "the records were rewritten by a pass that never read them"
+        );
+        assert!(recorder.messages().is_empty());
     }
 
     #[test]
@@ -1068,7 +1222,7 @@ mod tests {
         let bytes = b"this is somebody else's file";
         fs::write(store.path(), bytes).expect("write foreign file");
 
-        let _ = store.list().expect("read should degrade, not fail");
+        let _ = store.list().expect_err("read should report, not answer");
 
         assert_eq!(
             fs::read(store.path()).expect("file still there"),
@@ -1336,16 +1490,17 @@ mod tests {
             }
         });
 
-        let (reader, recorder) = recording_store(dir.path());
-        for _ in 0..200 {
-            reader.list().expect("a read must never fail mid-write");
-        }
+        // Every read has to succeed: the rename is atomic, so a reader sees one
+        // whole file or the other. A `Damaged` here would mean a torn one, and
+        // since that is now a hard failure rather than a warning, this is also
+        // what stops the fix above from turning ordinary concurrency into
+        // errors in front of a user.
+        let reader = store_in(dir.path());
+        let torn: Vec<String> = (0..200)
+            .filter_map(|_| reader.list().err().map(|err| err.to_string()))
+            .collect();
         writer.join().expect("writer thread panicked");
 
-        assert!(
-            recorder.messages().is_empty(),
-            "a reader saw a torn file: {:?}",
-            recorder.messages()
-        );
+        assert!(torn.is_empty(), "a reader saw a torn file: {torn:?}");
     }
 }

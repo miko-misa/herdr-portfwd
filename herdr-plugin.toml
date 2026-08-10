@@ -1,6 +1,6 @@
 id = "portfwd"
 name = "Herdr Port Forward"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.8.0"
 description = "Forward dev-server ports from remote Herdr hosts to your local machine"
 platforms = ["macos", "linux"]
@@ -33,21 +33,21 @@ command = ["./target/release/herdr-portfwd", "add"]
 [[actions]]
 id = "list"
 title = "Port: manage forwards"
-description = "Overlay of every live forward, with keys to stop them"
+description = "Overlay of every recorded forward on every host, marked live or not, with keys to stop them and to show one host at a time"
 contexts = ["global"]
 command = ["./target/release/herdr-portfwd", "pane-ui", "list"]
 
 [[actions]]
 id = "stop"
 title = "Port: stop a forward"
-description = "Pick a live forward and stop it"
+description = "Pick a live forward on any host and stop it"
 contexts = ["global", "workspace", "pane"]
 command = ["./target/release/herdr-portfwd", "stop"]
 
 [[actions]]
 id = "stop-all"
-title = "Port: stop all forwards for this host"
-description = "Stop every forward belonging to the invoking host"
+title = "Port: stop all forwards"
+description = "Stop every forward on every host, or on one host with --host"
 contexts = ["global", "workspace", "pane"]
 command = ["./target/release/herdr-portfwd", "stop-all"]
 
@@ -70,7 +70,7 @@ action = "open-url"
 [[panes]]
 id = "list"
 title = "Port forwards"
-description = "Live forwards, their owning panes, and stop keys"
+description = "Every host's forwards, marked live or not, their owning panes, stop keys, and h to show one host at a time"
 placement = "overlay"
 command = ["./target/release/herdr-portfwd", "pane-ui", "list"]
 

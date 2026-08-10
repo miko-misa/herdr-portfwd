@@ -131,6 +131,31 @@ impl ForwardSpec {
     }
 }
 
+/// Whether a recorded forward is actually up.
+///
+/// Three-valued, and the third value is not a shrug: a record is a claim that a
+/// port *should* be open, and only the machine that binds it can say whether it
+/// is. Under `herdr --remote` this process runs on the far side, where probing
+/// a local port answers a question about the wrong machine, so the honest
+/// answer is [`Liveness::Unknown`] — distinct from [`Liveness::Missing`], which
+/// is a check that ran and found nothing.
+///
+/// It lives here rather than in `actions` because both the CLI's listing and
+/// the manager pane render it, and a screen that drops it counts stale records
+/// as live forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Liveness {
+    /// The local port is bound here, so the forward is up.
+    Live,
+    /// Checked on the machine that would bind it, and nothing is listening.
+    /// The usual cause is a control master that died under the user: a laptop
+    /// that slept, a reboot, a dropped link.
+    Missing,
+    /// Not checked here, because this is not the machine that binds the port.
+    Unknown,
+}
+
 /// A forward believed to be live, as recorded in the state file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Forward {

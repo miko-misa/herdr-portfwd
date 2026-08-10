@@ -39,7 +39,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::confirm::ConfirmState;
-use crate::types::{AttributedListener, Forward, Origin, PaneRef};
+use crate::types::{AttributedListener, Forward, Liveness, Origin, PaneRef};
 
 /// Fallback terminal geometry when the real size cannot be read.
 pub const DEFAULT_WIDTH: usize = 80;
@@ -362,7 +362,12 @@ impl Status {
     }
 }
 
-/// A live forward, flattened for display.
+/// A recorded forward, flattened for display.
+///
+/// A *recorded* one, not a live one. The two are different questions and the
+/// answer to the second travels with the row: dropping it is how the manager
+/// came to draw a forward whose master had died exactly like one that was up,
+/// and to count it in a header that said `live`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardRow {
     pub host: String,
@@ -373,12 +378,16 @@ pub struct ForwardRow {
     pub agent: Option<String>,
     pub pane_id: Option<String>,
     pub origin: Origin,
+    /// Whether the record describes a port that is actually open. Carried
+    /// rather than assumed, and three-valued: see [`Liveness`].
+    pub live: Liveness,
 }
 
 impl ForwardRow {
-    /// Build from a stored record and the pane it was attributed to, if that
-    /// pane is still in the current snapshot.
-    pub fn from_forward(forward: &Forward, pane: Option<&PaneRef>) -> Self {
+    /// Build from a stored record, the pane it was attributed to if that pane
+    /// is still in the current snapshot, and what the listing found out about
+    /// the port.
+    pub fn from_forward(forward: &Forward, pane: Option<&PaneRef>, live: Liveness) -> Self {
         Self {
             host: forward.spec.host.clone(),
             remote_port: forward.spec.remote_port,
@@ -391,6 +400,7 @@ impl ForwardRow {
                 .clone()
                 .or_else(|| pane.map(|pane| pane.pane_id.clone())),
             origin: forward.spec.origin,
+            live,
         }
     }
 
@@ -455,11 +465,220 @@ pub fn find_pane<'a>(panes: &'a [PaneRef], pane_id: Option<&str>) -> Option<&'a 
     panes.iter().find(|pane| pane.pane_id == wanted)
 }
 
+/// Whether a table's rows are a listing at all.
+///
+/// An empty table has two causes that look identical in a `Vec` and are
+/// opposite answers to the user's question. *There is nothing* is a fact about
+/// every host. *I could not find out* is a fact about this process — the host
+/// name did not resolve, the store would not open — and says nothing whatever
+/// about what is live. A screen that cannot tell them apart states the first
+/// while the second is true, which is how
+/// `HERDR_PORTFWD_HOST=stale-name … pane-ui list` came to answer "No forwards
+/// are live on any host." over two open ports.
+///
+/// So the snapshot carries which one it is, and every wording that makes a
+/// claim about hosts — the header's count and scope, the empty table's
+/// sentence, and the statuses keys write when they find no rows — is gated on
+/// it. The CLI has never had this problem: `list --host gone-host` exits
+/// non-zero and refuses to print a world.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Listing {
+    /// The rows are what the store and the hosts actually reported.
+    #[default]
+    Fetched,
+    /// No listing was obtained. The rows are empty because nothing was learned.
+    Unavailable,
+}
+
+impl Listing {
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Listing::Unavailable)
+    }
+}
+
+/// Which host's forwards the manager is drawing.
+///
+/// The pane lists every host, because that is what is live; the filter is how a
+/// user with several hosts reads one of them at a time. It is a property of the
+/// screen, never of what exists — the snapshot always carries every row, so the
+/// header can say how many are being hidden and an emptied view can say the
+/// world is not empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HostFilter {
+    #[default]
+    All,
+    Host(String),
+}
+
+impl HostFilter {
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            HostFilter::All => None,
+            HostFilter::Host(name) => Some(name.as_str()),
+        }
+    }
+
+    fn keeps(&self, row: &ForwardRow) -> bool {
+        self.host().is_none_or(|only| only == row.host)
+    }
+}
+
+/// How many rows are live, how many are not, and how many nobody checked.
+///
+/// Every number and every sentence the manager writes about forwards is built
+/// from one of these rather than from `rows.len()`. A count of records is not a
+/// count of live forwards: `list_title` printing the one under the word `live`
+/// is how a forward whose master had died was announced as up, and
+/// `"N live on other hosts"` said the same thing about the hosts it was hiding.
+///
+/// Three fields rather than a live/dead pair, because [`Liveness`] has a third
+/// value and it is the common one under `herdr --remote`: this process is not
+/// the machine that binds the port, so nothing here checked. A wording that
+/// collapses that into either of the other two invents an answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub live: usize,
+    pub missing: usize,
+    pub unknown: usize,
+}
+
+impl Tally {
+    /// Count `rows` by what is known about each.
+    pub fn of<'a, I: IntoIterator<Item = &'a ForwardRow>>(rows: I) -> Self {
+        let mut tally = Self::default();
+        for row in rows {
+            match row.live {
+                Liveness::Live => tally.live += 1,
+                Liveness::Missing => tally.missing += 1,
+                Liveness::Unknown => tally.unknown += 1,
+            }
+        }
+        tally
+    }
+
+    pub fn total(&self) -> usize {
+        self.live + self.missing + self.unknown
+    }
+
+    /// How a screen says this out loud: `2 live`, `1 live, 1 not live`,
+    /// `3 not checked`.
+    ///
+    /// Only the non-zero parts are named, so the ordinary case — everything is
+    /// up — still reads as the plain `N live` it always did, and the stale
+    /// record that used to hide inside that number now has its own clause. No
+    /// rows at all is `0 live`: a listing that arrived and held nothing is a
+    /// fact about liveness, unlike one that never arrived, which never reaches
+    /// here (see [`ListSnapshot::unlisted`]).
+    pub fn phrase(&self) -> String {
+        let parts: Vec<String> = [
+            (self.live, Liveness::Live),
+            (self.missing, Liveness::Missing),
+            (self.unknown, Liveness::Unknown),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, live)| format!("{count} {}", liveness_word(live)))
+        .collect();
+        if parts.is_empty() {
+            return format!("0 {}", liveness_word(Liveness::Live));
+        }
+        parts.join(", ")
+    }
+}
+
+/// The word the manager uses for a liveness, in the header's counts and in the
+/// mark on the row itself.
+///
+/// One function for both so a row and the number above it cannot describe the
+/// same record differently. Deliberately a phrase rather than the CLI's
+/// one-word column (`live` / `missing` / `unknown`): a pane has no column
+/// header to say what the word is about, so `not checked` has to carry that on
+/// its own.
+fn liveness_word(live: Liveness) -> &'static str {
+    match live {
+        Liveness::Live => "live",
+        Liveness::Missing => "not live",
+        Liveness::Unknown => "not checked",
+    }
+}
+
+/// Hosts with a forward, each once, in the order they first appear.
+pub fn host_cycle(rows: &[ForwardRow]) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for row in rows {
+        if !hosts.contains(&row.host) {
+            hosts.push(row.host.clone());
+        }
+    }
+    hosts
+}
+
+/// Where `h` moves the filter next: all hosts, then each host that has a
+/// forward, then back to all hosts.
+///
+/// A filter naming a host that no longer has one — its last forward was just
+/// stopped — lands back on "all hosts" rather than on a neighbour the user
+/// never chose, and so does a cycle with nothing left to narrow.
+pub fn next_host_filter(current: &HostFilter, rows: &[ForwardRow]) -> HostFilter {
+    let hosts = host_cycle(rows);
+    if hosts.len() < 2 {
+        return HostFilter::All;
+    }
+    match current {
+        HostFilter::All => HostFilter::Host(hosts[0].clone()),
+        HostFilter::Host(name) => match hosts.iter().position(|host| host == name) {
+            Some(index) if index + 1 < hosts.len() => HostFilter::Host(hosts[index + 1].clone()),
+            _ => HostFilter::All,
+        },
+    }
+}
+
+/// What pressing `h` does to a snapshot.
+///
+/// Returned rather than applied so the decision is a pure function of what is
+/// on screen — the same shape the rendering has — and so the one case that must
+/// write nothing at all is a case rather than an omission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostCycle {
+    /// Move the filter here.
+    Filter(HostFilter),
+    /// Nothing to move it to. Say this, because a key that redraws an identical
+    /// frame reads as a key that does not work.
+    Say(String),
+    /// Nothing to move it to, and nothing this key is entitled to say: the
+    /// table is empty because no listing arrived, and the status already
+    /// explains that. Any replacement would be a claim about hosts the pane
+    /// never reached, and would cost the user the one line that named the
+    /// actual problem.
+    Keep,
+}
+
+/// Where `h` leaves the snapshot. See [`HostCycle`].
+pub fn host_cycle_effect(snapshot: &ListSnapshot) -> HostCycle {
+    if snapshot.unlisted() {
+        return HostCycle::Keep;
+    }
+    let hosts = host_cycle(&snapshot.rows);
+    if snapshot.filter == HostFilter::All && hosts.len() < 2 {
+        return HostCycle::Say(match hosts.first() {
+            Some(host) => format!("every forward is on {host}"),
+            None => "there is nothing to filter".to_string(),
+        });
+    }
+    HostCycle::Filter(next_host_filter(&snapshot.filter, &snapshot.rows))
+}
+
 /// Everything `render_list` needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListSnapshot {
     pub title: String,
+    /// Every live forward, on every host. What is *drawn* is
+    /// [`ListSnapshot::shown`]; `selected` and `top` index that.
     pub rows: Vec<ForwardRow>,
+    /// Whether [`ListSnapshot::rows`] is a listing or the absence of one. See
+    /// [`Listing`]; read through [`ListSnapshot::unlisted`].
+    pub listing: Listing,
+    pub filter: HostFilter,
     pub selected: usize,
     /// First row on screen. What the pane remembers of its own scrolling; see
     /// [`scroll_top`] for why it is remembered rather than recomputed.
@@ -475,6 +694,8 @@ impl Default for ListSnapshot {
         Self {
             title: "Port forwards".to_string(),
             rows: Vec::new(),
+            listing: Listing::Fetched,
+            filter: HostFilter::All,
             selected: 0,
             top: 0,
             status: None,
@@ -493,9 +714,32 @@ impl ListSnapshot {
         }
     }
 
-    fn selected_row(&self) -> Option<&ForwardRow> {
+    /// Whether the empty table means "nothing was learned" rather than "nothing
+    /// is live".
+    ///
+    /// Only an empty table can mean it: rows on screen are a listing whatever
+    /// happened since, so a refresh that failed over a table the pane is
+    /// already holding leaves that table speaking for itself and puts its own
+    /// reason on the status line.
+    pub fn unlisted(&self) -> bool {
+        self.listing.is_unavailable() && self.rows.is_empty()
+    }
+
+    /// The rows the filter lets through — what the table draws, what the keys
+    /// act on, and what `X` means by "shown".
+    pub fn shown(&self) -> Vec<ForwardRow> {
         self.rows
-            .get(self.selected.min(self.rows.len().saturating_sub(1)))
+            .iter()
+            .filter(|row| self.filter.keeps(row))
+            .cloned()
+            .collect()
+    }
+
+    fn selected_row(&self) -> Option<ForwardRow> {
+        let shown = self.shown();
+        shown
+            .get(self.selected.min(shown.len().saturating_sub(1)))
+            .cloned()
     }
 }
 
@@ -504,6 +748,9 @@ impl ListSnapshot {
 pub struct PickerSnapshot {
     pub host: String,
     pub rows: Vec<ListenerRow>,
+    /// Whether [`PickerSnapshot::rows`] is a listing or the absence of one. See
+    /// [`Listing`]; read through [`PickerSnapshot::unlisted`].
+    pub listing: Listing,
     pub selected: usize,
     /// First row on screen; see [`ListSnapshot::top`].
     pub top: usize,
@@ -518,6 +765,7 @@ impl Default for PickerSnapshot {
         Self {
             host: String::new(),
             rows: Vec::new(),
+            listing: Listing::Fetched,
             selected: 0,
             top: 0,
             status: None,
@@ -535,6 +783,12 @@ impl PickerSnapshot {
             rows,
             ..Self::default()
         }
+    }
+
+    /// Whether the empty table means "nothing was learned" rather than "no
+    /// listener here belongs to a pane". See [`ListSnapshot::unlisted`].
+    pub fn unlisted(&self) -> bool {
+        self.listing.is_unavailable() && self.rows.is_empty()
     }
 
     /// Rows the user marked, or the highlighted one when nothing is marked.
@@ -716,13 +970,47 @@ fn overflow_line(above: usize, below: usize) -> String {
     }
 }
 
-/// The note a forward row carries after its last column.
-fn list_note(row: &ForwardRow) -> &'static str {
-    if row.is_remapped() {
-        "remapped"
-    } else {
-        ""
+/// The notes a forward row carries after its last column, with the colour each
+/// is painted in.
+///
+/// One function so the width the layout reserves and the text the row draws
+/// cannot drift apart, and so the row that is not live cannot be drawn
+/// identically to the row that is. Liveness comes first because it is the one
+/// that decides whether the row describes an open port at all; `remapped` is a
+/// property of a forward that exists.
+///
+/// A live forward is marked by nothing, which is the point: the header counts
+/// it, and a table where every row carries a badge has no marks left for the
+/// row that needs one.
+fn list_notes(row: &ForwardRow) -> Vec<(String, &'static str)> {
+    let mut notes = Vec::new();
+    match row.live {
+        Liveness::Live => {}
+        // Red: the record claims a port that is not open, which is the state a
+        // user has to act on — a master that died under them.
+        Liveness::Missing => notes.push((liveness_word(row.live).to_string(), RED)),
+        // Dim: nothing is wrong, this is simply not the machine that knows.
+        Liveness::Unknown => notes.push((liveness_word(row.live).to_string(), DIM)),
     }
+    if row.is_remapped() {
+        notes.push(("remapped".to_string(), YELLOW));
+    }
+    notes
+}
+
+/// Cells a row's notes occupy once joined, separators included.
+fn notes_width(notes: &[(String, &'static str)]) -> usize {
+    let text: usize = notes.iter().map(|(text, _)| display_width(text)).sum();
+    text + notes.len().saturating_sub(1)
+}
+
+/// The notes as one painted cell.
+fn painted_notes(notes: &[(String, &'static str)], color: bool) -> String {
+    notes
+        .iter()
+        .map(|(text, code)| paint(text, code, color))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Column widths for the forward table, with the workspace column absorbing
@@ -754,12 +1042,12 @@ impl ListLayout {
         // Everything `row` emits other than the workspace column, counted
         // exactly once each: the marker, the five other columns, the five gaps
         // between the six columns, and — only when a row carries one — the gap
-        // and cells of the trailing note. Leaving the note out here spends its
-        // cells on the workspace column and starts the note past the right
-        // edge, where it wraps and costs a line the frame had budgeted.
+        // and cells of the trailing notes. Leaving the notes out here spends
+        // their cells on the workspace column and starts them past the right
+        // edge, where they wrap and cost a line the frame had budgeted.
         let note = rows
             .iter()
-            .map(|row| display_width(list_note(row)))
+            .map(|row| notes_width(&list_notes(row)))
             .max()
             .unwrap_or(0);
         let trailing = if note == 0 { 0 } else { GAP + note };
@@ -797,12 +1085,7 @@ impl ListLayout {
         } else {
             local
         };
-        let note = list_note(row);
-        let note = if note.is_empty() {
-            String::new()
-        } else {
-            paint(note, YELLOW, color)
-        };
+        let note = painted_notes(&list_notes(row), color);
         format!(
             "{marker}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
             cell(&row.host, self.host),
@@ -816,40 +1099,125 @@ impl ListLayout {
     }
 }
 
+/// The manager's first line: what is on screen, and whether that is everything.
+///
+/// The header this replaced read `Port forwards (1 live)` whether one forward
+/// existed or one was being shown out of several, which is the whole of the bug
+/// this pane had: nothing on screen distinguished the two.
+///
+/// The count that replaced it was still a count of *records* wearing the word
+/// `live`, so a forward whose master had died was announced as up by the same
+/// screen that offered to stop it. It is a [`Tally`] now: the number says what
+/// was checked and found, and a record nobody could check says that instead of
+/// borrowing the word.
+///
+/// A listing that never arrived gets no number at all: `0 live` is a count of
+/// what is live, and `all hosts` is a claim to have looked at them. Both were
+/// false on a screen that had reached no host at all.
+fn list_title(snapshot: &ListSnapshot, shown: &[ForwardRow]) -> String {
+    let title = sanitize(&snapshot.title);
+    if snapshot.unlisted() {
+        return format!("{title}  (listing unavailable)");
+    }
+    let phrase = Tally::of(shown).phrase();
+    match &snapshot.filter {
+        HostFilter::All => format!("{title}  ({phrase}, all hosts)"),
+        // The total is `recorded`, not `live`: the rows the filter is hiding
+        // were never checked against this header's question, and several of
+        // them may be exactly the stale records the user is looking for.
+        HostFilter::Host(name) => format!(
+            "{title}  ({phrase} of {} recorded, host {} only)",
+            snapshot.rows.len(),
+            sanitize(name)
+        ),
+    }
+}
+
 /// Draw the forward manager. Pure: same snapshot, same bytes.
 pub fn render_list(snapshot: &ListSnapshot) -> String {
     let width = snapshot.width.max(MIN_WIDTH);
     let mut frame = Frame::new(width, snapshot.color);
-    let count = snapshot.rows.len();
-    frame.push(paint(
-        &format!("{}  ({count} live)", sanitize(&snapshot.title)),
-        BOLD,
-        snapshot.color,
-    ));
+    let rows = snapshot.shown();
+    let count = rows.len();
+    frame.push(paint(&list_title(snapshot, &rows), BOLD, snapshot.color));
     frame.blank();
 
-    if snapshot.rows.is_empty() {
-        frame.push("No forwards are live.".to_string());
-        frame.push("Ctrl+click a localhost URL in a pane, or press a to pick one.".to_string());
+    if snapshot.unlisted() {
+        // No listing arrived, so this pane reached no host and knows nothing
+        // about any of them. Every other sentence on this screen would be a
+        // report about hosts it never got to; the reason is on the status line
+        // and `r` is the key that could change the answer.
+        frame.push("Could not list the forwards.".to_string());
+        frame.push("Nothing here says whether any are live. Press r to try again.".to_string());
         frame.blank();
         frame.push_status(snapshot.status.as_ref());
-        // The two keys an empty table still has. Spelled out rather than taken
-        // from `LIST_HINTS`, whose other rows act on a row that is not there.
         frame.push(paint(
-            &["a add", "q close"].join(HINT_GAP),
+            &["r refresh", "a add", "q close"].join(HINT_GAP),
             DIM,
             snapshot.color,
         ));
         return frame.finish();
     }
 
-    let layout = ListLayout::compute(&snapshot.rows, width);
+    if rows.is_empty() {
+        // A filtered view with nothing in it is not an empty world, and saying
+        // "No forwards are live" there would be the same lie the old header
+        // told, from the other side.
+        match &snapshot.filter {
+            HostFilter::Host(name) if !snapshot.rows.is_empty() => {
+                frame.push(format!("No forward on {}.", sanitize(name)));
+                // The hidden rows, counted by what is known about each. Their
+                // number under the word "live" was the header's own mistake
+                // one line down, and it is the sentence a user reads when
+                // deciding whether pressing `h` is worth it.
+                frame.push(format!(
+                    "{} on other hosts. Press h to show every host.",
+                    Tally::of(
+                        snapshot
+                            .rows
+                            .iter()
+                            .filter(|row| !snapshot.filter.keeps(row))
+                    )
+                    .phrase()
+                ));
+                frame.blank();
+                frame.push_status(snapshot.status.as_ref());
+                frame.push(paint(
+                    &["h host", "a add", "q close"].join(HINT_GAP),
+                    DIM,
+                    snapshot.color,
+                ));
+            }
+            _ => {
+                // "No forwards are live" was a claim about ports, drawn from
+                // the absence of records. What this screen knows is that it
+                // read the records and there were none.
+                frame.push("No forwards are recorded on any host.".to_string());
+                frame.push(
+                    "Ctrl+click a localhost URL in a pane, or press a to pick one.".to_string(),
+                );
+                frame.blank();
+                frame.push_status(snapshot.status.as_ref());
+                // The two keys an empty table still has. Spelled out rather
+                // than taken from `LIST_HINTS`, whose other rows act on a row
+                // that is not there.
+                frame.push(paint(
+                    &["a add", "q close"].join(HINT_GAP),
+                    DIM,
+                    snapshot.color,
+                ));
+            }
+        }
+        return frame.finish();
+    }
+
+    let layout = ListLayout::compute(&rows, width);
     frame.push(header_line(&layout.header(), snapshot.color));
 
     let capacity = rows_on_screen(snapshot.height, count);
     let selected = snapshot.selected.min(count - 1);
     let (start, end) = visible_window(snapshot.top, count, selected, capacity);
-    for (index, row) in snapshot.rows[start..end].iter().enumerate() {
+    for (index, row) in rows[start..end].iter().enumerate() {
         let index = start + index;
         frame.push_row(
             layout.row(row, index == selected, snapshot.color),
@@ -883,9 +1251,7 @@ fn picker_notes(row: &ListenerRow) -> Vec<(String, &'static str)> {
 
 /// Cells [`picker_notes`] occupies once joined, separators included.
 fn picker_notes_width(row: &ListenerRow) -> usize {
-    let notes = picker_notes(row);
-    let text: usize = notes.iter().map(|(text, _)| display_width(text)).sum();
-    text + notes.len().saturating_sub(1)
+    notes_width(&picker_notes(row))
 }
 
 /// Column widths for the listener table.
@@ -950,10 +1316,6 @@ impl PickerLayout {
             if selected { ">" } else { " " },
             if row.marked { "*" } else { " " },
         );
-        let notes: Vec<String> = picker_notes(row)
-            .iter()
-            .map(|(text, code)| paint(text, code, color))
-            .collect();
         format!(
             "{marker}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
             rcell(&row.remote_port.to_string(), self.port),
@@ -961,7 +1323,7 @@ impl PickerLayout {
             cell(&row.process, self.process),
             cell(or_dash(row.workspace.as_ref()), self.workspace),
             cell(or_dash(row.agent.as_ref()), self.agent),
-            notes.join(" "),
+            painted_notes(&picker_notes(row), color),
         )
     }
 }
@@ -978,6 +1340,26 @@ pub fn render_picker(snapshot: &PickerSnapshot) -> String {
     };
     frame.push(paint(&title, BOLD, snapshot.color));
     frame.blank();
+
+    if snapshot.unlisted() {
+        // The same distinction the manager draws: a scan that never ran has not
+        // established that no listener belongs to a pane, and the host in the
+        // title may be the very thing that could not be resolved.
+        frame.push(if host.is_empty() {
+            "Could not list the listening ports.".to_string()
+        } else {
+            format!("Could not list the listening ports on {host}.")
+        });
+        frame.push("Nothing here says which ports are open. Press r to try again.".to_string());
+        frame.blank();
+        frame.push_status(snapshot.status.as_ref());
+        frame.push(paint(
+            &["r refresh", "q close"].join(HINT_GAP),
+            DIM,
+            snapshot.color,
+        ));
+        return frame.finish();
+    }
 
     if snapshot.rows.is_empty() {
         frame.push("No listening port on this host belongs to a Herdr pane.".to_string());
@@ -1530,8 +1912,13 @@ pub enum ListCommand {
     Top,
     Bottom,
     Stop,
-    StopAll,
+    /// Stop every row the filter is showing — which with no filter is every
+    /// forward on every host, and that is what the header says it is.
+    StopShown,
     Reload,
+    /// Show the next host on its own, or every host again. See
+    /// [`next_host_filter`].
+    CycleHost,
     /// Leave for the picker, so the overlay that shows what is forwarded is
     /// also a way to forward something else.
     AddPort,
@@ -1549,8 +1936,12 @@ pub fn list_command(key: Key) -> ListCommand {
         Key::Home | Key::Char('g') => ListCommand::Top,
         Key::End | Key::Char('G') => ListCommand::Bottom,
         Key::Enter | Key::Char('x') | Key::Char('d') => ListCommand::Stop,
-        Key::Char('X') | Key::Char('D') => ListCommand::StopAll,
+        Key::Char('X') | Key::Char('D') => ListCommand::StopShown,
         Key::Char('r') => ListCommand::Reload,
+        // `h`, for host. Not a movement key here — Left and Right do nothing in
+        // this pane — and clear of `enter`, `X`, `a`, `r` and `q`, which are
+        // what the footer already promises.
+        Key::Char('h') => ListCommand::CycleHost,
         Key::Char('a') => ListCommand::AddPort,
         Key::Escape | Key::Char('q') => ListCommand::Quit,
         Key::Interrupt => ListCommand::Interrupt,
@@ -1638,10 +2029,15 @@ pub fn picker_command(key: Key) -> PickerCommand {
 const HINT_GAP: &str = "   ";
 
 /// The `list` pane's footer: hint, the key it names, the command it must run.
-const LIST_HINTS: [(&str, Key, ListCommand); 6] = [
+///
+/// "X stop shown" rather than "X stop all": with every host on screen and a key
+/// that narrows to one, "all" no longer names anything a user can point at, and
+/// what `X` stops is exactly the rows in front of them.
+const LIST_HINTS: [(&str, Key, ListCommand); 7] = [
     ("up/down move", Key::Down, ListCommand::Move(1)),
     ("enter stop", Key::Enter, ListCommand::Stop),
-    ("X stop all", Key::Char('X'), ListCommand::StopAll),
+    ("X stop shown", Key::Char('X'), ListCommand::StopShown),
+    ("h host", Key::Char('h'), ListCommand::CycleHost),
     ("a add", Key::Char('a'), ListCommand::AddPort),
     ("r refresh", Key::Char('r'), ListCommand::Reload),
     ("q close", Key::Char('q'), ListCommand::Quit),
@@ -1787,9 +2183,15 @@ impl Outcome {
 /// back. Both arms return a status line, so a refusal is shown in place rather
 /// than tearing the pane down.
 pub trait ListActions {
+    /// Stop the forward this row names — on this row's host, whatever host the
+    /// invocation resolved to.
     fn stop(&mut self, row: &ForwardRow) -> std::result::Result<String, String>;
-    fn stop_all(&mut self) -> std::result::Result<String, String>;
-    /// Rows as they are now. Called after every action and on `r`.
+    /// Stop every row the user can see. The rows are passed rather than
+    /// re-derived so "shown" means the same thing to the screen and to the
+    /// action: whatever the host filter is letting through right now.
+    fn stop_shown(&mut self, rows: &[ForwardRow]) -> std::result::Result<String, String>;
+    /// Rows as they are now, on every host. Called after every action and on
+    /// `r`; the filter is applied by the snapshot, not by the caller.
     fn rows(&mut self) -> std::result::Result<Vec<ForwardRow>, String>;
 }
 
@@ -1876,33 +2278,48 @@ where
         let (keys, consumed) = parse_keys(&pending, true);
         pending.drain(..consumed);
         for key in keys {
+            let shown = snapshot.shown();
             match list_command(key) {
                 ListCommand::Move(delta) => {
-                    snapshot.selected =
-                        step_selection(snapshot.selected, snapshot.rows.len(), delta);
+                    snapshot.selected = step_selection(snapshot.selected, shown.len(), delta);
                 }
                 ListCommand::Top => snapshot.selected = 0,
                 ListCommand::Bottom => {
-                    snapshot.selected = snapshot.rows.len().saturating_sub(1);
+                    snapshot.selected = shown.len().saturating_sub(1);
                 }
-                ListCommand::Stop => {
-                    let row = snapshot.selected_row().cloned();
-                    match row {
-                        Some(row) => {
-                            snapshot.status = Some(outcome_status(app.stop(&row)));
-                            reload_list(app, &mut snapshot);
-                        }
-                        None => snapshot.status = Some(Status::info("nothing to stop")),
+                ListCommand::Stop => match snapshot.selected_row() {
+                    Some(row) => {
+                        snapshot.status = Some(outcome_status(app.stop(&row)));
+                        reload_list(app, &mut snapshot);
                     }
-                }
-                ListCommand::StopAll => {
-                    if snapshot.rows.is_empty() {
+                    // "nothing to stop" is a report on a listing. Without one
+                    // it would be a guess, and it would overwrite the line
+                    // saying why there is no listing.
+                    None if !snapshot.unlisted() => {
                         snapshot.status = Some(Status::info("nothing to stop"));
+                    }
+                    None => {}
+                },
+                ListCommand::StopShown => {
+                    if shown.is_empty() {
+                        if !snapshot.unlisted() {
+                            snapshot.status = Some(Status::info("nothing to stop"));
+                        }
                     } else {
-                        snapshot.status = Some(outcome_status(app.stop_all()));
+                        snapshot.status = Some(outcome_status(app.stop_shown(&shown)));
                         reload_list(app, &mut snapshot);
                     }
                 }
+                ListCommand::CycleHost => match host_cycle_effect(&snapshot) {
+                    HostCycle::Filter(filter) => {
+                        snapshot.filter = filter;
+                        // The old index pointed into a different table.
+                        snapshot.selected = 0;
+                        snapshot.top = 0;
+                    }
+                    HostCycle::Say(message) => snapshot.status = Some(Status::info(message)),
+                    HostCycle::Keep => {}
+                },
                 ListCommand::Reload => reload_list(app, &mut snapshot),
                 ListCommand::AddPort => {
                     restore(out)?;
@@ -1918,14 +2335,15 @@ where
                 }
                 ListCommand::Ignore => {}
             }
-            // After every key, not only the ones that move: a stop or a refresh
-            // changes how many rows there are, and the offset has to stay a
-            // place the shortened table still has.
+            // After every key, not only the ones that move: a stop, a refresh
+            // or a change of filter changes how many rows there are, and the
+            // offset has to stay a place the shortened table still has.
+            let visible = snapshot.shown().len();
             snapshot.top = scroll_top(
                 snapshot.top,
-                snapshot.rows.len(),
+                visible,
                 snapshot.selected,
-                rows_on_screen(snapshot.height, snapshot.rows.len()),
+                rows_on_screen(snapshot.height, visible),
             );
         }
     }
@@ -1939,12 +2357,28 @@ fn outcome_status(result: std::result::Result<String, String>) -> Status {
 }
 
 /// Refresh rows in place. A failed refresh keeps the rows already on screen:
-/// blanking the table because one round trip failed loses the user's place.
+/// blanking the table because one round trip failed loses the user's place —
+/// and it leaves [`Listing`] alone for the same reason, because a stale listing
+/// is still a listing and still speaks for itself.
+///
+/// A refresh that succeeds over a pane that had no listing retires that state
+/// and the status explaining it, which is the whole of what `r` is for there.
+/// That status is the only one such a pane can be carrying: every key that
+/// finds no rows leaves it alone rather than replacing it.
 fn reload_list<A: ListActions>(app: &mut A, snapshot: &mut ListSnapshot) {
     match app.rows() {
         Ok(rows) => {
+            if snapshot.unlisted() {
+                snapshot.listing = Listing::Fetched;
+                snapshot.status = None;
+            }
             snapshot.rows = rows;
-            snapshot.selected = snapshot.selected.min(snapshot.rows.len().saturating_sub(1));
+            // Against what is drawn, not against everything recorded: with a
+            // host filter on, the two differ, and an index into the wrong one
+            // points at a row the user cannot see.
+            snapshot.selected = snapshot
+                .selected
+                .min(snapshot.shown().len().saturating_sub(1));
         }
         Err(message) => snapshot.status = Some(Status::failed(message)),
     }
@@ -1953,6 +2387,10 @@ fn reload_list<A: ListActions>(app: &mut A, snapshot: &mut ListSnapshot) {
 fn reload_picker<A: PickerActions>(app: &mut A, snapshot: &mut PickerSnapshot) {
     match app.rows() {
         Ok(rows) => {
+            if snapshot.unlisted() {
+                snapshot.listing = Listing::Fetched;
+                snapshot.status = None;
+            }
             snapshot.rows = rows;
             snapshot.selected = snapshot.selected.min(snapshot.rows.len().saturating_sub(1));
         }
@@ -2002,7 +2440,13 @@ where
                 PickerCommand::Confirm => {
                     let chosen = snapshot.chosen();
                     if chosen.is_empty() {
-                        snapshot.status = Some(Status::info("nothing to forward"));
+                        // As in the manager: with no listing behind it,
+                        // "nothing to forward" would be a claim about this
+                        // host's ports, made over the line saying why nothing
+                        // is known about them.
+                        if !snapshot.unlisted() {
+                            snapshot.status = Some(Status::info("nothing to forward"));
+                        }
                         continue;
                     }
                     match app.forward(&chosen) {
@@ -2234,6 +2678,25 @@ mod tests {
             agent: Some("claude".into()),
             pane_id: Some("w1:p1".into()),
             origin: Origin::Explicit,
+            live: Liveness::Live,
+        }
+    }
+
+    /// [`row`], with the port checked and not there — a master that died under
+    /// the user, which is the ordinary way a record goes stale.
+    fn missing_row(host: &str, remote: u16, local: u16, workspace: Option<&str>) -> ForwardRow {
+        ForwardRow {
+            live: Liveness::Missing,
+            ..row(host, remote, local, workspace)
+        }
+    }
+
+    /// [`row`], on a host this machine does not apply forwards for: nothing
+    /// here checked, and nothing here may claim either answer.
+    fn unchecked_row(host: &str, remote: u16, local: u16, workspace: Option<&str>) -> ForwardRow {
+        ForwardRow {
+            live: Liveness::Unknown,
+            ..row(host, remote, local, workspace)
         }
     }
 
@@ -2265,6 +2728,29 @@ mod tests {
             rows,
             color: false,
             ..PickerSnapshot::default()
+        }
+    }
+
+    /// What the panes open with when the listing they asked for failed: no
+    /// rows, the reason on the status line, and [`Listing::Unavailable`] saying
+    /// that the two go together. This is what `main` builds from a `list` that
+    /// could not resolve its host.
+    const NO_LISTING: &str = "unknown host \"stale-name\"; configured: buildbox";
+
+    fn unlisted_list() -> ListSnapshot {
+        ListSnapshot {
+            listing: Listing::Unavailable,
+            status: Some(Status::failed(NO_LISTING)),
+            ..plain_list(Vec::new())
+        }
+    }
+
+    fn unlisted_picker() -> PickerSnapshot {
+        PickerSnapshot {
+            host: String::new(),
+            listing: Listing::Unavailable,
+            status: Some(Status::failed(NO_LISTING)),
+            ..plain_picker(Vec::new())
         }
     }
 
@@ -2530,14 +3016,113 @@ mod tests {
     #[test]
     fn an_empty_list_says_what_to_do_instead_of_rendering_nothing() {
         let page = render_list(&plain_list(Vec::new()));
-        assert!(page.contains("No forwards are live."), "{page}");
+        assert!(
+            page.contains("No forwards are recorded on any host."),
+            "{page}"
+        );
         assert!(page.contains("Ctrl+click"), "{page}");
-        assert!(page.contains("(0 live)"), "{page}");
+        assert!(page.contains("(0 live, all hosts)"), "{page}");
         assert!(page.contains("q close"), "{page}");
         assert!(
             !page.contains("HOST"),
             "no table header without rows:\n{page}"
         );
+    }
+
+    #[test]
+    fn a_manager_that_could_not_list_never_reports_an_empty_world() {
+        // The report: `HERDR_PORTFWD_HOST=stale-name … pane-ui list` drew
+        // `(0 live, all hosts)` over "No forwards are live on any host." while
+        // `list` in the same sandbox found two, on two machines. The listing
+        // had failed on the host name; the pane had reached nobody and said so
+        // about everybody.
+        let page = render_list(&unlisted_list());
+        for claim in [
+            "No forwards are recorded on any host.",
+            "(0 live, all hosts)",
+            "all hosts",
+            "0 live",
+        ] {
+            assert!(
+                !page.contains(claim),
+                "a pane that reached no host claimed {claim:?}:\n{page}"
+            );
+        }
+        assert!(page.contains("Could not list the forwards."), "{page}");
+        assert!(
+            page.contains(NO_LISTING),
+            "the reason is the only thing this screen knows:\n{page}"
+        );
+        assert!(
+            page.contains("r refresh"),
+            "the key that could change the answer has to be on screen:\n{page}"
+        );
+        assert!(
+            !page.contains("HOST"),
+            "no table header without rows:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_picker_that_could_not_scan_never_reports_a_host_with_no_listeners() {
+        let page = render_picker(&unlisted_picker());
+        assert!(
+            !page.contains("belongs to a Herdr pane"),
+            "a scan that never ran established nothing:\n{page}"
+        );
+        assert!(
+            page.contains("Could not list the listening ports"),
+            "{page}"
+        );
+        assert!(page.contains(NO_LISTING), "{page}");
+        assert!(page.contains("r refresh"), "{page}");
+    }
+
+    #[test]
+    fn a_pane_that_could_not_list_still_fits_the_pane() {
+        // The unavailable frames are two more sentences than the empty ones and
+        // carry a status line that came from an ssh failure, which is the text
+        // most likely to be long.
+        let long = Status::failed(format!("{NO_LISTING}, {}", "buildbox-".repeat(30)));
+        for width in [MIN_WIDTH, 40, 56, DEFAULT_WIDTH, 100] {
+            let list = ListSnapshot {
+                width,
+                status: Some(long.clone()),
+                ..unlisted_list()
+            };
+            let picker = PickerSnapshot {
+                width,
+                status: Some(long.clone()),
+                ..unlisted_picker()
+            };
+            for (page, height) in [
+                (render_list(&list), list.height),
+                (render_picker(&picker), picker.height),
+            ] {
+                for line in page.lines() {
+                    assert!(
+                        ref_width(line) <= width,
+                        "a {}-cell line in a {width}-cell pane: {line:?}",
+                        ref_width(line)
+                    );
+                }
+                assert!(page.lines().count() <= height, "{page}");
+            }
+        }
+    }
+
+    #[test]
+    fn rows_on_screen_outrank_a_stale_unavailable_mark() {
+        // Defensive: `unlisted` is about an empty table. A listing that arrived
+        // is drawn whatever the mark says, rather than being hidden behind a
+        // sentence saying it could not be fetched.
+        let snapshot = ListSnapshot {
+            listing: Listing::Unavailable,
+            ..plain_list(two_hosts())
+        };
+        let page = render_list(&snapshot);
+        assert!(page.contains("8788") && page.contains("5178"), "{page}");
+        assert!(page.contains("(2 live, all hosts)"), "{page}");
     }
 
     #[test]
@@ -2552,6 +3137,318 @@ mod tests {
             !page.contains("WORKSPACE"),
             "no table header without rows:\n{page}"
         );
+    }
+
+    fn two_hosts() -> Vec<ForwardRow> {
+        vec![
+            row("mac-mini-honkoma", 8788, 8788, Some("mini: scholion")),
+            row("mac-studio-honkoma", 5178, 5178, Some("studio: 実験")),
+        ]
+    }
+
+    #[test]
+    fn the_manager_draws_every_host_and_says_that_is_what_it_is_doing() {
+        // The bug this pane had: it drew the one host the invocation resolved
+        // to, under a header — `(1 live)` — that read exactly the same whether
+        // one forward existed or one was being shown out of two.
+        let page = render_list(&plain_list(two_hosts()));
+        assert!(page.contains("8788"), "{page}");
+        assert!(page.contains("5178"), "{page}");
+        assert!(page.contains("mac-studio-honkoma"), "{page}");
+        assert!(
+            page.contains("(2 live, all hosts)"),
+            "the header has to say how much of the world this is:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_filtered_manager_says_which_host_and_how_much_it_is_hiding() {
+        let snapshot = ListSnapshot {
+            filter: HostFilter::Host("mac-studio-honkoma".into()),
+            ..plain_list(two_hosts())
+        };
+        let page = render_list(&snapshot);
+        assert!(
+            page.contains("(1 live of 2 recorded, host mac-studio-honkoma only)"),
+            "{page}"
+        );
+        assert!(page.contains("5178"), "{page}");
+        assert!(
+            !page.contains("8788"),
+            "the filter is not filtering:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_filter_with_nothing_in_it_does_not_read_as_an_empty_world() {
+        // Every forward on the filtered host was just stopped. "No forwards are
+        // live" here would be the old lie from the other side.
+        let snapshot = ListSnapshot {
+            filter: HostFilter::Host("gpu".into()),
+            ..plain_list(two_hosts())
+        };
+        let page = render_list(&snapshot);
+        assert!(page.contains("No forward on gpu."), "{page}");
+        assert!(page.contains("2 live on other hosts"), "{page}");
+        assert!(
+            page.contains("h "),
+            "the way back to every host has to be on screen:\n{page}"
+        );
+        assert!(
+            !page.contains("No forwards are recorded"),
+            "there are two, one host over:\n{page}"
+        );
+    }
+
+    // ---- what the manager counts -----------------------------------------
+
+    #[test]
+    fn a_record_whose_port_is_gone_is_not_counted_as_a_live_forward() {
+        // The report: `list` said `8788 live` and `54321 missing`, and the pane
+        // above it said `(2 live, all hosts)` and drew both rows identically.
+        // `Manager::forward_view` had dropped `ForwardStatus::live` on the way
+        // in, so `rows.len()` was doing duty as a count of live forwards.
+        let snapshot = plain_list(vec![
+            row("mac-mini-honkoma", 8788, 8788, Some("mini: scholion")),
+            missing_row("mac-mini-honkoma", 54321, 54321, Some("mini: scholion")),
+        ]);
+        let page = render_list(&snapshot);
+        assert!(
+            !page.contains("2 live"),
+            "one of these two is not live:\n{page}"
+        );
+        assert!(
+            page.contains("(1 live, 1 not live, all hosts)"),
+            "the header has to count what was checked and found:\n{page}"
+        );
+        // And the rows have to be told apart, or the count says two things are
+        // different while the table says they are the same.
+        assert!(
+            row_line(&page, "54321").contains("not live"),
+            "the stale row is drawn exactly like the open one: {:?}",
+            row_line(&page, "54321")
+        );
+        assert!(
+            !row_line(&page, "8788").contains("not live"),
+            "the live row was marked too, which marks nothing: {:?}",
+            row_line(&page, "8788")
+        );
+    }
+
+    #[test]
+    fn a_forward_this_machine_cannot_check_is_neither_live_nor_dead() {
+        // Under `herdr --remote` the pane runs on the far side, where probing a
+        // local port answers a question about the wrong machine, so `list_in`
+        // reports `Unknown` for every row. A wording built on a live/dead pair
+        // has to pick one of them here, and both are inventions.
+        let snapshot = plain_list(vec![
+            unchecked_row("mac-mini-honkoma", 8788, 8788, None),
+            unchecked_row("mac-studio-honkoma", 5178, 5178, None),
+        ]);
+        let page = render_list(&snapshot);
+        assert!(
+            page.contains("(2 not checked, all hosts)"),
+            "a pane that checked nothing has to say so:\n{page}"
+        );
+        assert!(
+            !page.contains("2 live") && !page.contains("2 not live"),
+            "nothing here established either:\n{page}"
+        );
+        for port in ["8788", "5178"] {
+            assert!(
+                row_line(&page, port).contains("not checked"),
+                "{port} is drawn as though its state were known: {:?}",
+                row_line(&page, port)
+            );
+        }
+    }
+
+    #[test]
+    fn a_filtered_header_counts_the_shown_rows_and_calls_the_rest_records() {
+        // `1 of 3 live` counted rows on both sides of the "of": the shown ones
+        // under a word nothing had checked them against, and the hidden ones
+        // the filter had kept the pane from looking at at all.
+        let snapshot = ListSnapshot {
+            filter: HostFilter::Host("mac-mini-honkoma".into()),
+            ..plain_list(vec![
+                missing_row("mac-mini-honkoma", 8788, 8788, None),
+                row("mac-studio-honkoma", 5178, 5178, None),
+            ])
+        };
+        let page = render_list(&snapshot);
+        assert!(
+            page.contains("(1 not live of 2 recorded, host mac-mini-honkoma only)"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("1 live of") && !page.contains("1 of 2 live"),
+            "the one row on screen is a record, not a live forward:\n{page}"
+        );
+    }
+
+    #[test]
+    fn the_forwards_a_filter_hides_are_counted_by_what_is_known_about_them() {
+        // The sentence a user reads when deciding whether `h` is worth
+        // pressing. "2 live on other hosts" was the header's own mistake one
+        // line down, and it was drawn from `rows.len()` the same way.
+        let snapshot = ListSnapshot {
+            filter: HostFilter::Host("gpu".into()),
+            ..plain_list(vec![
+                row("mac-mini-honkoma", 8788, 8788, None),
+                missing_row("mac-studio-honkoma", 5178, 5178, None),
+            ])
+        };
+        let page = render_list(&snapshot);
+        assert!(
+            page.contains("1 live, 1 not live on other hosts."),
+            "{page}"
+        );
+        assert!(!page.contains("2 live on other hosts"), "{page}");
+    }
+
+    #[test]
+    fn an_empty_table_that_was_read_says_it_read_records_rather_than_ports() {
+        // The one claim an empty listing supports: the records were read and
+        // there were none. Whether anything is live is a question about ports,
+        // and no port was looked at to produce this screen.
+        let page = render_list(&plain_list(Vec::new()));
+        assert!(
+            page.contains("No forwards are recorded on any host."),
+            "{page}"
+        );
+        assert!(
+            !page.contains("No forwards are live"),
+            "an absent record is not a probed port:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_tally_names_only_the_answers_it_has() {
+        let tally = |live, missing, unknown| {
+            Tally {
+                live,
+                missing,
+                unknown,
+            }
+            .phrase()
+        };
+        // The ordinary case still reads exactly as it always did.
+        assert_eq!(tally(3, 0, 0), "3 live");
+        assert_eq!(tally(0, 2, 0), "2 not live");
+        assert_eq!(tally(0, 0, 2), "2 not checked");
+        assert_eq!(tally(1, 1, 0), "1 live, 1 not live");
+        assert_eq!(tally(1, 0, 2), "1 live, 2 not checked");
+        assert_eq!(tally(1, 2, 3), "1 live, 2 not live, 3 not checked");
+        // Nothing to count is a count, not a shrug: the listing arrived.
+        assert_eq!(tally(0, 0, 0), "0 live");
+        assert_eq!(
+            Tally::of(&[
+                row("a", 1, 1, None),
+                missing_row("a", 2, 2, None),
+                unchecked_row("b", 3, 3, None),
+            ]),
+            Tally {
+                live: 1,
+                missing: 1,
+                unknown: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_liveness_mark_is_paid_for_by_the_layout_rather_than_hung_off_the_edge() {
+        // The notes are a column like any other, and this is the widest a row
+        // can get: a mark and a remap on the same row.
+        let mut both = missing_row("buildbox", 8787, 18787, Some("mini: api"));
+        both.local_port = 18787;
+        let page = render_list(&plain_list(vec![both]));
+        let line = row_line(&page, "18787");
+        assert!(
+            line.ends_with("not live remapped"),
+            "the notes were cut or pushed off: {line:?}"
+        );
+        assert!(
+            ref_width(line) <= DEFAULT_WIDTH,
+            "a {}-cell row in an {DEFAULT_WIDTH}-cell pane: {line:?}",
+            ref_width(line)
+        );
+    }
+
+    #[test]
+    fn the_filter_cycles_through_all_hosts_and_each_host_that_has_a_forward() {
+        let rows = two_hosts();
+        let all = HostFilter::All;
+        let mini = next_host_filter(&all, &rows);
+        assert_eq!(mini, HostFilter::Host("mac-mini-honkoma".into()));
+        let studio = next_host_filter(&mini, &rows);
+        assert_eq!(studio, HostFilter::Host("mac-studio-honkoma".into()));
+        assert_eq!(next_host_filter(&studio, &rows), HostFilter::All);
+        // A host that no longer has a forward is not a place to stay.
+        assert_eq!(
+            next_host_filter(&HostFilter::Host("gone".into()), &rows),
+            HostFilter::All
+        );
+        // And with one host, or none, there is nothing to narrow to.
+        assert_eq!(
+            next_host_filter(&all, &[row("only", 1, 1, None)]),
+            HostFilter::All
+        );
+        assert_eq!(next_host_filter(&all, &[]), HostFilter::All);
+    }
+
+    #[test]
+    fn the_filter_key_says_nothing_at_all_when_there_was_no_listing() {
+        // `h` cannot change a table that was never fetched, and the status it
+        // would have written — "there is nothing to filter" — describes a
+        // listing that came back empty. Over a failed one it replaces the only
+        // sentence on screen that named the actual problem.
+        assert_eq!(host_cycle_effect(&unlisted_list()), HostCycle::Keep);
+        // The same emptiness, arrived at honestly, still gets its message.
+        assert_eq!(
+            host_cycle_effect(&plain_list(Vec::new())),
+            HostCycle::Say("there is nothing to filter".to_string())
+        );
+        assert_eq!(
+            host_cycle_effect(&plain_list(vec![row("only", 1, 1, None)])),
+            HostCycle::Say("every forward is on only".to_string())
+        );
+        assert_eq!(
+            host_cycle_effect(&plain_list(two_hosts())),
+            HostCycle::Filter(HostFilter::Host("mac-mini-honkoma".into()))
+        );
+    }
+
+    #[test]
+    fn no_row_outgrows_the_pane_when_two_hosts_and_east_asian_labels_share_it() {
+        // Host names are the widest column that grew here: two long ones and a
+        // wide label in the same table is what a two-machine user has.
+        // One of them not live and remapped as well, so the row carrying the
+        // most trailing notes is the one measured.
+        let rows = vec![
+            row("mac-mini-honkoma", 8788, 8788, Some("実験用ワークスペース")),
+            missing_row("mac-studio-honkoma", 5178, 15178, Some("ミラー: 日本語")),
+        ];
+        for width in [MIN_WIDTH, 40, 56, DEFAULT_WIDTH, 100] {
+            for filter in [
+                HostFilter::All,
+                HostFilter::Host("mac-studio-honkoma".into()),
+            ] {
+                let snapshot = ListSnapshot {
+                    width,
+                    filter,
+                    ..plain_list(rows.clone())
+                };
+                let page = render_list(&snapshot);
+                for line in page.lines() {
+                    assert!(
+                        ref_width(line) <= width,
+                        "a {}-cell line in a {width}-cell pane: {line:?}",
+                        ref_width(line)
+                    );
+                }
+                assert!(page.lines().count() <= snapshot.height, "{page}");
+            }
+        }
     }
 
     #[test]
@@ -2658,8 +3555,8 @@ mod tests {
         for width in [MIN_WIDTH, 40, 56, 72, DEFAULT_WIDTH, 100, 132] {
             let mut list = plain_list(vec![
                 row("buildbox", 5173, 5173, Some("mini: scholion")),
-                row("buildbox", 8787, 18787, Some("実験用ワークスペース")),
-                row("a-rather-long-hostname", 3000, 3000, None),
+                missing_row("buildbox", 8787, 18787, Some("実験用ワークスペース")),
+                unchecked_row("a-rather-long-hostname", 3000, 3000, None),
             ]);
             list.width = width;
             list.status = Some(Status::failed(long));
@@ -3108,6 +4005,7 @@ mod tests {
         let built = ForwardRow::from_forward(
             &forward(5173, 5173, Some("w1:p1")),
             Some(&pane("w1:p1", Some("mini: scholion"))),
+            Liveness::Live,
         );
         assert_eq!(built.workspace.as_deref(), Some("mini: scholion"));
         assert_eq!(built.agent.as_deref(), Some("claude"));
@@ -3120,13 +4018,18 @@ mod tests {
         let built = ForwardRow::from_forward(
             &forward(5173, 5173, Some("w1:p1")),
             Some(&pane("w1:p1", None)),
+            Liveness::Live,
         );
         assert_eq!(built.workspace.as_deref(), Some("w1"));
     }
 
     #[test]
     fn a_forward_whose_pane_is_gone_keeps_its_recorded_pane_id() {
-        let built = ForwardRow::from_forward(&forward(15173, 5173, Some("w9:p9")), None);
+        let built = ForwardRow::from_forward(
+            &forward(15173, 5173, Some("w9:p9")),
+            None,
+            Liveness::Missing,
+        );
         assert_eq!(built.workspace, None);
         assert_eq!(built.pane_id.as_deref(), Some("w9:p9"));
         assert!(built.is_remapped());
@@ -3390,7 +4293,9 @@ mod tests {
             Some("mini: scholion"),
         )]));
         assert!(
-            list.contains("up/down move   enter stop   X stop all   a add   r refresh   q close"),
+            list.contains(
+                "up/down move   enter stop   X stop shown   h host   a add   r refresh   q close"
+            ),
             "{list}"
         );
 
@@ -3801,9 +4706,36 @@ mod tests {
     #[test]
     fn a_stop_all_key_is_not_reachable_by_a_single_lowercase_press() {
         // Shift is the guard: `x` stops one forward, and the pane must not let
-        // a mistyped one take out every forward on the host.
-        assert_ne!(list_command(Key::Char('x')), ListCommand::StopAll);
-        assert_ne!(list_command(Key::Char('a')), ListCommand::StopAll);
+        // a mistyped one take out every forward on screen.
+        assert_ne!(list_command(Key::Char('x')), ListCommand::StopShown);
+        assert_ne!(list_command(Key::Char('a')), ListCommand::StopShown);
+        // And the filter key is not one of the keys that act, either.
+        assert_ne!(list_command(Key::Char('h')), ListCommand::StopShown);
+        assert_ne!(list_command(Key::Char('h')), ListCommand::Stop);
+    }
+
+    #[test]
+    fn the_host_filter_key_collides_with_nothing_the_footer_already_promises() {
+        // The pane's other keys were chosen with the same care; a filter key
+        // that shadowed one would take a stop or a close with it.
+        for taken in [
+            Key::Enter,
+            Key::Char('X'),
+            Key::Char('a'),
+            Key::Char('r'),
+            Key::Char('q'),
+            Key::Up,
+            Key::Down,
+            Key::Left,
+            Key::Right,
+        ] {
+            assert_ne!(
+                list_command(taken),
+                ListCommand::CycleHost,
+                "{taken:?} already does something else on this pane"
+            );
+        }
+        assert_eq!(list_command(Key::Char('h')), ListCommand::CycleHost);
     }
 
     // ---- driving the panes ----------------------------------------------
@@ -3812,7 +4744,9 @@ mod tests {
     struct FakeList {
         rows: Vec<ForwardRow>,
         stopped: Vec<(String, u16)>,
-        stop_all_calls: usize,
+        /// What each `X` was handed, so a test can tell "everything" from
+        /// "everything the filter is showing".
+        stop_shown_calls: Vec<Vec<(String, u16)>>,
         rows_calls: usize,
         stop_error: Option<String>,
         rows_error: Option<String>,
@@ -3829,10 +4763,15 @@ mod tests {
             Ok(format!("stopped {} {}", row.host, row.remote_port))
         }
 
-        fn stop_all(&mut self) -> std::result::Result<String, String> {
-            self.stop_all_calls += 1;
-            let count = self.rows.len();
-            self.rows.clear();
+        fn stop_shown(&mut self, rows: &[ForwardRow]) -> std::result::Result<String, String> {
+            self.stop_shown_calls.push(
+                rows.iter()
+                    .map(|row| (row.host.clone(), row.remote_port))
+                    .collect(),
+            );
+            let count = rows.len();
+            self.rows
+                .retain(|kept| !rows.iter().any(|gone| gone == kept));
             Ok(format!("stopped {count} forwards"))
         }
 
@@ -3851,6 +4790,7 @@ mod tests {
         forwarded: Vec<Vec<u16>>,
         rows_calls: usize,
         forward_error: Option<String>,
+        rows_error: Option<String>,
     }
 
     impl PickerActions for FakePicker {
@@ -3865,12 +4805,24 @@ mod tests {
 
         fn rows(&mut self) -> std::result::Result<Vec<ListenerRow>, String> {
             self.rows_calls += 1;
-            Ok(self.rows.clone())
+            match &self.rows_error {
+                Some(message) => Err(message.clone()),
+                None => Ok(self.rows.clone()),
+            }
         }
     }
 
     fn drive_list(app: &mut FakeList, keys: &[u8]) -> (Outcome, String) {
-        let snapshot = plain_list(app.rows.clone());
+        drive_list_from(app, plain_list(app.rows.clone()), keys)
+    }
+
+    /// [`drive_list`] over a snapshot the test built, for the opening states
+    /// `main` can hand the pane that its own rows cannot describe.
+    fn drive_list_from(
+        app: &mut FakeList,
+        snapshot: ListSnapshot,
+        keys: &[u8],
+    ) -> (Outcome, String) {
         let mut input = keys;
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_list(app, snapshot, &mut input, &mut out).expect("streams never fail");
@@ -3878,7 +4830,14 @@ mod tests {
     }
 
     fn drive_picker(app: &mut FakePicker, keys: &[u8]) -> (Outcome, String) {
-        let snapshot = plain_picker(app.rows.clone());
+        drive_picker_from(app, plain_picker(app.rows.clone()), keys)
+    }
+
+    fn drive_picker_from(
+        app: &mut FakePicker,
+        snapshot: PickerSnapshot,
+        keys: &[u8],
+    ) -> (Outcome, String) {
         let mut input = keys;
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_picker(app, snapshot, &mut input, &mut out).expect("streams never fail");
@@ -4145,7 +5104,7 @@ mod tests {
         };
         let (_, screen) = drive_list(&mut app, b"\r");
         let last_frame = screen.rsplit("\x1b[2J").next().unwrap_or_default();
-        assert!(last_frame.contains("(1 live)"), "{last_frame}");
+        assert!(last_frame.contains("(1 live, all hosts)"), "{last_frame}");
         assert!(!last_frame.contains("mini: scholion"), "{last_frame}");
         assert!(last_frame.contains("mini: api"), "{last_frame}");
     }
@@ -4175,9 +5134,204 @@ mod tests {
             ..FakeList::default()
         };
         let (_, screen) = drive_list(&mut app, b"X");
-        assert_eq!(app.stop_all_calls, 1);
+        assert_eq!(app.stop_shown_calls.len(), 1);
+        assert_eq!(
+            app.stop_shown_calls[0],
+            [
+                ("buildbox".to_string(), 5173),
+                ("buildbox".to_string(), 8787)
+            ],
+            "with no filter on, `shown` is every row"
+        );
         assert!(app.stopped.is_empty(), "stop-all must not stop one by one");
         assert!(screen.contains("stopped 2 forwards"), "{screen}");
+    }
+
+    #[test]
+    fn enter_stops_the_row_on_the_row_s_own_host() {
+        // The pane lists two machines; the key has to act on the one under the
+        // highlight rather than on whatever host the invocation resolved to.
+        let mut app = FakeList {
+            rows: two_hosts(),
+            ..FakeList::default()
+        };
+        let (_, screen) = drive_list(&mut app, b"j\r");
+        assert_eq!(app.stopped, [("mac-studio-honkoma".to_string(), 5178)]);
+        assert!(
+            screen.contains("stopped mac-studio-honkoma 5178"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn h_narrows_to_one_host_and_then_back_to_every_host() {
+        let mut app = FakeList {
+            rows: two_hosts(),
+            ..FakeList::default()
+        };
+        let mut input = Keystrokes { keys: b"hhh" };
+        let mut out: Vec<u8> = Vec::new();
+        run_list(&mut app, plain_list(two_hosts()), &mut input, &mut out)
+            .expect("streams never fail");
+        let screen = String::from_utf8_lossy(&out).into_owned();
+        let drawn = frames(&screen);
+        assert_eq!(drawn.len(), 4, "one frame per key, plus the first");
+        assert!(drawn[0].contains("(2 live, all hosts)"), "{}", drawn[0]);
+        assert!(
+            drawn[1].contains("host mac-mini-honkoma only") && !drawn[1].contains("5178"),
+            "{}",
+            drawn[1]
+        );
+        assert!(
+            drawn[2].contains("host mac-studio-honkoma only") && !drawn[2].contains("8788"),
+            "{}",
+            drawn[2]
+        );
+        assert!(drawn[3].contains("(2 live, all hosts)"), "{}", drawn[3]);
+        assert!(
+            app.stopped.is_empty(),
+            "a filter changes nothing that is up"
+        );
+    }
+
+    #[test]
+    fn a_filter_key_with_one_host_says_so_instead_of_redrawing_the_same_frame() {
+        let mut app = FakeList {
+            rows: two_forwards(),
+            ..FakeList::default()
+        };
+        let (_, screen) = drive_list(&mut app, b"h");
+        assert!(screen.contains("every forward is on buildbox"), "{screen}");
+    }
+
+    #[test]
+    fn shift_x_stops_what_the_filter_is_showing_and_nothing_behind_it() {
+        // What `X` means once the pane shows every host: everything on screen.
+        // The footer says "stop shown" and this is the sentence it makes true.
+        let mut app = FakeList {
+            rows: two_hosts(),
+            ..FakeList::default()
+        };
+        let mut input = Keystrokes { keys: b"hX" };
+        let mut out: Vec<u8> = Vec::new();
+        run_list(&mut app, plain_list(two_hosts()), &mut input, &mut out)
+            .expect("streams never fail");
+        assert_eq!(
+            app.stop_shown_calls,
+            [vec![("mac-mini-honkoma".to_string(), 8788)]],
+            "the forward on the other host was not on screen"
+        );
+    }
+
+    /// The last thing painted, which is what the user is looking at.
+    fn last_frame(screen: &str) -> String {
+        frames(screen)
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn no_key_replaces_the_reason_a_listing_failed_with_a_report_about_hosts() {
+        // `h` was the one that shipped: it overwrote the status with "there is
+        // nothing to filter" whenever the snapshot held no rows, so one
+        // keystroke turned a screen that said `unknown host "stale-name"` into
+        // one that said the tool had looked and found nothing to narrow. Every
+        // key that finds no rows is the same shape, so every key is checked.
+        for keys in [&b"h"[..], b"\r", b"x", b"X", b"j", b"G"] {
+            let mut app = FakeList {
+                rows_error: Some("the pane must not have refetched".into()),
+                ..FakeList::default()
+            };
+            let (outcome, screen) = drive_list_from(&mut app, unlisted_list(), keys);
+            let frame = last_frame(&screen);
+            assert!(
+                frame.contains(NO_LISTING),
+                "{keys:?} lost the reason the table is empty:\n{frame}"
+            );
+            for claim in [
+                "there is nothing to filter",
+                "nothing to stop",
+                "No forwards are recorded on any host.",
+                "all hosts",
+            ] {
+                assert!(
+                    !frame.contains(claim),
+                    "{keys:?} answered {claim:?} for hosts it never reached:\n{frame}"
+                );
+            }
+            assert_eq!(
+                outcome.status.map(|status| status.text).as_deref(),
+                Some(NO_LISTING),
+                "the status the pane hands back to the plugin log changed too, on {keys:?}"
+            );
+            assert!(app.stopped.is_empty() && app.stop_shown_calls.is_empty());
+            assert_eq!(app.rows_calls, 0, "{keys:?} refetched nothing to act on");
+        }
+    }
+
+    #[test]
+    fn r_over_a_failed_listing_replaces_it_with_the_listing_and_drops_the_reason() {
+        // The other half: the reason survives until something changes it, and a
+        // refresh that worked is that something. Leaving it up would caption a
+        // real table with the failure that preceded it.
+        let mut app = FakeList {
+            rows: two_hosts(),
+            ..FakeList::default()
+        };
+        let (outcome, screen) = drive_list_from(&mut app, unlisted_list(), b"r");
+        let frame = last_frame(&screen);
+        assert_eq!(app.rows_calls, 1);
+        assert!(frame.contains("8788") && frame.contains("5178"), "{frame}");
+        assert!(frame.contains("(2 live, all hosts)"), "{frame}");
+        assert!(
+            !frame.contains(NO_LISTING),
+            "a listing arrived; the reason it had not is stale:\n{frame}"
+        );
+        assert_eq!(outcome.status, None);
+    }
+
+    #[test]
+    fn a_refresh_that_fails_again_keeps_saying_why() {
+        let mut app = FakeList {
+            rows_error: Some("ssh: connect to host mini port 22: no route".into()),
+            ..FakeList::default()
+        };
+        let (_, screen) = drive_list_from(&mut app, unlisted_list(), b"r");
+        let frame = last_frame(&screen);
+        assert!(frame.contains("no route"), "{frame}");
+        assert!(frame.contains("Could not list the forwards."), "{frame}");
+        assert!(!frame.contains("all hosts"), "{frame}");
+    }
+
+    #[test]
+    fn enter_on_a_picker_that_could_not_scan_keeps_the_reason() {
+        // The picker has the same fallback-to-empty shape, and the same key
+        // that assumes the listing succeeded.
+        let mut app = FakePicker::default();
+        let (_, screen) = drive_picker_from(&mut app, unlisted_picker(), b"\r ");
+        let frame = last_frame(&screen);
+        assert!(frame.contains(NO_LISTING), "{frame}");
+        assert!(
+            !frame.contains("nothing to forward"),
+            "a scan that never ran established no such thing:\n{frame}"
+        );
+        assert!(!frame.contains("belongs to a Herdr pane"), "{frame}");
+        assert!(app.forwarded.is_empty());
+    }
+
+    #[test]
+    fn r_over_a_failed_scan_replaces_it_with_the_listeners() {
+        let mut app = FakePicker {
+            rows: vec![listener_row(5173, "node", Some("mini: scholion"))],
+            ..FakePicker::default()
+        };
+        let (outcome, screen) = drive_picker_from(&mut app, unlisted_picker(), b"r");
+        let frame = last_frame(&screen);
+        assert!(frame.contains("5173") && frame.contains("node"), "{frame}");
+        assert!(!frame.contains(NO_LISTING), "{frame}");
+        assert_eq!(outcome.status, None);
     }
 
     #[test]
@@ -4185,7 +5339,7 @@ mod tests {
         let mut app = FakeList::default();
         let (_, screen) = drive_list(&mut app, b"\rX");
         assert!(app.stopped.is_empty());
-        assert_eq!(app.stop_all_calls, 0);
+        assert!(app.stop_shown_calls.is_empty());
         assert!(screen.contains("nothing to stop"), "{screen}");
     }
 

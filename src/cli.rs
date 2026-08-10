@@ -14,8 +14,9 @@ use clap::{Parser, Subcommand};
     long_about = None,
 )]
 pub struct Cli {
-    /// Host to act on. Defaults to the host behind the invoking pane, then to
-    /// the configured default host.
+    /// Act on one host only. `list`, `stop` and `stop-all` cover every host
+    /// without it; the commands that make a forward fall back to the host
+    /// behind the invoking pane, then to the configured default host.
     #[arg(long, global = true, env = "HERDR_PORTFWD_HOST")]
     pub host: Option<String>,
 
@@ -74,7 +75,7 @@ pub enum Command {
         port: Option<u16>,
     },
 
-    /// Stop every forward for the selected host.
+    /// Stop every forward on every host. Narrowed to one host by --host.
     StopAll,
 
     /// Forward the port in a loopback URL, then open it locally. This is the

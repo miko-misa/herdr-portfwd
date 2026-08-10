@@ -353,6 +353,79 @@ Leaf modules have no dependencies on each other and are independently testable.
 `HerdrClient` have real implementations and test fakes. No test may invoke real
 `ssh`, real `herdr`, or touch a real network.
 
+**A screen narrows what it shows, never what it holds.** The manager pane's
+snapshot always carries every live forward on every host, and `--host` presets
+the same filter the `h` key moves. `Actions::list` still narrows, because that
+is what `--host` means to a command that prints once and exits — but a pane is
+still there after it has answered, so narrowing *its* rows leaves its header
+describing a scope its table does not have and its filter key with nothing
+behind it to reveal. `Actions::list_for_pane` is that seam: a listing that was
+not narrowed, plus the narrowing as the screen's opening filter, fetched
+together so the rows and the filter cannot come from two listings that
+disagree.
+
+**"I could not find out" is not "there is nothing".** A CLI keeps the two apart
+for free: `list --host gone-host` exits non-zero and prints no world. A pane
+cannot refuse — a pane that will not open cannot show why — so it opens on the
+failure instead, and the failure has to survive being rendered. `ui::Listing`
+is what carries it: the snapshot says whether its rows are a listing or the
+absence of one, and everything that would make a claim about hosts is gated on
+it. That is the header's count and scope, the sentence an empty table draws,
+and — the part that is easy to miss — the statuses keys write when they find no
+rows. `h` finding nothing to filter, `enter` and `X` finding nothing to stop,
+the picker's `enter` finding nothing to forward: each is a report on a listing,
+and over a failed one each was replacing the only line that named the actual
+problem. A key that could not change anything must not change the explanation;
+only `r` can, by getting a listing.
+
+The distinction has to start where the reading does, or the gate never fires.
+`state` degrades nothing: a missing or empty file is the one shape that really
+means "no records", and a file that could not be read or could not be understood
+is `StateError::Damaged` — never a `T::default()` with a warning on stderr,
+which is a plugin log nobody reads or a line the next frame clears. `Store::list`
+returning `Ok([])` for a `chmod 000` file is how a pane came to stamp `(0 live,
+all hosts)` over two live forwards while `Listing::Unavailable`, which only
+covers failures that surface as `Err`, sat unused one layer up. The quarantine
+stays for bytes that were read and understood not to be ours; bytes that were
+never read are never moved, because a file this binary cannot open may hold
+every record it has.
+
+**A record is not a port.** `forwards.json` says a forward *should* exist;
+whether it does is a different question, answered by binding the local port, and
+only on the machine that would bind it. `Liveness` is that answer and it has
+three values, because under `herdr --remote` the process reading the records is
+not that machine and the honest reply is `Unknown` rather than either of the
+other two. `Actions::list` has always computed it. The manager pane dropped it
+on the way in — `ForwardStatus { forward, live }` flattened to a `ForwardRow`
+with no liveness field — and then counted `rows.len()` under the word `live`,
+which is how a forward whose master had died was announced as live, drawn
+identically to an open port, and offered the stop key as though there were
+something to stop. A master dies under a user whenever a laptop sleeps or a link
+drops; that is the ordinary way a record goes stale, and it is the whole reason
+liveness is computed at all.
+
+So the row carries it, `ui::Tally` counts by it, and every wording on that
+screen is built from the tally rather than from a length: the header
+(`2 live`, `1 live, 1 not live`, `2 not checked`), the count of what a filter is
+hiding, and the filtered header's total, which says `recorded` because the rows
+it names were never checked against the question the word `live` asks. An empty
+table says *"No forwards are recorded on any host."* for the same reason: the
+absence of a record is a fact about the file that was read, not about any port.
+The three values are why the wording is generated rather than written out — a
+sentence with a slot for "live" and a slot for "not live" has nowhere to put the
+third, and a screen with nowhere to put an answer invents one.
+
+**`status` is the one command that must not become the failure it reports.** It
+is what the READMEs send a user to first when something is already wrong, which
+is exactly when `forwards.json` may be the thing that is wrong. A `?` on that
+read printed nothing at all — not the path of the broken file, not the
+configured hosts, not the request queue that was perfectly readable. Each read
+that can fail is a field instead (`state_error`, `request_error`), the values
+they would have produced become `null` rather than an invented `0`, and the
+process still exits non-zero, because the tool's exit code says whether this run
+worked and this one did not. Reporting a failure and being one are different
+things; only the second loses the report.
+
 ## Invariants
 
 These are the properties tests must defend.

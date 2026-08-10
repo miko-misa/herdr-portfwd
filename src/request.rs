@@ -44,8 +44,14 @@ pub const REQUEST_FILE: &str = "requests.json";
 /// simply means "nothing applied yet".
 pub const ACK_FILE: &str = "requests.acked";
 
-/// Schema version stamped into the file. Informational: every field is
-/// optional on the way in.
+/// Schema version stamped into the file. Informational, and it buys less than
+/// it looks: what a reader older than a writer survives is unknown *fields*,
+/// which serde skips. A [`Request`]'s own identity — its id, host, ports,
+/// origin and timestamp — is required, exactly as [`crate::state::STATE_VERSION`]
+/// describes for a record, and a value none of them can be read as fails the
+/// whole queue. That failure is now reported as
+/// [`crate::state::StateError::Damaged`]; the applier retries rather than
+/// concluding there is nothing left to apply.
 pub const REQUEST_VERSION: u32 = 1;
 
 /// How long an unconsumed request stays applicable.
@@ -618,16 +624,24 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_log_degrades_to_nothing_pending_and_reports_it() {
+    fn a_truncated_log_is_a_damaged_read_rather_than_an_empty_queue() {
+        // The same distinction the store draws: a queue that could not be read
+        // is not a queue with nothing in it. The agent reports "could not read
+        // requests" and tries again; concluding there is nothing to apply would
+        // drop every request in a file it never saw.
         let dir = tempfile::tempdir().expect("temp dir");
         let (log, recorder) = recording_log(dir.path());
         fs::write(log.path(), br#"{"pending":[{"id":1,"host":"build"#).expect("write");
 
-        assert!(log
-            .pending()
-            .expect("a corrupt log must not be fatal")
-            .is_empty());
-        assert_eq!(recorder.messages().len(), 1);
+        let Err(err) = log.pending() else {
+            panic!("a queue that could not be read was answered as nothing pending");
+        };
+
+        assert!(
+            matches!(err, crate::state::StateError::Damaged { .. }),
+            "{err:?}: {err}"
+        );
+        assert!(recorder.messages().is_empty());
     }
 
     #[test]

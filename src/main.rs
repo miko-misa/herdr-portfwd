@@ -59,9 +59,9 @@ use clap::Parser;
 use serde::Serialize;
 
 use herdr_portfwd::actions::{
-    Actions, AddOutcome, Applied, DropReason, Env, HostHerdr, ListReport, Liveness, OpenOutcome,
-    Placement, PlacementReason, ReconcileReport, ReconcileTrigger, ScanReport, StatusReport,
-    StopOutcome, SystemOpener, SystemPorts, Where, MODE_ENV,
+    Actions, AddOutcome, Applied, DropReason, Env, ForwardKey, HostHerdr, ListReport, Liveness,
+    OpenOutcome, Placement, PlacementReason, ReconcileReport, ReconcileTrigger, ScanReport, Scope,
+    StatusReport, StopOutcome, SystemOpener, SystemPorts, Where, MODE_ENV,
 };
 use herdr_portfwd::cli::{Cli, Command, PaneEntrypoint};
 use herdr_portfwd::config::HostsConfig;
@@ -76,8 +76,8 @@ use herdr_portfwd::ssh_process::SshProcess;
 use herdr_portfwd::state::Store;
 use herdr_portfwd::types::{AttributedListener, Host, Origin, PaneRef};
 use herdr_portfwd::ui::{
-    self, ConfirmActions, ConfirmSnapshot, Exit, ForwardRow, Handoff, ListActions, ListSnapshot,
-    ListenerRow, PickerActions, PickerSnapshot, Status,
+    self, ConfirmActions, ConfirmSnapshot, Exit, ForwardRow, Handoff, HostFilter, ListActions,
+    ListSnapshot, ListenerRow, Listing, PickerActions, PickerSnapshot, Status,
 };
 
 /// Anything went wrong. One code, because a plugin log reads the message, not
@@ -758,20 +758,50 @@ impl Ctx<'_> {
         Ok(ExitCode::SUCCESS)
     }
 
+    /// The one command that must not become the failure it is reporting.
+    ///
+    /// A file it could not read is data in the report — named, with everything
+    /// that *was* readable printed beside it — and `--json` carries the same
+    /// fields rather than an empty stdout. The exit code is still the tool's
+    /// own: something went wrong, so this run failed, and the reason is on
+    /// stderr where every other failure puts it and where
+    /// `herdr plugin log list` reads it.
     fn status(&self) -> Result<ExitCode> {
         let report = self.actions.status()?;
         self.emit(&report, render_status)?;
-        Ok(ExitCode::SUCCESS)
+        let failures = report.failures();
+        if failures.is_empty() {
+            return Ok(ExitCode::SUCCESS);
+        }
+        let mut err = io::stderr().lock();
+        for failure in failures {
+            let _ = writeln!(err, "herdr-portfwd: {}", ui::sanitize(failure));
+        }
+        Ok(ExitCode::from(EXIT_FAILURE))
     }
 
     // -- panes --------------------------------------------------------------
 
     fn manager_pane(&self) -> Result<ExitCode> {
         let mut app = self.manager();
-        let (rows, status) = split_initial(app.forward_rows());
+        // Every row, plus whatever `--host` narrowed to as the filter to open
+        // with. Never a narrowed listing: the header describes the filter, so
+        // rows the filter does not know about would make it describe a scope
+        // the table does not have.
+        let (view, status) = split_initial(app.forward_view());
+        // A listing that never arrived is not a world with no forwards in it.
+        // The pane opens on what it knows — nothing — and says that, because
+        // "No forwards are live on any host." over an unresolvable `--host`
+        // was a positive claim about every machine this process never reached.
+        let (rows, filter, listing) = match view {
+            Some((rows, filter)) => (rows, filter, Listing::Fetched),
+            None => (Vec::new(), HostFilter::All, Listing::Unavailable),
+        };
         let (width, height) = ui::terminal_size();
         let snapshot = ListSnapshot {
             rows,
+            listing,
+            filter,
             status,
             width,
             height,
@@ -783,7 +813,13 @@ impl Ctx<'_> {
 
     fn picker_pane(&self) -> Result<ExitCode> {
         let mut app = self.manager();
-        let (rows, status) = split_initial(app.listener_rows());
+        let (listeners, status) = split_initial(app.listener_rows());
+        // Same rule as the manager: a scan that did not run has not established
+        // that no listener here belongs to a pane.
+        let (rows, listing) = match listeners {
+            Some(rows) => (rows, Listing::Fetched),
+            None => (Vec::new(), Listing::Unavailable),
+        };
         let (width, height) = ui::terminal_size();
         // A failed resolve is already reported through `status`; the header just
         // loses its host name rather than the pane refusing to open.
@@ -795,6 +831,7 @@ impl Ctx<'_> {
         let snapshot = PickerSnapshot {
             host,
             rows,
+            listing,
             status,
             width,
             height,
@@ -898,10 +935,17 @@ fn confirm_env(state: &ConfirmState) -> Result<Vec<String>> {
 
 /// Rows for the first frame, with a failure turned into a status line instead
 /// of a refusal to open: a pane that will not open cannot show why.
-fn split_initial<T>(rows: std::result::Result<Vec<T>, String>) -> (Vec<T>, Option<Status>) {
-    match rows {
-        Ok(rows) => (rows, None),
-        Err(message) => (Vec::new(), Some(Status::failed(message))),
+///
+/// The absence is handed back as an absence rather than swallowed into a
+/// default, because `T::default()` for a table is an empty table and an empty
+/// table is an answer — the wrong one. Deciding what to do with nothing belongs
+/// to the caller building the snapshot, which is the one place that can mark it
+/// as [`herdr_portfwd::ui::Listing::Unavailable`] rather than as a world with
+/// no forwards in it.
+fn split_initial<T>(value: std::result::Result<T, String>) -> (Option<T>, Option<Status>) {
+    match value {
+        Ok(value) => (Some(value), None),
+        Err(message) => (None, Some(Status::failed(message))),
     }
 }
 
@@ -924,17 +968,43 @@ impl Manager<'_> {
         self.herdr.pane_list_labelled().unwrap_or_default()
     }
 
-    fn forward_rows(&self) -> std::result::Result<Vec<ForwardRow>, String> {
-        let report = self.actions.list().map_err(|err| err.to_string())?;
+    /// What the manager opens with: every live forward on every host, and the
+    /// filter the pane starts narrowed to.
+    ///
+    /// One call for both, so the rows and the filter cannot come from two
+    /// listings that disagree about scope — which is exactly what a header
+    /// saying "all hosts" over one host's rows was. `--host` reaches the pane
+    /// here and nowhere else: it is the same narrowing `h` performs, preset.
+    fn forward_view(&self) -> std::result::Result<(Vec<ForwardRow>, HostFilter), String> {
+        let listing = self
+            .actions
+            .list_for_pane()
+            .map_err(|err| err.to_string())?;
         let panes = self.panes();
-        Ok(report
-            .forwards
+        let rows = listing
+            .report
+            .hosts
             .iter()
+            .flat_map(|host| host.forwards.iter())
             .map(|status| {
                 let pane = ui::find_pane(&panes, status.forward.spec.pane_id.as_deref());
-                ForwardRow::from_forward(&status.forward, pane)
+                // `status.live` travels with the record. Dropping it here is
+                // what made the pane count every record as a live forward and
+                // draw a dead one exactly like an open port.
+                ForwardRow::from_forward(&status.forward, pane, status.live)
             })
-            .collect())
+            .collect();
+        let filter = match listing.focus.host() {
+            Some(name) => HostFilter::Host(name.to_string()),
+            None => HostFilter::All,
+        };
+        Ok((rows, filter))
+    }
+
+    /// Rows only, for a refresh: `r` and every action reload the table without
+    /// touching the filter the user is looking through.
+    fn forward_rows(&self) -> std::result::Result<Vec<ForwardRow>, String> {
+        self.forward_view().map(|(rows, _)| rows)
     }
 
     fn listener_rows(&self) -> std::result::Result<Vec<ListenerRow>, String> {
@@ -957,17 +1027,32 @@ impl Manager<'_> {
     }
 }
 
+/// A row as the store names it. The pane acts on what it is showing, so the
+/// host travels with the ports rather than being re-derived from the
+/// invocation — which is what made `enter` miss a forward on any other host.
+fn row_key(row: &ForwardRow) -> ForwardKey {
+    ForwardKey {
+        host: row.host.clone(),
+        remote_port: row.remote_port,
+        local_port: row.local_port,
+    }
+}
+
 impl ListActions for Manager<'_> {
     fn stop(&mut self, row: &ForwardRow) -> std::result::Result<String, String> {
         let outcome = self
             .actions
-            .stop(Some(row.remote_port))
+            .stop_rows(&[row_key(row)])
             .map_err(|err| err.to_string())?;
         Ok(stop_summary(&outcome))
     }
 
-    fn stop_all(&mut self) -> std::result::Result<String, String> {
-        let outcome = self.actions.stop_all().map_err(|err| err.to_string())?;
+    fn stop_shown(&mut self, rows: &[ForwardRow]) -> std::result::Result<String, String> {
+        let keys: Vec<ForwardKey> = rows.iter().map(row_key).collect();
+        let outcome = self
+            .actions
+            .stop_rows(&keys)
+            .map_err(|err| err.to_string())?;
         Ok(stop_summary(&outcome))
     }
 
@@ -1058,18 +1143,44 @@ fn ports(ports: &[u16]) -> String {
         .join(", ")
 }
 
+/// What a stop did, host by host.
+///
+/// The empty case has to say *where* it looked. "nothing to stop on
+/// mac-mini-honkoma" while the port was live on mac-studio-honkoma is the
+/// report that sent a user hunting for a bug in `ssh`, so a search that covered
+/// every host says so, and one that was narrowed names the host that does carry
+/// the port.
 fn stop_summary(outcome: &StopOutcome) -> String {
     if outcome.stopped.is_empty() {
         // Invariant 4: nothing to cancel is a no-op, so this is a status line
         // and not an error.
-        return format!("nothing to stop on {}", outcome.host);
+        let mut text = match outcome.hosts.as_slice() {
+            [] => "nothing to stop: no forward on any host".to_string(),
+            hosts => format!("nothing to stop on {}", hosts.join(", ")),
+        };
+        if !outcome.elsewhere.is_empty() {
+            text.push_str(&format!(
+                "; that port is forwarded on {}, so name it with --host",
+                outcome.elsewhere.join(", ")
+            ));
+        }
+        return text;
     }
-    let stopped: Vec<u16> = outcome
-        .stopped
+    // Grouped, in the order the hosts were acted on: "stopped 5178, 8788"
+    // across two machines names neither of them.
+    let mut groups: Vec<(&str, Vec<u16>)> = Vec::new();
+    for forward in &outcome.stopped {
+        let host = forward.spec.host.as_str();
+        match groups.iter_mut().find(|(name, _)| *name == host) {
+            Some((_, ports)) => ports.push(forward.spec.remote_port),
+            None => groups.push((host, vec![forward.spec.remote_port])),
+        }
+    }
+    let stopped: Vec<String> = groups
         .iter()
-        .map(|forward| forward.spec.remote_port)
+        .map(|(host, on_host)| format!("{} on {host}", ports(on_host)))
         .collect();
-    format!("stopped {} on {}", ports(&stopped), outcome.host)
+    format!("stopped {}", stopped.join("; "))
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,46 +1332,67 @@ fn render_open(outcome: &OpenOutcome) -> String {
     text
 }
 
+/// The listing, host by host, under a first line that says how much of the
+/// world it is.
+///
+/// That first line is the honest replacement for a per-host header on a
+/// listing that is no longer per host: with one section it still read as the
+/// whole truth, which is exactly how a forward on a second machine stayed
+/// invisible.
 fn render_list(report: &ListReport) -> String {
-    let master = match report.master_running {
-        Some(true) => " (master running)",
-        Some(false) => " (no master)",
-        None => "",
+    let total = report.total();
+    let mut text = match &report.scope {
+        Scope::Host(name) => {
+            format!("{total} forward(s) on {name} only (--host); other hosts not shown\n")
+        }
+        Scope::AllHosts if report.hosts.is_empty() => "no forwards on any host\n".to_string(),
+        Scope::AllHosts => format!(
+            "{total} forward(s) on {} host(s); every host, --host narrows\n",
+            report.hosts.len()
+        ),
     };
-    let mut text = format!(
-        "{}: {} forward(s){master}, {}\n",
-        report.host,
-        report.forwards.len(),
-        placement_label(&report.placement)
-    );
-    for status in &report.forwards {
-        let spec = &status.forward.spec;
+    for host in &report.hosts {
+        let master = match host.master_running {
+            Some(true) => " (master running)",
+            Some(false) => " (no master)",
+            None => "",
+        };
         text.push_str(&format!(
-            "  {:>5} -> {:<5}  {:<7}  {:<8}{}\n",
-            spec.remote_port,
-            spec.local_port,
-            liveness_label(status.live),
-            origin_label(spec.origin),
-            // A pane id under `--remote` arrives in a request the remote side
-            // wrote, so it is no more trustworthy than a workspace label.
-            spec.pane_id
-                .as_deref()
-                .map(|id| format!("  pane {}", ui::sanitize(id)))
-                .unwrap_or_default(),
+            "{}: {} forward(s){master}, {}\n",
+            host.host,
+            host.forwards.len(),
+            placement_label(&host.placement)
         ));
-    }
-    if !report.pending.is_empty() {
-        text.push_str(&format!(
-            "  {} request(s) waiting for the local agent: {}\n",
-            report.pending.len(),
-            ports(
-                &report
-                    .pending
-                    .iter()
-                    .map(|request| request.remote_port)
-                    .collect::<Vec<_>>()
-            )
-        ));
+        for status in &host.forwards {
+            let spec = &status.forward.spec;
+            text.push_str(&format!(
+                "  {:>5} -> {:<5}  {:<7}  {:<8}{}\n",
+                spec.remote_port,
+                spec.local_port,
+                liveness_label(status.live),
+                origin_label(spec.origin),
+                // A pane id under `--remote` arrives in a request the remote
+                // side wrote, so it is no more trustworthy than a workspace
+                // label.
+                spec.pane_id
+                    .as_deref()
+                    .map(|id| format!("  pane {}", ui::sanitize(id)))
+                    .unwrap_or_default(),
+            ));
+        }
+        if !host.pending.is_empty() {
+            text.push_str(&format!(
+                "  {} request(s) waiting for the local agent: {}\n",
+                host.pending.len(),
+                ports(
+                    &host
+                        .pending
+                        .iter()
+                        .map(|request| request.remote_port)
+                        .collect::<Vec<_>>()
+                )
+            ));
+        }
     }
     text
 }
@@ -1374,11 +1506,20 @@ fn render_status(report: &StatusReport) -> String {
     for shadowed in &report.shadowed {
         text.push_str(&format!("  shadowed:   {}\n", shadowed.display()));
     }
+    // The path first, then what happened to it. A user who ran `status`
+    // because something was wrong needs the name of the file to look at more
+    // than they need the records it was supposed to hold.
     text.push_str(&format!("state file:   {}\n", report.state_file.display()));
+    if let Some(why) = &report.state_error {
+        text.push_str(&format!("  unreadable: {}\n", ui::sanitize(why)));
+    }
     text.push_str(&format!(
         "request file: {}\n",
         report.request_file.display()
     ));
+    if let Some(why) = &report.request_error {
+        text.push_str(&format!("  unreadable: {}\n", ui::sanitize(why)));
+    }
     match &report.selected {
         Some(selected) => text.push_str(&format!(
             "selected:     {} (via {}), {}\n",
@@ -1396,7 +1537,13 @@ fn render_status(report: &StatusReport) -> String {
             )
         )),
     }
-    text.push_str(&format!("pending:      {}\n", report.pending_requests));
+    text.push_str(&format!(
+        "pending:      {}\n",
+        match report.pending_requests {
+            Some(count) => count.to_string(),
+            None => "unknown".to_string(),
+        }
+    ));
     for warning in &report.warnings {
         // Config text and error strings both end up here, and `status` is what
         // someone runs when something is already wrong.
@@ -1408,13 +1555,19 @@ fn render_status(report: &StatusReport) -> String {
             Some(false) => "no master",
             None => "master not checked",
         };
+        // "0 forward(s)" is a count; a file that could not be read has none to
+        // give, and printing one would be the report agreeing with itself
+        // about something it never learned.
+        let counted = match &host.forwards {
+            Some(forwards) => format!("{} forward(s)", forwards.len()),
+            None => "forwards unknown".to_string(),
+        };
         text.push_str(&format!(
-            "\n{} -> {} ({master}, {} forward(s))\n",
+            "\n{} -> {} ({master}, {counted})\n",
             ui::sanitize(&host.host.name),
             ui::sanitize(&host.host.target),
-            host.forwards.len()
         ));
-        for forward in &host.forwards {
+        for forward in host.forwards.iter().flatten() {
             text.push_str(&format!(
                 "  {}  {}\n",
                 mapping(
@@ -1443,7 +1596,9 @@ fn show_path(path: &Option<PathBuf>) -> String {
 mod tests {
     use super::*;
 
-    use herdr_portfwd::actions::{Candidate, Dropped, ForwardStatus, HostStatus, SelectedHost};
+    use herdr_portfwd::actions::{
+        Candidate, Dropped, ForwardStatus, HostForwards, HostStatus, SelectedHost,
+    };
     use herdr_portfwd::request::Request;
     use herdr_portfwd::types::{Forward, ForwardSpec, Listener};
 
@@ -1899,17 +2054,25 @@ mod tests {
 
     // -- list ---------------------------------------------------------------
 
-    #[test]
-    fn an_empty_list_still_names_the_host() {
-        let text = render_list(&ListReport {
-            host: "buildbox".to_string(),
-            master_running: Some(false),
-            forwards: Vec::new(),
+    fn section(host: &str, master: Option<bool>, forwards: Vec<ForwardStatus>) -> HostForwards {
+        HostForwards {
+            host: host.to_string(),
+            master_running: master,
+            forwards,
             pending: Vec::new(),
             placement: local_placement(),
+        }
+    }
+
+    #[test]
+    fn an_empty_list_still_names_the_host_it_was_narrowed_to() {
+        let text = render_list(&ListReport {
+            scope: Scope::Host("buildbox".to_string()),
+            hosts: vec![section("buildbox", Some(false), Vec::new())],
         });
         assert!(text.contains("buildbox: 0 forward(s)"), "{text}");
         assert!(text.contains("no master"), "{text}");
+        assert!(text.contains("--host"), "the narrowing has to be visible");
     }
 
     #[test]
@@ -1917,20 +2080,21 @@ mod tests {
         let mut missing = forward("buildbox", 8787, 8787);
         missing.spec.origin = Origin::Offered;
         let text = render_list(&ListReport {
-            host: "buildbox".to_string(),
-            master_running: Some(true),
-            forwards: vec![
-                ForwardStatus {
-                    forward: forward("buildbox", 5173, 5173),
-                    live: Liveness::Live,
-                },
-                ForwardStatus {
-                    forward: missing,
-                    live: Liveness::Missing,
-                },
-            ],
-            pending: Vec::new(),
-            placement: local_placement(),
+            scope: Scope::AllHosts,
+            hosts: vec![section(
+                "buildbox",
+                Some(true),
+                vec![
+                    ForwardStatus {
+                        forward: forward("buildbox", 5173, 5173),
+                        live: Liveness::Live,
+                    },
+                    ForwardStatus {
+                        forward: missing,
+                        live: Liveness::Missing,
+                    },
+                ],
+            )],
         });
         assert!(text.contains("live"), "{text}");
         assert!(text.contains("missing"), "{text}");
@@ -1939,13 +2103,56 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_says_how_many_hosts_it_covers_rather_than_reading_as_the_world() {
+        // The report a user pasted: one host's header over a listing that was
+        // silently one host of two. The first line has to say which it is.
+        let text = render_list(&ListReport {
+            scope: Scope::AllHosts,
+            hosts: vec![
+                section(
+                    "mac-mini-honkoma",
+                    Some(true),
+                    vec![ForwardStatus {
+                        forward: forward("mac-mini-honkoma", 8788, 8788),
+                        live: Liveness::Live,
+                    }],
+                ),
+                section(
+                    "mac-studio-honkoma",
+                    Some(true),
+                    vec![ForwardStatus {
+                        forward: forward("mac-studio-honkoma", 5178, 5178),
+                        live: Liveness::Live,
+                    }],
+                ),
+            ],
+        });
+        assert!(text.starts_with("2 forward(s) on 2 host(s)"), "{text}");
+        assert!(text.contains("mac-mini-honkoma: 1 forward(s)"), "{text}");
+        assert!(text.contains("mac-studio-honkoma: 1 forward(s)"), "{text}");
+        assert!(text.contains("5178"), "{text}");
+    }
+
+    #[test]
+    fn a_listing_with_nothing_anywhere_says_so_in_those_words() {
+        let text = render_list(&ListReport {
+            scope: Scope::AllHosts,
+            hosts: Vec::new(),
+        });
+        assert_eq!(text, "no forwards on any host\n");
+    }
+
+    #[test]
     fn pending_requests_are_listed_when_the_forward_is_not_ours_to_apply() {
         let text = render_list(&ListReport {
-            host: "buildbox".to_string(),
-            master_running: None,
-            forwards: Vec::new(),
-            pending: vec![Request::new(1, 0, spec("buildbox", 5173, 5173))],
-            placement: remote_placement(),
+            scope: Scope::AllHosts,
+            hosts: vec![HostForwards {
+                host: "buildbox".to_string(),
+                master_running: None,
+                forwards: Vec::new(),
+                pending: vec![Request::new(1, 0, spec("buildbox", 5173, 5173))],
+                placement: remote_placement(),
+            }],
         });
         assert!(text.contains("1 request(s) waiting"), "{text}");
         assert!(text.contains("5173"), "{text}");
@@ -1957,22 +2164,62 @@ mod tests {
     fn stopping_nothing_is_reported_as_a_no_op() {
         // Invariant 4: this is success, and the wording must not read as one.
         let text = render_stop(&StopOutcome {
-            host: "buildbox".to_string(),
+            hosts: vec!["buildbox".to_string()],
             stopped: Vec::new(),
+            elsewhere: Vec::new(),
         });
         assert_eq!(text, "nothing to stop on buildbox\n");
     }
 
     #[test]
+    fn a_stop_that_looked_everywhere_says_so_rather_than_naming_one_host() {
+        let text = render_stop(&StopOutcome {
+            hosts: Vec::new(),
+            stopped: Vec::new(),
+            elsewhere: Vec::new(),
+        });
+        assert_eq!(text, "nothing to stop: no forward on any host\n");
+    }
+
+    #[test]
+    fn a_stop_narrowed_past_the_port_says_where_the_port_actually_is() {
+        let text = render_stop(&StopOutcome {
+            hosts: vec!["mac-mini-honkoma".to_string()],
+            stopped: Vec::new(),
+            elsewhere: vec!["mac-studio-honkoma".to_string()],
+        });
+        assert!(
+            text.contains("nothing to stop on mac-mini-honkoma"),
+            "{text}"
+        );
+        assert!(
+            text.contains("forwarded on mac-studio-honkoma"),
+            "the port is up one host over, and the report has to say so: {text}"
+        );
+        assert!(text.contains("--host"), "{text}");
+    }
+
+    #[test]
     fn stopping_several_names_every_port() {
         let text = render_stop(&StopOutcome {
-            host: "buildbox".to_string(),
+            hosts: vec!["buildbox".to_string()],
             stopped: vec![
                 forward("buildbox", 5173, 5173),
                 forward("buildbox", 8787, 8787),
             ],
+            elsewhere: Vec::new(),
         });
         assert!(text.contains("5173, 8787"), "{text}");
+    }
+
+    #[test]
+    fn a_stop_across_two_hosts_says_which_ports_went_with_which() {
+        let text = render_stop(&StopOutcome {
+            hosts: vec!["mini".to_string(), "studio".to_string()],
+            stopped: vec![forward("mini", 8788, 8788), forward("studio", 5178, 5178)],
+            elsewhere: Vec::new(),
+        });
+        assert_eq!(text, "stopped 8788 on mini; 5178 on studio\n");
     }
 
     // -- scan ---------------------------------------------------------------
@@ -2178,7 +2425,9 @@ mod tests {
             selected: None,
             selection_error: Some("no hosts are configured".to_string()),
             hosts: Vec::new(),
-            pending_requests: 0,
+            pending_requests: Some(0),
+            state_error: None,
+            request_error: None,
         }
     }
 
@@ -2217,14 +2466,71 @@ mod tests {
                 prefix: Some("build".to_string()),
             },
             master_running: Some(true),
-            forwards: vec![forward("buildbox", 5173, 5173)],
+            forwards: Some(vec![forward("buildbox", 5173, 5173)]),
         }];
-        report.pending_requests = 2;
+        report.pending_requests = Some(2);
         let text = render_status(&report);
         assert!(text.contains("buildbox -> user@10.0.0.9"), "{text}");
         assert!(text.contains("master running"), "{text}");
         assert!(text.contains("pending:      2"), "{text}");
         assert!(text.contains("local (live control master)"), "{text}");
+    }
+
+    #[test]
+    fn status_names_a_record_file_it_could_not_read_and_still_prints_the_rest() {
+        // `status` is what the READMEs tell a user to run first when something
+        // is already wrong, and the record file is one of the things that can
+        // be wrong. Returning `Err` for it printed nothing at all: not the path
+        // of the broken file, not the hosts, not the requests that were
+        // perfectly readable.
+        let mut report = empty_status();
+        report.state_error =
+            Some("forwards.json could not be read, so this process knows nothing of what it holds: /state/forwards.json".to_string());
+        report.hosts = vec![HostStatus {
+            host: Host {
+                name: "buildbox".to_string(),
+                target: "user@10.0.0.9".to_string(),
+                prefix: None,
+            },
+            master_running: Some(true),
+            forwards: None,
+        }];
+        report.pending_requests = Some(3);
+        let text = render_status(&report);
+        assert!(text.contains("/state/forwards.json"), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+        // Everything it *did* learn is still on the screen.
+        assert!(text.contains("buildbox -> user@10.0.0.9"), "{text}");
+        assert!(text.contains("master running"), "{text}");
+        assert!(text.contains("pending:      3"), "{text}");
+        // And nothing it did not: "0 forward(s)" here is the count the empty
+        // read used to invent.
+        assert!(
+            text.contains("forwards unknown") && !text.contains("0 forward(s)"),
+            "a file that was never read was counted anyway:\n{text}"
+        );
+    }
+
+    #[test]
+    fn status_that_could_not_read_the_queue_says_so_rather_than_counting_zero() {
+        let mut report = empty_status();
+        report.request_error = Some("requests.json could not be read".to_string());
+        report.pending_requests = None;
+        let text = render_status(&report);
+        assert!(text.contains("pending:      unknown"), "{text}");
+        assert!(!text.contains("pending:      0"), "{text}");
+        assert!(text.contains("requests.json could not be read"), "{text}");
+    }
+
+    #[test]
+    fn a_status_that_read_everything_reports_no_failure() {
+        // The gate the exit code is taken from: an ordinary report must not
+        // start exiting non-zero because the fields exist.
+        assert!(empty_status().failures().is_empty());
+        let mut broken = empty_status();
+        broken.state_error = Some("forwards.json could not be read".to_string());
+        broken.request_error = Some("requests.json could not be read".to_string());
+        assert_eq!(broken.failures().len(), 2);
     }
 
     #[test]
@@ -2237,7 +2543,7 @@ mod tests {
                 prefix: None,
             },
             master_running: None,
-            forwards: Vec::new(),
+            forwards: Some(Vec::new()),
         }];
         let text = render_status(&report);
         assert!(text.contains("master not checked"), "{text}");
@@ -2551,14 +2857,17 @@ mod tests {
         let mut hostile = forward("buildbox", 5173, 5173);
         hostile.spec.pane_id = Some(HOSTILE.to_string());
         let text = render_list(&ListReport {
-            host: "buildbox".to_string(),
-            master_running: Some(true),
-            forwards: vec![ForwardStatus {
-                forward: hostile,
-                live: Liveness::Live,
+            scope: Scope::AllHosts,
+            hosts: vec![HostForwards {
+                host: "buildbox".to_string(),
+                master_running: Some(true),
+                forwards: vec![ForwardStatus {
+                    forward: hostile,
+                    live: Liveness::Live,
+                }],
+                pending: Vec::new(),
+                placement: remote_placement(),
             }],
-            pending: Vec::new(),
-            placement: remote_placement(),
         });
         assert_nothing_a_terminal_would_obey(&text, "a pane id");
     }
@@ -2575,7 +2884,7 @@ mod tests {
                 prefix: None,
             },
             master_running: None,
-            forwards: Vec::new(),
+            forwards: Some(Vec::new()),
         }];
         let text = render_status(&report);
         assert_nothing_a_terminal_would_obey(&text, "a status report");
@@ -2612,8 +2921,9 @@ mod tests {
         // entry; one that doubles it pads the log.
         let texts = [
             render_stop(&StopOutcome {
-                host: "buildbox".to_string(),
+                hosts: vec!["buildbox".to_string()],
                 stopped: Vec::new(),
+                elsewhere: Vec::new(),
             }),
             render_add(&AddOutcome {
                 spec: spec("buildbox", 5173, 5173),

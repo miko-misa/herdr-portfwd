@@ -63,6 +63,13 @@ use crate::ssh::{self, MasterState, SshRunner};
 use crate::state::Store;
 use crate::types::{Forward, ForwardSpec, Host, Listener, Origin, PaneRef};
 
+/// Whether a record describes a forward that is actually up.
+///
+/// Defined in [`crate::types`] so the pure rendering layer can name it without
+/// depending on this module, and re-exported here because this is where it is
+/// decided. See [`Liveness`].
+pub use crate::types::Liveness;
+
 /// The only remote-side destination v1 forwards to.
 pub const LOOPBACK: &str = "127.0.0.1";
 
@@ -119,6 +126,19 @@ pub enum ActionError {
          where the local agent is running"
     )]
     NotHere { action: &'static str, host: String },
+    /// Two hosts forwarding the same port is ordinary — the port number comes
+    /// from whatever each dev server chose — so a bare `stop <port>` cannot
+    /// pick for the user. Naming both is the whole answer.
+    #[error(
+        "port {port} is forwarded on more than one host ({hosts}); \
+         say which with --host, for example \
+         `herdr-portfwd stop {port} --host {first}`"
+    )]
+    PortOnSeveralHosts {
+        port: u16,
+        hosts: String,
+        first: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ActionError>;
@@ -395,22 +415,45 @@ pub struct OpenOutcome {
     pub opened: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Liveness {
-    Live,
-    Missing,
-    Unknown,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ForwardStatus {
     pub forward: Forward,
     pub live: Liveness,
 }
 
+/// Which hosts a listing or a stop covers.
+///
+/// Every host, unless the invocation narrowed it. A forward on a host this
+/// invocation did not happen to resolve to is still a port open on this
+/// machine: hiding it made it unstoppable, and made a one-host listing
+/// indistinguishable from a one-forward world.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ListReport {
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// The default: every host that has a forward or a queued request.
+    AllHosts,
+    /// `--host`, or `HERDR_PORTFWD_HOST`.
+    Host(String),
+}
+
+impl Scope {
+    /// The host this scope narrows to, if it narrows at all.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Scope::AllHosts => None,
+            Scope::Host(name) => Some(name.as_str()),
+        }
+    }
+
+    fn covers(&self, host: &str) -> bool {
+        self.host().is_none_or(|only| only == host)
+    }
+}
+
+/// One host's section of a listing. Master and placement are per host, because
+/// they are questions about a connection rather than about the invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostForwards {
     pub host: String,
     pub master_running: Option<bool>,
     pub forwards: Vec<ForwardStatus>,
@@ -419,11 +462,78 @@ pub struct ListReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct StopOutcome {
+pub struct ListReport {
+    pub scope: Scope,
+    /// Hosts with something to show, in configuration order. A host with no
+    /// forward and no pending request is left out rather than listed empty —
+    /// except the one `--host` named, which is what the user asked about.
+    pub hosts: Vec<HostForwards>,
+}
+
+impl ListReport {
+    /// Forwards across every host in the report.
+    pub fn total(&self) -> usize {
+        self.hosts.iter().map(|host| host.forwards.len()).sum()
+    }
+}
+
+/// What the manager pane opens with: every host's forwards, and the host this
+/// invocation asked to look at.
+///
+/// The pane always holds every row — [`ListReport::scope`] here is always
+/// [`Scope::AllHosts`], and the rows really are every host's — because the
+/// screen narrows on top of what it holds. That is what lets its header say how
+/// many forwards it is hiding, and what lets `h` reveal the hosts it is not
+/// showing.
+///
+/// So `--host` cannot narrow the *listing* here the way it narrows
+/// [`Actions::list`]: a pane whose rows were narrowed and whose filter was not
+/// has a header describing a scope its rows do not have, and `h` with nothing
+/// behind it to reveal. It narrows the *screen* instead, through `focus`, which
+/// makes the flag and the key the same mechanism rather than two that can
+/// disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneListing {
+    /// Every live forward on every host, scoped [`Scope::AllHosts`].
+    pub report: ListReport,
+    /// The screen's initial narrowing: what `--host` or `HERDR_PORTFWD_HOST`
+    /// named, resolved to its configured name so it matches the host a record
+    /// carries, or [`Scope::AllHosts`] when the invocation named none.
+    pub focus: Scope,
+}
+
+/// One forward as a screen names it.
+///
+/// `(host, local_port)` is what identifies a record — the pair a cancel has to
+/// name — and the remote port rides along so a row cannot cancel a record that
+/// was rewritten between the frame being drawn and the key being pressed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForwardKey {
     pub host: String,
+    pub remote_port: u16,
+    pub local_port: u16,
+}
+
+impl ForwardKey {
+    pub fn matches(&self, forward: &Forward) -> bool {
+        forward.spec.host == self.host
+            && forward.spec.local_port == self.local_port
+            && forward.spec.remote_port == self.remote_port
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StopOutcome {
+    /// Hosts this stop acted on, or was looking at when it found nothing.
+    /// Empty when it searched every host and matched nowhere.
+    pub hosts: Vec<String>,
     /// Empty when nothing matched: cancelling a forward that was never created
     /// is a no-op, not an error (invariant 4).
     pub stopped: Vec<Forward>,
+    /// Hosts that do carry the port, when the stop was narrowed away from them.
+    /// A refusal that says "nothing to stop" while the port is live one host
+    /// over is the report that sent a user looking for a bug in `ssh`.
+    pub elsewhere: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -502,7 +612,11 @@ pub struct ReconcileReport {
 pub struct HostStatus {
     pub host: Host,
     pub master_running: Option<bool>,
-    pub forwards: Vec<Forward>,
+    /// `None` when the record file could not be read, which is not the same
+    /// host with no forwards on it. An empty list here is the answer that
+    /// `status` exists to give honestly; `null` is the absence of one, and
+    /// [`StatusReport::state_error`] says why.
+    pub forwards: Option<Vec<Forward>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -523,7 +637,28 @@ pub struct StatusReport {
     /// Why no host could be selected, when `selected` is `None`.
     pub selection_error: Option<String>,
     pub hosts: Vec<HostStatus>,
-    pub pending_requests: usize,
+    /// `None` when the request file could not be read. See
+    /// [`StatusReport::request_error`].
+    pub pending_requests: Option<usize>,
+    /// Why the record file yielded nothing, when it could not be read. Every
+    /// [`HostStatus::forwards`] is `None` in that case.
+    pub state_error: Option<String>,
+    /// Why the request queue yielded nothing, when it could not be read.
+    pub request_error: Option<String>,
+}
+
+impl StatusReport {
+    /// What `status` could not find out, in the order the report prints it.
+    ///
+    /// Read by the caller to decide the exit code: a report is still a report
+    /// when part of it is missing, but a run that could not read a file has
+    /// failed and says so the way every other command does.
+    pub fn failures(&self) -> Vec<&str> {
+        [self.state_error.as_deref(), self.request_error.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
 }
 
 fn source_label(source: HostSource) -> &'static str {
@@ -1081,127 +1216,324 @@ impl Actions<'_> {
         Ok(state)
     }
 
+    // -- scope --------------------------------------------------------------
+
+    /// Which hosts this invocation acts on.
+    ///
+    /// Only an explicit `--host` narrows. Everything else — the mirror prefix,
+    /// `default_host`, the only-host rule — decides which host a *new* forward
+    /// is made on, and reading it as "the only host worth showing" is what made
+    /// a forward on a second host invisible and unstoppable.
+    fn scope(&self) -> Result<Scope> {
+        match self
+            .env
+            .explicit_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            // Resolved rather than taken verbatim, so an unknown name is still
+            // the error it always was rather than an empty listing.
+            Some(_) => Ok(Scope::Host(self.resolve()?.host.name)),
+            None => Ok(Scope::AllHosts),
+        }
+    }
+
+    /// The configured host of that name, or a stand-in using the name as its
+    /// ssh target.
+    ///
+    /// The same fallback `attach` makes. A record whose host has left
+    /// `hosts.toml` is still an open port until `reconcile` gets to it, so it
+    /// is still listed and still stoppable rather than vanishing from the one
+    /// screen that could do something about it.
+    fn host_named(&self, name: &str) -> Host {
+        self.env
+            .hosts
+            .by_name(name)
+            .cloned()
+            .unwrap_or_else(|| Host {
+                name: name.to_string(),
+                target: name.to_string(),
+                prefix: None,
+            })
+    }
+
+    /// Placement for an arbitrary host.
+    ///
+    /// The mirror-prefix rule only applies to the host this invocation resolved
+    /// to *through* that prefix: another host's forwards were not made by the
+    /// workspace whose label carries it.
+    fn locate_named(&self, host: &Host) -> Where {
+        let prefix_matched = matches!(
+            self.resolve(),
+            Ok(resolved)
+                if resolved.source == HostSource::WorkspacePrefix
+                    && resolved.host.name == host.name
+        );
+        self.locate(host, prefix_matched)
+    }
+
+    /// Hosts worth a section: those with a record or a queued request, in
+    /// configuration order, plus any host named only by a record.
+    fn hosts_in_scope(
+        &self,
+        scope: &Scope,
+        recorded: &[Forward],
+        pending: &[Request],
+    ) -> Vec<Host> {
+        if let Scope::Host(name) = scope {
+            return vec![self.host_named(name)];
+        }
+        let mentions = |name: &str| {
+            recorded.iter().any(|f| f.spec.host == name)
+                || pending.iter().any(|request| request.host == name)
+        };
+        let mut hosts: Vec<Host> = Vec::new();
+        for host in &self.env.hosts.hosts {
+            if mentions(&host.name) {
+                hosts.push(host.clone());
+            }
+        }
+        let named = recorded
+            .iter()
+            .map(|forward| forward.spec.host.as_str())
+            .chain(pending.iter().map(|request| request.host.as_str()));
+        for name in named {
+            if !hosts.iter().any(|host| host.name == name) {
+                hosts.push(self.host_named(name));
+            }
+        }
+        hosts
+    }
+
     // -- list ---------------------------------------------------------------
 
-    /// Recorded forwards for the selected host, with whether each looks live.
+    /// Recorded forwards, with whether each looks live.
+    ///
+    /// Every host by default; `--host` narrows. See [`Actions::scope`].
+    ///
+    /// This is what `--host` means to the CLI: print that host's forwards. A
+    /// *screen* narrows differently — see [`Actions::list_for_pane`].
     pub fn list(&self) -> Result<ListReport> {
-        let resolved = self.resolve()?;
-        let placement = self.locate_resolved(&resolved);
-        let host = resolved.host;
-        let recorded = self.store.list_host(&host.name)?;
-        let pending = self
-            .requests
-            .pending()?
-            .into_iter()
-            .filter(|request| request.host == host.name)
-            .collect();
+        self.list_in(self.scope()?)
+    }
 
-        let master_running = if placement.is_local() {
-            self.master_is_running(&host)
-        } else {
-            None
-        };
-        let forwards = recorded
+    /// The listing the manager pane opens with.
+    ///
+    /// Every host's forwards whatever `--host` said, plus that narrowing as the
+    /// pane's initial filter. The argument for splitting it this way is on
+    /// [`PaneListing`].
+    ///
+    /// The narrowing is resolved first, so an invocation naming a host that
+    /// does not exist still fails the way `list` does rather than opening a
+    /// pane filtered to nothing.
+    pub fn list_for_pane(&self) -> Result<PaneListing> {
+        let focus = self.scope()?;
+        Ok(PaneListing {
+            report: self.list_in(Scope::AllHosts)?,
+            focus,
+        })
+    }
+
+    fn list_in(&self, scope: Scope) -> Result<ListReport> {
+        let recorded = self.store.list()?;
+        let pending = self.requests.pending()?;
+
+        let hosts = self
+            .hosts_in_scope(&scope, &recorded, &pending)
             .into_iter()
-            .map(|forward| {
-                let live = if !placement.is_local() {
-                    Liveness::Unknown
-                } else if self.ports.in_use(forward.spec.local_port) {
-                    Liveness::Live
+            .map(|host| {
+                let placement = self.locate_named(&host);
+                let master_running = if placement.is_local() {
+                    self.master_is_running(&host)
                 } else {
-                    Liveness::Missing
+                    None
                 };
-                ForwardStatus { forward, live }
+                let forwards = recorded
+                    .iter()
+                    .filter(|forward| forward.spec.host == host.name)
+                    .map(|forward| {
+                        let live = if !placement.is_local() {
+                            Liveness::Unknown
+                        } else if self.ports.in_use(forward.spec.local_port) {
+                            Liveness::Live
+                        } else {
+                            Liveness::Missing
+                        };
+                        ForwardStatus {
+                            forward: forward.clone(),
+                            live,
+                        }
+                    })
+                    .collect();
+                HostForwards {
+                    host: host.name.clone(),
+                    master_running,
+                    forwards,
+                    pending: pending
+                        .iter()
+                        .filter(|request| request.host == host.name)
+                        .cloned()
+                        .collect(),
+                    placement,
+                }
             })
             .collect();
 
-        Ok(ListReport {
-            host: host.name,
-            master_running,
-            forwards,
-            pending,
-            placement,
-        })
+        Ok(ListReport { scope, hosts })
     }
 
     // -- stop / stop-all ----------------------------------------------------
 
     /// Stop the forward for `port`, matched on the remote port first and the
     /// local port second. Nothing matching is a no-op (invariant 4).
+    ///
+    /// Every host is searched unless `--host` narrowed it, because that is what
+    /// `list` shows. A port on two hosts is refused rather than guessed at, and
+    /// a port the narrowing hid is named in the outcome instead of being
+    /// reported as nothing at all.
     pub fn stop(&self, port: Option<u16>) -> Result<StopOutcome> {
         let port = port.ok_or(ActionError::NoPort { command: "stop" })?;
-        let resolved = self.resolve()?;
-        let placement = self.locate_resolved(&resolved);
-        let host = resolved.host;
-        if !placement.is_local() {
-            return Err(ActionError::NotHere {
-                action: "stop",
-                host: host.name,
-            });
-        }
+        let scope = self.scope()?;
+        let recorded = self.store.list()?;
+        let matching = matching_port(&recorded, port, &scope);
 
-        let recorded = self.store.list_host(&host.name)?;
-        let mut matching: Vec<Forward> = recorded
-            .iter()
-            .filter(|f| f.spec.remote_port == port)
-            .cloned()
-            .collect();
-        if matching.is_empty() {
-            matching = recorded
-                .into_iter()
-                .filter(|f| f.spec.local_port == port)
-                .collect();
+        let hosts = host_order(&matching);
+        match hosts.as_slice() {
+            [] => {
+                self.not_here_if_remote("stop")?;
+                Ok(StopOutcome {
+                    hosts: scope.host().map(str::to_string).into_iter().collect(),
+                    stopped: Vec::new(),
+                    elsewhere: host_order(&matching_port(&recorded, port, &Scope::AllHosts)),
+                })
+            }
+            [_] => self.stop_forwards("stop", matching),
+            [first, ..] => Err(ActionError::PortOnSeveralHosts {
+                port,
+                hosts: hosts.join(", "),
+                first: first.clone(),
+            }),
         }
-        if matching.is_empty() {
-            return Ok(StopOutcome {
-                host: host.name,
-                stopped: Vec::new(),
-            });
-        }
-
-        let control_path = self.control_path(&host)?;
-        for forward in &matching {
-            self.ssh
-                .cancel_forward(&host.target, &control_path, &forward.spec)?;
-            self.store.remove(&host.name, forward.spec.local_port)?;
-        }
-        Ok(StopOutcome {
-            host: host.name,
-            stopped: matching,
-        })
     }
 
-    /// Stop every recorded forward for the selected host.
+    /// Stop every recorded forward, on every host unless `--host` narrows it.
     ///
     /// The master is left running: it is shared with the local agent and with
     /// the next `add`, and `-O exit` would take those with it.
     pub fn stop_all(&self) -> Result<StopOutcome> {
-        let resolved = self.resolve()?;
-        let placement = self.locate_resolved(&resolved);
-        let host = resolved.host;
-        if !placement.is_local() {
-            return Err(ActionError::NotHere {
-                action: "stop-all",
-                host: host.name,
+        let scope = self.scope()?;
+        let matching: Vec<Forward> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|forward| scope.covers(&forward.spec.host))
+            .collect();
+        if matching.is_empty() {
+            self.not_here_if_remote("stop-all")?;
+            return Ok(StopOutcome {
+                hosts: scope.host().map(str::to_string).into_iter().collect(),
+                stopped: Vec::new(),
+                elsewhere: Vec::new(),
             });
+        }
+        self.stop_forwards("stop-all", matching)
+    }
+
+    /// The refusal a stop owes the far side when it matched nothing.
+    ///
+    /// Under `herdr --remote` the records live beside the local agent, on the
+    /// other machine, so an empty match over here is not evidence that there is
+    /// nothing to stop — it is evidence that this is the wrong machine to ask,
+    /// and saying "nothing to stop" would be the confident wrong answer. A host
+    /// that cannot be resolved at all leaves the no-op alone: there is then no
+    /// single machine to send anyone to.
+    fn not_here_if_remote(&self, action: &'static str) -> Result<()> {
+        if let Ok(resolved) = self.resolve() {
+            if !self.locate_named(&resolved.host).is_local() {
+                return Err(ActionError::NotHere {
+                    action,
+                    host: resolved.host.name,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop exactly the forwards a screen is showing.
+    ///
+    /// This is what makes `enter` on a row stop *that* row's forward on *that*
+    /// row's host, whatever host the invocation resolved to. A row whose record
+    /// has changed since the frame was drawn matches nothing and is skipped:
+    /// the ports it names are not the ports the record holds any more, and
+    /// cancelling what replaced it would stop a forward nobody pointed at.
+    pub fn stop_rows(&self, wanted: &[ForwardKey]) -> Result<StopOutcome> {
+        let matching: Vec<Forward> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|forward| wanted.iter().any(|key| key.matches(forward)))
+            .collect();
+        if matching.is_empty() {
+            let mut hosts: Vec<String> = Vec::new();
+            for key in wanted {
+                if !hosts.contains(&key.host) {
+                    hosts.push(key.host.clone());
+                }
+            }
+            return Ok(StopOutcome {
+                hosts,
+                stopped: Vec::new(),
+                elsewhere: Vec::new(),
+            });
+        }
+        self.stop_forwards("stop", matching)
+    }
+
+    /// Cancel these records, wherever they live.
+    ///
+    /// Every host is placement-checked before anything is cancelled: a stop
+    /// spanning two hosts that refused halfway would leave the screen and the
+    /// records disagreeing about which half it did.
+    fn stop_forwards(&self, action: &'static str, matching: Vec<Forward>) -> Result<StopOutcome> {
+        let mut groups: Vec<(Host, Vec<Forward>)> = Vec::new();
+        for forward in matching {
+            match groups
+                .iter_mut()
+                .find(|(host, _)| host.name == forward.spec.host)
+            {
+                Some((_, forwards)) => forwards.push(forward),
+                None => {
+                    let host = self.host_named(&forward.spec.host);
+                    groups.push((host, vec![forward]));
+                }
+            }
+        }
+        for (host, _) in &groups {
+            if !self.locate_named(host).is_local() {
+                return Err(ActionError::NotHere {
+                    action,
+                    host: host.name.clone(),
+                });
+            }
         }
 
-        let recorded = self.store.list_host(&host.name)?;
-        if recorded.is_empty() {
-            return Ok(StopOutcome {
-                host: host.name,
-                stopped: Vec::new(),
-            });
+        let mut hosts: Vec<String> = Vec::new();
+        let mut stopped: Vec<Forward> = Vec::new();
+        for (host, forwards) in &groups {
+            let control_path = self.control_path(host)?;
+            for forward in forwards {
+                self.ssh
+                    .cancel_forward(&host.target, &control_path, &forward.spec)?;
+                self.store.remove(&host.name, forward.spec.local_port)?;
+                stopped.push(forward.clone());
+            }
+            hosts.push(host.name.clone());
         }
-        let control_path = self.control_path(&host)?;
-        for forward in &recorded {
-            self.ssh
-                .cancel_forward(&host.target, &control_path, &forward.spec)?;
-        }
-        self.store.remove_host(&host.name)?;
         Ok(StopOutcome {
-            host: host.name,
-            stopped: recorded,
+            hosts,
+            stopped,
+            elsewhere: Vec::new(),
         })
     }
 
@@ -1487,9 +1819,24 @@ impl Actions<'_> {
     /// Hosts, masters and forwards. Total on purpose: `status` is what a user
     /// runs when something is already wrong, so it reports failures instead of
     /// becoming one.
+    ///
+    /// That covers the record file and the request queue, not only the host
+    /// name. A damaged `forwards.json` is one of the things a user runs this
+    /// command to find out about, and returning `Err` for it printed nothing at
+    /// all: not the path of the file that is broken, not the hosts that are
+    /// configured, not the pending requests that were perfectly readable. Each
+    /// failure becomes a field, every other field is still gathered, and the
+    /// caller turns "something was unreadable" into the same non-zero exit any
+    /// other failed command gives.
     pub fn status(&self) -> Result<StatusReport> {
-        let recorded = self.store.list()?;
-        let pending = self.requests.pending()?;
+        let (recorded, state_error) = match self.store.list() {
+            Ok(recorded) => (Some(recorded), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
+        let (pending, request_error) = match self.requests.pending() {
+            Ok(pending) => (Some(pending), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
 
         let (selected, selection_error) = match self.resolve() {
             Ok(resolved) => (
@@ -1517,11 +1864,13 @@ impl Actions<'_> {
                 master_running: selected_is_local
                     .then(|| self.master_is_running(host))
                     .flatten(),
-                forwards: recorded
-                    .iter()
-                    .filter(|f| f.spec.host == host.name)
-                    .cloned()
-                    .collect(),
+                forwards: recorded.as_ref().map(|recorded| {
+                    recorded
+                        .iter()
+                        .filter(|f| f.spec.host == host.name)
+                        .cloned()
+                        .collect()
+                }),
                 host: host.clone(),
             })
             .collect();
@@ -1535,9 +1884,43 @@ impl Actions<'_> {
             selected,
             selection_error,
             hosts,
-            pending_requests: pending.len(),
+            pending_requests: pending.map(|pending| pending.len()),
+            state_error,
+            request_error,
         })
     }
+}
+
+/// Records `port` names, within `scope`.
+///
+/// Two passes rather than one filter: `stop 5173` means the remote port a user
+/// read in a URL, and only when no host forwards that remote port at all does
+/// the number get read as a local one. A single pass would let one host's
+/// remapped local port answer for another host's remote port.
+fn matching_port(recorded: &[Forward], port: u16, scope: &Scope) -> Vec<Forward> {
+    let matches = |pick: fn(&ForwardSpec) -> u16| -> Vec<Forward> {
+        recorded
+            .iter()
+            .filter(|forward| scope.covers(&forward.spec.host) && pick(&forward.spec) == port)
+            .cloned()
+            .collect()
+    };
+    let remote = matches(|spec| spec.remote_port);
+    if !remote.is_empty() {
+        return remote;
+    }
+    matches(|spec| spec.local_port)
+}
+
+/// The hosts these records name, each once, in the order they appear.
+fn host_order(forwards: &[Forward]) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for forward in forwards {
+        if !hosts.contains(&forward.spec.host) {
+            hosts.push(forward.spec.host.clone());
+        }
+    }
+    hosts
 }
 
 /// What identifies a record: the pair a cancel has to name.
@@ -3382,6 +3765,157 @@ mod tests {
     }
 
     #[test]
+    fn stop_reaches_a_port_on_a_host_the_invocation_did_not_resolve_to() {
+        // The other half of the bug: `stop 5178` narrowed to the host the
+        // invocation resolved to, found nothing, and said "nothing to stop on
+        // mac-mini-honkoma" while the port stayed up on the other machine.
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("mini", 8788, 8788, Origin::Explicit, None))
+            .expect("seed");
+        harness
+            .store
+            .upsert(forward("studio", 5178, 5178, Origin::Explicit, None))
+            .expect("seed");
+
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.hosts.default_host = Some("mini".into());
+        let outcome = harness.actions(e).stop(Some(5178)).expect("stop");
+
+        assert_eq!(outcome.stopped.len(), 1);
+        assert_eq!(outcome.stopped[0].spec.host, "studio");
+        assert_eq!(outcome.hosts, ["studio"]);
+        assert_eq!(
+            harness.ssh.calls(),
+            vec![SshCall::CancelForward(
+                "studio.example".into(),
+                "localhost:5178:127.0.0.1:5178".into()
+            )]
+        );
+        let left = harness.store.list().expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].spec.host, "mini");
+    }
+
+    #[test]
+    fn a_port_forwarded_on_two_hosts_is_named_rather_than_guessed_at() {
+        let harness = Harness::simple();
+        for name in ["mini", "studio"] {
+            harness
+                .store
+                .upsert(forward(name, 5173, 5173, Origin::Explicit, None))
+                .expect("seed");
+        }
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.hosts.default_host = Some("mini".into());
+        let err = harness
+            .actions(e)
+            .stop(Some(5173))
+            .expect_err("two hosts, one port");
+        match err {
+            ActionError::PortOnSeveralHosts { port, hosts, .. } => {
+                assert_eq!(port, 5173);
+                assert!(
+                    hosts.contains("mini") && hosts.contains("studio"),
+                    "{hosts}"
+                );
+            }
+            other => panic!("expected PortOnSeveralHosts, got {other:?}"),
+        }
+        assert!(
+            harness.ssh.calls().is_empty(),
+            "a refusal must cancel nothing"
+        );
+        assert_eq!(harness.store.list().expect("list").len(), 2);
+    }
+
+    #[test]
+    fn a_narrowed_stop_that_finds_nothing_names_the_host_that_does_have_the_port() {
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("studio", 5178, 5178, Origin::Explicit, None))
+            .expect("seed");
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.explicit_host = Some("mini".into());
+        let outcome = harness.actions(e).stop(Some(5178)).expect("no-op");
+
+        assert!(outcome.stopped.is_empty());
+        assert_eq!(outcome.hosts, ["mini"]);
+        assert_eq!(
+            outcome.elsewhere,
+            ["studio"],
+            "a stop that says nothing about where the port actually is sends \
+             the user looking for a bug in ssh"
+        );
+    }
+
+    #[test]
+    fn stop_rows_cancels_exactly_the_rows_a_screen_was_showing() {
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("mini", 8788, 8788, Origin::Explicit, None))
+            .expect("seed");
+        harness
+            .store
+            .upsert(forward("studio", 5178, 5178, Origin::Explicit, None))
+            .expect("seed");
+        harness
+            .store
+            .upsert(forward("studio", 3000, 3000, Origin::Offered, None))
+            .expect("seed");
+
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.hosts.default_host = Some("mini".into());
+        let outcome = harness
+            .actions(e)
+            .stop_rows(&[
+                ForwardKey {
+                    host: "studio".into(),
+                    remote_port: 5178,
+                    local_port: 5178,
+                },
+                ForwardKey {
+                    host: "mini".into(),
+                    remote_port: 8788,
+                    local_port: 8788,
+                },
+            ])
+            .expect("stop rows");
+
+        assert_eq!(outcome.stopped.len(), 2);
+        let left = harness.store.list().expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].spec.remote_port, 3000);
+    }
+
+    #[test]
+    fn a_row_whose_record_changed_under_it_stops_nothing() {
+        // The frame said 5173 -> 5173; by the time the key was pressed the
+        // record on that local port belonged to a different remote port.
+        // Cancelling it would stop a forward nobody pointed at.
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("mini", 9999, 5173, Origin::Explicit, None))
+            .expect("seed");
+        let outcome = harness
+            .actions(env(vec![host("mini", None)]))
+            .stop_rows(&[ForwardKey {
+                host: "mini".into(),
+                remote_port: 5173,
+                local_port: 5173,
+            }])
+            .expect("no-op");
+        assert!(outcome.stopped.is_empty());
+        assert_eq!(outcome.hosts, ["mini"]);
+        assert!(harness.ssh.calls().is_empty());
+        assert_eq!(harness.store.list().expect("list").len(), 1);
+    }
+
+    #[test]
     fn stop_all_cancels_every_forward_for_the_host_and_leaves_the_master_up() {
         let harness = Harness::new(
             FakeSsh::new().with_master("buildbox.example"),
@@ -3422,6 +3956,29 @@ mod tests {
         let left = harness.store.list().expect("list");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].spec.host, "other");
+    }
+
+    #[test]
+    fn stop_all_with_no_host_named_covers_every_host() {
+        // `stop-all` stops what `list` shows, and `list` shows every host. The
+        // manifest description says so too.
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("mini", 8788, 8788, Origin::Explicit, None))
+            .expect("seed");
+        harness
+            .store
+            .upsert(forward("studio", 5178, 5178, Origin::Explicit, None))
+            .expect("seed");
+
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.hosts.default_host = Some("mini".into());
+        let outcome = harness.actions(e).stop_all().expect("stop-all");
+
+        assert_eq!(outcome.stopped.len(), 2);
+        assert_eq!(outcome.hosts, ["mini", "studio"]);
+        assert!(harness.store.list().expect("list").is_empty());
     }
 
     #[test]
@@ -3478,14 +4035,109 @@ mod tests {
             .list()
             .expect("list");
 
-        assert_eq!(report.master_running, Some(true));
-        let by_port: HashMap<u16, Liveness> = report
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].master_running, Some(true));
+        let by_port: HashMap<u16, Liveness> = report.hosts[0]
             .forwards
             .iter()
             .map(|f| (f.forward.spec.local_port, f.live))
             .collect();
         assert_eq!(by_port[&5173], Liveness::Live);
         assert_eq!(by_port[&8787], Liveness::Missing);
+    }
+
+    #[test]
+    fn list_shows_every_host_that_has_a_forward_not_only_the_resolved_one() {
+        // The bug, exactly as a user met it: two hosts, a forward on each, and
+        // an invocation that resolves to one of them. Narrowing the listing to
+        // that one made the other forward invisible — and `stop` narrowed the
+        // same way, so it could not be stopped either.
+        let harness = Harness::new(
+            FakeSsh::new().with_master("mini.example"),
+            FakeHerdr::default(),
+            FakePorts::taken(&[8788, 5178]),
+        );
+        harness
+            .store
+            .upsert(forward("mini", 8788, 8788, Origin::Explicit, None))
+            .expect("seed");
+        harness
+            .store
+            .upsert(forward("studio", 5178, 5178, Origin::Explicit, None))
+            .expect("seed");
+
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.hosts.default_host = Some("mini".into());
+        let report = harness.actions(e).list().expect("list");
+
+        assert_eq!(report.scope, Scope::AllHosts);
+        assert_eq!(report.total(), 2, "both forwards are live: {report:?}");
+        assert_eq!(
+            report
+                .hosts
+                .iter()
+                .map(|section| section.host.as_str())
+                .collect::<Vec<_>>(),
+            ["mini", "studio"]
+        );
+    }
+
+    #[test]
+    fn list_narrows_to_one_host_only_when_it_was_asked_to() {
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("mini", 8788, 8788, Origin::Explicit, None))
+            .expect("seed");
+        harness
+            .store
+            .upsert(forward("studio", 5178, 5178, Origin::Explicit, None))
+            .expect("seed");
+
+        let mut e = env(vec![host("mini", None), host("studio", None)]);
+        e.explicit_host = Some("studio".into());
+        let report = harness.actions(e).list().expect("list");
+
+        assert_eq!(report.scope, Scope::Host("studio".into()));
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.hosts[0].host, "studio");
+    }
+
+    #[test]
+    fn list_answers_across_hosts_even_when_no_single_one_can_be_resolved() {
+        // Two configured hosts and nothing pointing at either is
+        // `AmbiguousHost` for anything that has to *choose* one. Listing does
+        // not have to choose, and refusing to show the forwards that are up is
+        // the least useful moment to insist on it.
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("mini", 8788, 8788, Origin::Explicit, None))
+            .expect("seed");
+
+        let report = harness
+            .actions(env(vec![host("mini", None), host("studio", None)]))
+            .list()
+            .expect("a listing needs no single host");
+        assert_eq!(report.total(), 1);
+    }
+
+    #[test]
+    fn a_record_whose_host_left_the_config_is_still_listed_rather_than_hidden() {
+        // It is an open port until `reconcile` reaches it, and the listing is
+        // the one screen that could do something about it.
+        let harness = Harness::simple();
+        harness
+            .store
+            .upsert(forward("retired", 9000, 9000, Origin::Explicit, None))
+            .expect("seed");
+
+        let report = harness
+            .actions(env(vec![host("mini", None)]))
+            .list()
+            .expect("list");
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.hosts[0].host, "retired");
     }
 
     #[test]
@@ -3509,10 +4161,12 @@ mod tests {
         e.explicit_host = Some("buildbox".into());
         let report = harness.actions(e).list().expect("list");
 
-        assert_eq!(report.master_running, None);
-        assert_eq!(report.pending.len(), 1, "only this host's requests");
-        assert_eq!(report.pending[0].remote_port, 5173);
-        assert_eq!(report.forwards[0].live, Liveness::Unknown);
+        assert_eq!(report.hosts.len(), 1, "--host narrowed it");
+        let section = &report.hosts[0];
+        assert_eq!(section.master_running, None);
+        assert_eq!(section.pending.len(), 1, "only this host's requests");
+        assert_eq!(section.pending[0].remote_port, 5173);
+        assert_eq!(section.forwards[0].live, Liveness::Unknown);
     }
 
     // -- scan ----------------------------------------------------------------
@@ -4364,7 +5018,7 @@ mod tests {
         assert_eq!(report.hosts.len(), 2);
         assert_eq!(report.hosts[0].master_running, Some(true));
         assert_eq!(report.hosts[1].master_running, Some(false));
-        assert_eq!(report.hosts[0].forwards.len(), 1);
+        assert_eq!(report.hosts[0].forwards.as_deref().map(<[_]>::len), Some(1));
         assert_eq!(report.warnings.len(), 1);
         assert!(report.selection_error.is_none());
     }
@@ -4393,7 +5047,7 @@ mod tests {
         let mut e = env(vec![host("buildbox", None)]);
         e.placement = Some(Placement::Remote);
         let report = harness.actions(e).status().expect("status");
-        assert_eq!(report.pending_requests, 1);
+        assert_eq!(report.pending_requests, Some(1));
         assert_eq!(report.hosts[0].master_running, None);
     }
 

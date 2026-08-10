@@ -135,6 +135,26 @@ esac
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake");
     }
 
+    /// An `ssh` that lets `-O cancel` succeed and still refuses everything
+    /// else, so a stop can be measured by the records it actually removed
+    /// rather than by the one call it made before the default fake failed it.
+    ///
+    /// Still a shell script on the sandbox `PATH`: nothing here is any closer
+    /// to a real host than the fake it replaces, and every other subcommand —
+    /// anything that would dial — fails exactly as loudly as before.
+    fn with_cancels_that_work(self) -> Self {
+        self.script(
+            "ssh",
+            "printf '%s\\n' \"$*\" >> \"$FAKE_SSH_LOG\"\n\
+             case \"$*\" in\n\
+             \x20 *\"-O cancel\"*) exit 0 ;;\n\
+             esac\n\
+             echo \"fake ssh: a test must never reach a host ($*)\" >&2\n\
+             exit 255\n",
+        );
+        self
+    }
+
     fn with_host(self) -> Self {
         fs::write(
             self.path("config/herdr-portfwd/hosts.toml"),
@@ -471,6 +491,279 @@ fn the_plugin_and_pane_ids_the_binary_names_are_the_ones_the_manifest_declares()
             .map(|id| (*id).to_string())
             .collect::<BTreeSet<String>>(),
     );
+}
+
+/// One `[[actions]]` entry, whole.
+fn manifest_action(id: &str) -> toml::Table {
+    manifest()
+        .get("actions")
+        .and_then(|value| value.as_array())
+        .expect("the manifest has [[actions]]")
+        .iter()
+        .find(|entry| entry.get("id").and_then(|value| value.as_str()) == Some(id))
+        .and_then(|entry| entry.as_table())
+        .unwrap_or_else(|| panic!("the manifest declares no action {id:?}"))
+        .clone()
+}
+
+fn titled(entry: &toml::Table) -> String {
+    entry
+        .get("title")
+        .and_then(|value| value.as_str())
+        .expect("every manifest action carries a title")
+        .to_string()
+}
+
+fn described(entry: &toml::Table) -> String {
+    entry
+        .get("description")
+        .and_then(|value| value.as_str())
+        .expect("every manifest entry carries a description")
+        .to_string()
+}
+
+#[test]
+fn the_manifest_no_longer_promises_a_one_host_listing() {
+    // The description is what a user reads in `herdr plugin action list`, and
+    // it was the one place that said out loud what the code did — "every live
+    // forward" over a listing narrowed to one host, and "every forward
+    // belonging to the invoking host" over a `stop-all` that now covers them
+    // all. A description and an implementation that disagree is how the bug
+    // stayed invisible for a release.
+    for entry in [manifest_action("list"), manifest_pane("list")] {
+        let text = described(&entry);
+        assert!(
+            text.contains("every host") || text.contains("Every host"),
+            "the manager pane covers every host; its description has to say so: {text:?}"
+        );
+    }
+    let stop_all = described(&manifest_action("stop-all"));
+    assert!(
+        stop_all.contains("every host"),
+        "`stop-all` covers every host now: {stop_all:?}"
+    );
+    assert!(
+        !stop_all.contains("invoking host"),
+        "the invoking host stopped being the scope: {stop_all:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// one command, one blast radius, however the user reads about it
+// ---------------------------------------------------------------------------
+
+/// The blank-line-separated blocks of `document` that mention `needle`, joined.
+///
+/// A block rather than a line: a sentence that gets rewrapped moves across
+/// lines, and a check that reads one line would quietly stop reading the claim
+/// without ever failing.
+fn paragraphs_mentioning(document: &str, needle: &str) -> String {
+    let blocks: Vec<&str> = document
+        .split("\n\n")
+        .filter(|block| block.contains(needle))
+        .collect();
+    assert!(
+        !blocks.is_empty(),
+        "no paragraph mentions {needle:?} any more; if that is deliberate, this \
+         check needs a new place to read the claim"
+    );
+    blocks.join("\n\n")
+}
+
+/// One statement about what a command reaches, and every surface a user can
+/// read it from.
+///
+/// Descriptions drift because each surface is edited on its own: `stop-all`
+/// shipped a release describing "every forward belonging to the invoking host"
+/// after it had started stopping every host's, and nothing failed, because
+/// nothing read the words. So they are checked together, against wording each
+/// surface has to carry and wording none of them may carry any more — and the
+/// test that owns each claim measures the behaviour first, so agreeing with
+/// each other is not enough: they have to agree with the code.
+struct Claim {
+    what: &'static str,
+    /// Where a user reads it, the text they read, and the wording it must
+    /// carry. Per surface, because a README paragraph and a clap doc comment
+    /// are the same claim in different sentences — and the Japanese README in
+    /// a different language.
+    surfaces: Vec<(&'static str, String, &'static str)>,
+    /// Wording for a blast radius the command no longer has. Any surface still
+    /// carrying it is the drift, whichever surface that is.
+    retired: &'static [&'static str],
+}
+
+impl Claim {
+    fn holds(&self) {
+        for (surface, text, says) in &self.surfaces {
+            assert!(
+                text.contains(says),
+                "{}: {surface} no longer says {says:?}, so a user reading it is \
+                 told something else than a user reading the others:\n{text}",
+                self.what
+            );
+            for gone in self.retired {
+                assert!(
+                    !text.contains(gone),
+                    "{}: {surface} still describes the old scope ({gone:?}):\n{text}",
+                    self.what
+                );
+            }
+        }
+    }
+}
+
+/// Wording that described a scope no command has any more. `--host` still names
+/// the invoking *pane*, which is a fallback for the commands that make a
+/// forward and not a scope for the ones that read or stop.
+const RETIRED_SCOPES: &[&str] = &[
+    "for the selected host",
+    "belonging to the invoking host",
+    "invoking host",
+    "for this host",
+    "Defaults to the host behind the invoking pane",
+];
+
+/// `-O cancel` lines the fake ssh was asked for, one per forward a stop reached
+/// for. The fake refuses every call, so this is what the command *aimed* at,
+/// which is exactly the blast radius being described.
+fn cancels(sandbox: &Sandbox) -> Vec<String> {
+    sandbox
+        .log("ssh.log")
+        .lines()
+        .filter(|line| line.contains("-O cancel"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn stop_all_reaches_every_host_and_every_surface_that_describes_it_says_so() {
+    // The destructive one. Its own `--help` described "every forward for the
+    // selected host" for a release after it had started stopping every host's,
+    // and no test read a help string, so nothing caught it.
+    let sandbox = two_hosts_one_forward_each().with_cancels_that_work();
+    sandbox
+        .run_with(&["stop-all"], &[("HERDR_PORTFWD_MODE", "local")])
+        .succeeded();
+    let reached = cancels(&sandbox);
+    assert!(
+        reached.iter().any(|line| line.contains("mini"))
+            && reached.iter().any(|line| line.contains("studio")),
+        "stop-all is not what the surfaces below say it is:\n{reached:?}"
+    );
+    let left = sandbox.state_file("forwards.json");
+    assert!(
+        !left.contains("8788") && !left.contains("5178"),
+        "a forward survived a stop-all that claims every host:\n{left}"
+    );
+
+    Claim {
+        what: "stop-all stops every forward on every host",
+        surfaces: vec![
+            (
+                "`herdr-portfwd stop-all --help`",
+                sandbox.run(&["stop-all", "--help"]).succeeded().stdout(),
+                "every forward on every host",
+            ),
+            (
+                "`herdr-portfwd --help`",
+                sandbox.run(&["--help"]).succeeded().stdout(),
+                "every forward on every host",
+            ),
+            (
+                "the manifest's stop-all action, which Herdr shows in its action list",
+                described(&manifest_action("stop-all")),
+                "every forward on every host",
+            ),
+            (
+                "the manifest's stop-all title",
+                titled(&manifest_action("stop-all")),
+                "stop all forwards",
+            ),
+            (
+                "README.md",
+                paragraphs_mentioning(include_str!("../README.md"), "stop-all"),
+                "every forward on every host",
+            ),
+            (
+                "README.ja.md",
+                paragraphs_mentioning(include_str!("../README.ja.md"), "stop-all"),
+                "すべてのホスト",
+            ),
+        ],
+        retired: RETIRED_SCOPES,
+    }
+    .holds();
+}
+
+#[test]
+fn the_host_flag_narrows_what_already_covers_every_host_and_says_that_everywhere() {
+    // The flag is the other half of the same sentence: it stopped being "which
+    // host this command acts on" and became "act on this one only". A user who
+    // reads it the old way passes it expecting no change and gets a narrowing,
+    // or omits it expecting one host and gets all of them.
+    let sandbox = two_hosts_one_forward_each().with_cancels_that_work();
+    sandbox
+        .run_with(
+            &["stop-all", "--host", "mac-mini-honkoma"],
+            &[("HERDR_PORTFWD_MODE", "local")],
+        )
+        .succeeded();
+    let reached = cancels(&sandbox);
+    assert_eq!(
+        reached.len(),
+        1,
+        "--host did not narrow the stop it was given:\n{reached:?}"
+    );
+    assert!(
+        reached[0].contains("mini"),
+        "--host narrowed to a host it does not name:\n{reached:?}"
+    );
+    let left = sandbox.state_file("forwards.json");
+    assert!(
+        left.contains("5178") && !left.contains("8788"),
+        "the flag is not the narrowing its own help describes:\n{left}"
+    );
+
+    // The flag is global, so it is documented once and read from every
+    // subcommand's help. All of them have to be the same sentence.
+    let mut surfaces: Vec<(&'static str, String, &'static str)> = Vec::new();
+    for (surface, argv) in [
+        ("`herdr-portfwd --help`", vec!["--help"]),
+        (
+            "`herdr-portfwd stop-all --help`",
+            vec!["stop-all", "--help"],
+        ),
+        ("`herdr-portfwd list --help`", vec!["list", "--help"]),
+        ("`herdr-portfwd add --help`", vec!["add", "--help"]),
+    ] {
+        surfaces.push((
+            surface,
+            sandbox.run(&argv).succeeded().stdout(),
+            "cover every host without it",
+        ));
+    }
+    surfaces.push((
+        "README.md",
+        paragraphs_mentioning(include_str!("../README.md"), "stop-all"),
+        "cover every host",
+    ));
+    surfaces.push((
+        "README.ja.md",
+        paragraphs_mentioning(include_str!("../README.ja.md"), "stop-all"),
+        "すべてのホスト",
+    ));
+    surfaces.push((
+        "the manifest's stop-all action",
+        described(&manifest_action("stop-all")),
+        "--host",
+    ));
+
+    Claim {
+        what: "--host narrows a command that otherwise covers every host",
+        surfaces,
+        retired: RETIRED_SCOPES,
+    }
+    .holds();
 }
 
 /// The `placement` a `[[panes]]` entry declares.
@@ -1463,6 +1756,817 @@ fn scan_attributes_a_listener_to_the_pane_that_owns_it() {
     );
 }
 
+/// Two configured hosts, one forward on each, written straight into the record
+/// file — the state the reported bug was met in.
+fn two_hosts_one_forward_each() -> Sandbox {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.path("config/herdr-portfwd/hosts.toml"),
+        "default_host = \"mac-mini-honkoma\"\n\n\
+         [hosts.mac-mini-honkoma]\ntarget = \"mini\"\n\n\
+         [hosts.mac-studio-honkoma]\ntarget = \"studio\"\n",
+    )
+    .expect("write hosts.toml");
+    fs::write(
+        sandbox.state_path("forwards.json"),
+        r#"{"version":1,"forwards":[
+            {"host":"mac-mini-honkoma","remote_port":8788,"local_port":8788,
+             "remote_bind":"127.0.0.1","origin":"explicit","pane_id":"wE:p2",
+             "created_unix_ms":1},
+            {"host":"mac-studio-honkoma","remote_port":5178,"local_port":5178,
+             "remote_bind":"127.0.0.1","origin":"explicit","pane_id":null,
+             "created_unix_ms":1}
+        ]}"#,
+    )
+    .expect("seed two hosts' forwards");
+    sandbox
+}
+
+#[test]
+fn list_shows_a_forward_on_every_host_rather_than_the_resolved_one() {
+    // The report this fix came from: two hosts live, `list` printed one, and
+    // the header read as though that was all there was.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with(&["list"], &[("HERDR_PORTFWD_MODE", "local")]);
+    run.succeeded();
+    let text = run.stdout();
+    assert!(text.contains("8788"), "{text}");
+    assert!(
+        text.contains("5178"),
+        "the forward on the other host is invisible again:\n{text}"
+    );
+    assert!(text.contains("mac-studio-honkoma"), "{text}");
+    assert!(
+        text.starts_with("2 forward(s) on 2 host(s)"),
+        "the first line has to say how much of the world this is:\n{text}"
+    );
+}
+
+#[test]
+fn stop_reaches_a_port_on_a_host_this_invocation_did_not_resolve_to() {
+    // `stop 5178` used to answer "nothing to stop on mac-mini-honkoma" and
+    // leave the port up. The fake ssh fails every call, so what is asserted is
+    // *which host was dialled*: reaching the right master is the fix, and the
+    // failure after it is the sandbox refusing to touch a network.
+    let sandbox = two_hosts_one_forward_each();
+    sandbox.run_with(&["stop", "5178"], &[("HERDR_PORTFWD_MODE", "local")]);
+    let ssh = sandbox.log("ssh.log");
+    assert!(
+        ssh.contains("studio"),
+        "the stop never reached the host holding the port:\n{ssh}"
+    );
+    assert!(
+        ssh.contains("cancel") && ssh.contains("5178"),
+        "the cancel has to name the forward the user asked about:\n{ssh}"
+    );
+}
+
+#[test]
+fn the_manager_pane_draws_every_host_and_enter_stops_the_row_s_own_host() {
+    // The pane end of the same bug, driven through the real binary: the frame
+    // has to carry both machines, and `enter` on the second row has to reach
+    // the master of the host *that row* names rather than the one this
+    // invocation resolved to.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &[
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "local"),
+        ],
+        "j\r",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    assert!(screen.contains("mac-mini-honkoma"), "{screen}");
+    assert!(
+        screen.contains("mac-studio-honkoma"),
+        "the pane drew one host of two:\n{screen}"
+    );
+    assert!(screen.contains("all hosts"), "{screen}");
+    let ssh = sandbox.log("ssh.log");
+    assert!(
+        ssh.contains("studio") && ssh.contains("5178"),
+        "enter stopped something other than the highlighted row's forward:\n{ssh}"
+    );
+    assert!(
+        !ssh.contains("8788"),
+        "the other host's forward was never selected:\n{ssh}"
+    );
+}
+
+#[test]
+fn shift_x_in_the_pane_stops_what_the_host_filter_is_showing() {
+    // Two `h` presses narrow to the *second* host, so a key that still meant
+    // "everything recorded" would go for the first host's forward instead —
+    // the fake ssh fails every call, so what is asserted is which forward the
+    // key reached for first.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &[
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "local"),
+        ],
+        "hhX",
+    );
+    run.succeeded();
+    let cancels: Vec<String> = sandbox
+        .log("ssh.log")
+        .lines()
+        .filter(|line| line.contains("-O cancel"))
+        .map(|line| line.to_string())
+        .collect();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "X reached past the filter:\n{cancels:?}\n{}",
+        run.stdout()
+    );
+    assert!(
+        cancels[0].contains("5178") && cancels[0].contains("studio"),
+        "X stopped something the filter was hiding:\n{cancels:?}\n{}",
+        run.stdout()
+    );
+}
+
+/// One entry per repaint. A pane clears the screen before painting, so the
+/// clear is where one frame ends and the next begins.
+fn frames(stdout: &str) -> Vec<String> {
+    stdout
+        .split("\x1b[2J")
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The manager's header names a scope; the table under it has to be that scope.
+///
+/// Both fixture hosts have exactly one forward, so "all hosts" over a frame
+/// naming one of them, or "host X only" over a frame naming two, is the header
+/// describing something other than its own rows — whichever direction the
+/// disagreement comes back from.
+fn header_scope_matches_rows(frame: &str) {
+    const HOSTS: [&str; 2] = ["mac-mini-honkoma", "mac-studio-honkoma"];
+    let drawn: Vec<&str> = HOSTS
+        .into_iter()
+        .filter(|host| frame.contains(host))
+        .collect();
+    if frame.contains("all hosts") {
+        assert_eq!(
+            drawn, HOSTS,
+            "the header says every host; the frame holds {drawn:?}:\n{frame}"
+        );
+    }
+    if let Some(only) = HOSTS
+        .into_iter()
+        .find(|host| frame.contains(&format!("host {host} only")))
+    {
+        assert_eq!(
+            drawn,
+            [only],
+            "the header narrows to {only}; the frame holds {drawn:?}:\n{frame}"
+        );
+    }
+}
+
+/// A pane's own environment, narrowed to one host the way `HERDR_PORTFWD_HOST`
+/// or `--host` narrows it.
+fn narrowed_manager_env(host: &str) -> Vec<(&str, &str)> {
+    vec![
+        ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+        ("HERDR_PLUGIN_ID", "portfwd"),
+        ("HERDR_PORTFWD_MODE", "local"),
+        ("HERDR_PORTFWD_HOST", host),
+    ]
+}
+
+#[test]
+fn a_manager_pane_narrowed_to_one_host_never_calls_that_frame_every_host() {
+    // The report: `HERDR_PORTFWD_HOST=mini herdr-portfwd pane-ui list` drew one
+    // machine's row under `(1 live, all hosts)`, because the pane's rows came
+    // from a listing `--host` had narrowed while its own filter — the thing the
+    // header describes — was still "all hosts". The pane holds every row now
+    // and `--host` presets the filter instead, so the two cannot disagree.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &narrowed_manager_env("mac-mini-honkoma"),
+        "",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    let frames = frames(&screen);
+    assert_eq!(frames.len(), 1, "one frame, then EOF:\n{screen}");
+    for frame in &frames {
+        header_scope_matches_rows(frame);
+    }
+    // "of 2 recorded", not "of 2 live": whether either port is actually open
+    // depends on the machine running this test, and the header's scope does
+    // not. What is asserted here is the scope; the count is
+    // `the_manager_pane_counts_what_is_live_rather_than_what_is_recorded`.
+    assert!(
+        frames[0].contains("of 2 recorded") && frames[0].contains("host mac-mini-honkoma only"),
+        "the header has to say it is showing one forward of two:\n{screen}"
+    );
+    assert!(frames[0].contains("8788"), "{screen}");
+    assert!(
+        !frames[0].contains("5178"),
+        "the filter is not filtering:\n{screen}"
+    );
+}
+
+/// A loopback port with a listener on it for as long as the handle lives, and
+/// the same trick with the listener dropped for a port nothing holds.
+///
+/// This is not the network: nothing connects, nothing is sent, and both are
+/// `127.0.0.1`. It is the only way to ask the binary's own liveness probe a
+/// question with a known answer, because that probe is a `bind` — the one check
+/// that cannot be faked from outside the process — and the ports a fixture
+/// picks out of the air are whatever the machine running the test happens to
+/// have. `SystemPorts`' own unit tests use the same two moves.
+fn held_loopback_port() -> (std::net::TcpListener, u16) {
+    let held = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
+    let port = held.local_addr().expect("the bound address").port();
+    (held, port)
+}
+
+/// A port the kernel considered free and was then given back. A listener that
+/// accepted nothing leaves no `TIME_WAIT` behind.
+fn released_loopback_port() -> u16 {
+    held_loopback_port().1
+}
+
+#[test]
+fn the_manager_pane_counts_what_is_live_rather_than_what_is_recorded() {
+    // The report, through the real binary: `list` said one forward was `live`
+    // and the other `missing`, and the pane above it counted both as live, drew
+    // them identically, and offered the stop key on the dead one. A master dies
+    // under a user whenever a laptop sleeps or a link drops, so this is the
+    // ordinary state of a record — and it is why the CLI computes liveness at
+    // all.
+    let (_held, live_port) = held_loopback_port();
+    let dead_port = released_loopback_port();
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.path("config/herdr-portfwd/hosts.toml"),
+        "default_host = \"mac-mini-honkoma\"\n\n[hosts.mac-mini-honkoma]\ntarget = \"mini\"\n",
+    )
+    .expect("write hosts.toml");
+    fs::write(
+        sandbox.state_path("forwards.json"),
+        format!(
+            r#"{{"version":1,"forwards":[
+                {{"host":"mac-mini-honkoma","remote_port":{live_port},"local_port":{live_port},
+                 "remote_bind":"127.0.0.1","origin":"explicit","pane_id":null,
+                 "created_unix_ms":1}},
+                {{"host":"mac-mini-honkoma","remote_port":{dead_port},"local_port":{dead_port},
+                 "remote_bind":"127.0.0.1","origin":"explicit","pane_id":null,
+                 "created_unix_ms":1}}
+            ]}}"#
+        ),
+    )
+    .expect("seed one live forward and one whose master is gone");
+
+    // What the CLI says about the same two records, so the pane is measured
+    // against the answer the tool already has rather than against a guess.
+    let listed = sandbox.run_with(&["list"], &[("HERDR_PORTFWD_MODE", "local")]);
+    listed.succeeded();
+    let text = listed.stdout();
+    assert!(
+        text.contains(&format!("{live_port}  live"))
+            || text.contains(&format!("{live_port}   live")),
+        "the fixture is not what this test is about:\n{text}"
+    );
+    assert!(text.contains("missing"), "{text}");
+
+    let run = sandbox.run_with_stdin(&["pane-ui", "list"], &manager_env(), "");
+    run.succeeded();
+    let screen = run.stdout();
+    assert!(
+        !screen.contains("2 live"),
+        "the pane counted a record whose port is gone as a live forward:\n{screen}"
+    );
+    assert!(
+        screen.contains("(1 live, 1 not live, all hosts)"),
+        "the header has to count what was checked and found:\n{screen}"
+    );
+    let dead_row = screen
+        .lines()
+        .find(|line| line.contains(&dead_port.to_string()))
+        .unwrap_or_else(|| panic!("no row for {dead_port}:\n{screen}"));
+    assert!(
+        dead_row.contains("not live"),
+        "the stale row is drawn exactly like the open one: {dead_row:?}"
+    );
+    let live_row = screen
+        .lines()
+        .find(|line| line.contains(&live_port.to_string()))
+        .unwrap_or_else(|| panic!("no row for {live_port}:\n{screen}"));
+    assert!(
+        !live_row.contains("not live"),
+        "the live row was marked too, which marks nothing: {live_row:?}"
+    );
+}
+
+#[test]
+fn a_pane_that_cannot_check_a_port_does_not_call_it_live() {
+    // Under `herdr --remote` the pane runs on the far side, where binding a
+    // local port answers a question about the wrong machine, so every row is
+    // `unknown`. A header built on a live/dead pair has to pick one of them
+    // here, and both are inventions — this is the third value the wording had
+    // to survive.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &[
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "remote"),
+        ],
+        "",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    assert!(
+        screen.contains("(2 not checked, all hosts)"),
+        "a pane that checked nothing has to say so:\n{screen}"
+    );
+    assert!(
+        !screen.contains("2 live"),
+        "nothing on this machine established that:\n{screen}"
+    );
+    for port in ["8788", "5178"] {
+        let row = screen
+            .lines()
+            .find(|line| line.contains(port))
+            .unwrap_or_else(|| panic!("no row for {port}:\n{screen}"));
+        assert!(
+            row.contains("not checked"),
+            "{port} is drawn as though its state were known: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn h_reveals_the_host_that_host_was_hiding() {
+    // The other half: a narrowed *listing* left `h` with nothing behind it, so
+    // the one key that was supposed to reach the second machine could not. The
+    // rows are every host's, so the filter has somewhere to move.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &narrowed_manager_env("mac-mini-honkoma"),
+        "h",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    let frames = frames(&screen);
+    for frame in &frames {
+        header_scope_matches_rows(frame);
+    }
+    let last = frames.last().expect("the pane drew at least one frame");
+    assert!(
+        last.contains("mac-studio-honkoma") && last.contains("5178"),
+        "h left the host the invocation named:\n{screen}"
+    );
+}
+
+#[test]
+fn a_manager_pane_that_could_not_list_never_reports_an_empty_world() {
+    // The report, both halves in one sandbox: `list` finds two forwards on two
+    // machines, and the pane — narrowed to a host name that resolves to
+    // nothing — drew `(0 live, all hosts)` over "No forwards are live on any
+    // host." A failed listing is not a world; the pane had reached nobody and
+    // was answering for everybody.
+    let sandbox = two_hosts_one_forward_each();
+    let live = sandbox.run_with(&["list"], &[("HERDR_PORTFWD_MODE", "local")]);
+    live.succeeded();
+    assert!(
+        live.stdout().starts_with("2 forward(s) on 2 host(s)"),
+        "the fixture is not what this test is about:\n{}",
+        live.stdout()
+    );
+    // The CLI's own answer to the same unresolvable name: a refusal, never a
+    // count. The pane is the surface that has to reach the same conclusion.
+    sandbox
+        .run_with(&["list"], &narrowed_manager_env("stale-name"))
+        .failed()
+        .stderr_mentions("unknown host");
+
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &narrowed_manager_env("stale-name"),
+        "",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    for claim in [
+        "No forwards are recorded on any host.",
+        "all hosts",
+        "0 live",
+        "8788",
+        "5178",
+    ] {
+        assert!(
+            !screen.contains(claim),
+            "a pane that reached no host claimed {claim:?}:\n{screen}"
+        );
+    }
+    assert!(screen.contains("Could not list the forwards."), "{screen}");
+    assert!(
+        screen.contains("unknown host") && screen.contains("stale-name"),
+        "the one thing this screen knows is why it knows nothing:\n{screen}"
+    );
+}
+
+#[test]
+fn h_on_a_manager_pane_that_could_not_list_keeps_the_reason() {
+    // `h` overwrote the status with "there is nothing to filter" whenever the
+    // snapshot held no rows, so the opening frame's `unknown host "stale-name"`
+    // survived exactly one keystroke. A key that could not change anything must
+    // not change the explanation.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &narrowed_manager_env("stale-name"),
+        "h",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    let frames = frames(&screen);
+    let last = frames.last().expect("the pane drew at least one frame");
+    assert!(
+        last.contains("unknown host") && last.contains("stale-name"),
+        "one keystroke turned a qualified wrong screen into an unqualified one:\n{screen}"
+    );
+    assert!(
+        !last.contains("there is nothing to filter"),
+        "the pane has no listing to report a lack of filtering in:\n{screen}"
+    );
+    assert!(
+        !last.contains("all hosts"),
+        "the header is still speaking for every host:\n{screen}"
+    );
+    // stderr is the plugin log, and it gets the pane's last status. The reason
+    // has to reach it too, rather than a message about filtering.
+    run.stderr_mentions("unknown host");
+}
+
+#[test]
+fn a_picker_pane_that_could_not_scan_never_reports_a_host_with_no_listeners() {
+    // The sibling shape: `main` fell back to an empty listener table the same
+    // way, and `enter` there wrote "nothing to forward" over the reason.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "picker"],
+        &[
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "picker"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "local"),
+            ("HERDR_PORTFWD_HOST", "stale-name"),
+        ],
+        "\r",
+    );
+    run.succeeded();
+    let screen = run.stdout();
+    let last = frames(&screen)
+        .last()
+        .cloned()
+        .expect("the pane drew at least one frame");
+    assert!(
+        !last.contains("belongs to a Herdr pane"),
+        "a scan that never ran established no such thing:\n{screen}"
+    );
+    assert!(
+        !last.contains("nothing to forward"),
+        "enter answered for ports it never looked at:\n{screen}"
+    );
+    assert!(
+        last.contains("Could not list the listening ports"),
+        "{screen}"
+    );
+    assert!(last.contains("unknown host"), "{screen}");
+}
+
+// ---------------------------------------------------------------------------
+// a state file that could not be read is not a world with nothing in it
+// ---------------------------------------------------------------------------
+
+/// A pane's own environment, with nothing narrowing it.
+fn manager_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+        ("HERDR_PLUGIN_ID", "portfwd"),
+        ("HERDR_PORTFWD_MODE", "local"),
+    ]
+}
+
+/// A record file that yields nothing, with the forwards it describes still live
+/// behind it.
+#[derive(Clone, Copy)]
+enum Damage {
+    /// The bytes are perfectly good and this process may not have them.
+    Unreadable,
+    /// Bytes that are not this document.
+    Bytes(&'static str),
+}
+
+impl Damage {
+    /// Inflict it on a fixture's record file.
+    ///
+    /// `None` when this machine cannot be damaged that way: a test run as root
+    /// reads a `chmod 000` file regardless, and there is then nothing to refuse
+    /// and nothing to test.
+    fn inflicted_on(self, sandbox: Sandbox) -> Option<Sandbox> {
+        let path = sandbox.state_path("forwards.json");
+        match self {
+            Damage::Unreadable => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+                    .expect("chmod the state file");
+                fs::read(&path).is_err().then_some(sandbox)
+            }
+            Damage::Bytes(bytes) => {
+                fs::write(&path, bytes).expect("damage the state file");
+                Some(sandbox)
+            }
+        }
+    }
+}
+
+/// Every shape of damage the report named. All three end in the same place: a
+/// read that learned nothing, over records that are still there.
+const DAMAGED_RECORD_FILES: [(&str, Damage); 3] = [
+    ("a file this process may not read", Damage::Unreadable),
+    (
+        "a file truncated mid-write",
+        Damage::Bytes(r#"{"version":1,"forwards":[{"host":"mac-mini"#),
+    ),
+    (
+        "a record from a writer this binary is older than",
+        Damage::Bytes(
+            r#"{"version":2,"forwards":[
+                {"host":"mac-mini-honkoma","remote_port":8788,"local_port":8788,
+                 "remote_bind":"127.0.0.1","origin":"pinned","pane_id":null,
+                 "created_unix_ms":1}
+            ]}"#,
+        ),
+    ),
+];
+
+#[test]
+fn a_state_file_that_could_not_be_read_is_refused_rather_than_printed_as_no_forwards() {
+    // `list` used to succeed here and print an empty world, because `state`
+    // degraded an unreadable document to a default one and returned `Ok`. The
+    // CLI's job in this file is to refuse and say why — the same thing it does
+    // for a host name that resolves to nothing.
+    for (what, damage) in DAMAGED_RECORD_FILES {
+        let Some(sandbox) = damage.inflicted_on(two_hosts_one_forward_each()) else {
+            continue;
+        };
+        let run = sandbox.run_with(&["--json", "list"], &[("HERDR_PORTFWD_MODE", "local")]);
+        run.failed()
+            .stderr_mentions("forwards.json")
+            .stderr_mentions("herdr-portfwd");
+        assert!(
+            !run.stdout().contains("\"hosts\""),
+            "{what}: a listing that never happened was printed as a world:\n{}",
+            run.stdout()
+        );
+    }
+}
+
+#[test]
+fn a_manager_pane_that_could_not_read_the_records_never_reports_an_empty_world() {
+    // The report, end to end and through the real binary: two forwards live on
+    // two hosts, the state file `chmod 000`, and every frame read
+    // `(0 live, all hosts)` over "No forwards are live on any host." — a
+    // positive claim about every machine, made by a process that read nothing.
+    let Some(sandbox) = Damage::Unreadable.inflicted_on(two_hosts_one_forward_each()) else {
+        return;
+    };
+    let run = sandbox.run_with_stdin(&["pane-ui", "list"], &manager_env(), "");
+    run.succeeded();
+    let screen = run.stdout();
+    for claim in [
+        "No forwards are recorded on any host.",
+        "all hosts",
+        "0 live",
+        "8788",
+        "5178",
+    ] {
+        assert!(
+            !screen.contains(claim),
+            "a pane that read nothing claimed {claim:?}:\n{screen}"
+        );
+    }
+    assert!(screen.contains("Could not list the forwards."), "{screen}");
+    assert!(
+        screen.contains("forwards.json") && screen.contains("could not be read"),
+        "the one thing this screen knows is why it knows nothing, and it has to \
+         fit the width a pane clamps a status line to:\n{screen}"
+    );
+}
+
+#[test]
+fn no_key_on_a_pane_that_could_not_read_the_records_replaces_the_reason() {
+    // Every key made it worse: `h` wrote "there is nothing to filter", `enter`
+    // and `X` wrote "nothing to stop", and `r` tried again and denied it again
+    // — so no keystroke let the user discover the forwards still existed. A key
+    // that could not change anything must not change the explanation.
+    let Some(sandbox) = Damage::Unreadable.inflicted_on(two_hosts_one_forward_each()) else {
+        return;
+    };
+    let run = sandbox.run_with_stdin(&["pane-ui", "list"], &manager_env(), "h\rXr");
+    run.succeeded();
+    let screen = run.stdout();
+    let last = frames(&screen)
+        .last()
+        .cloned()
+        .expect("the pane drew at least one frame");
+    assert!(
+        last.contains("forwards.json"),
+        "four keystrokes turned a qualified wrong screen into an unqualified one:\n{screen}"
+    );
+    for replacement in [
+        "there is nothing to filter",
+        "nothing to stop",
+        "all hosts",
+        "0 live",
+    ] {
+        assert!(
+            !last.contains(replacement),
+            "a key with nothing behind it wrote {replacement:?} over the reason:\n{screen}"
+        );
+    }
+    // stderr is the plugin log, and it gets the pane's last status. Under Herdr
+    // that is the only place this ever reaches a person.
+    run.stderr_mentions("forwards.json");
+    // Nothing here may repair the file by writing over it: the records are
+    // intact and only unreadable, so quarantining them would lose two forwards.
+    assert!(
+        !sandbox.state_path("forwards.json.corrupt").exists(),
+        "a pass that never read the records set them aside anyway"
+    );
+}
+
+#[test]
+fn a_state_file_that_could_not_be_read_does_not_stop_the_binary() {
+    // It refuses, and it refuses the way a plugin command has to: a message on
+    // stderr for `herdr plugin log list` and an exit code, never a panic. The
+    // harness asserts the absence of a panic for every run in this file.
+    for (what, damage) in DAMAGED_RECORD_FILES {
+        let Some(sandbox) = damage.inflicted_on(two_hosts_one_forward_each()) else {
+            continue;
+        };
+        for args in [
+            vec!["status"],
+            vec!["reconcile", "--startup"],
+            vec!["stop-all"],
+            vec!["add", "5173"],
+        ] {
+            let run = sandbox.run_with(&args, &[("HERDR_PORTFWD_MODE", "local")]);
+            assert_ne!(
+                run.code(),
+                2,
+                "{what}: `{}` stopped parsing:\n{}",
+                args.join(" "),
+                run.stderr()
+            );
+            // Every one of these has to speak for the hosts, and none of them
+            // can: `status` most of all, since it is what a user runs once
+            // something is already wrong.
+            run.failed().stderr_mentions("forwards.json");
+            // Bytes that were never read are bytes nothing may conclude
+            // anything about, so nothing may move them either: a quarantine
+            // here is a permission problem turned into two lost forwards.
+            if matches!(damage, Damage::Unreadable) {
+                assert_eq!(
+                    sandbox.state_file("forwards.json.corrupt"),
+                    "",
+                    "{what}: `{}` set aside records it never read",
+                    args.join(" ")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn shift_x_under_a_host_flag_stops_the_flag_s_host_and_nothing_behind_it() {
+    // `X` means "everything shown", and with the flag preset as the filter the
+    // pane is holding a row it is not showing. Stopping that one would be the
+    // same disagreement acting instead of merely reading wrong.
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list", "--host", "mac-mini-honkoma"],
+        &[
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "local"),
+        ],
+        "X",
+    );
+    run.succeeded();
+    let cancels: Vec<String> = sandbox
+        .log("ssh.log")
+        .lines()
+        .filter(|line| line.contains("-O cancel"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        cancels.len(),
+        1,
+        "X reached past the filter --host preset:\n{cancels:?}\n{}",
+        run.stdout()
+    );
+    assert!(
+        cancels[0].contains("8788") && cancels[0].contains("mini"),
+        "X stopped a host the frame was not showing:\n{cancels:?}\n{}",
+        run.stdout()
+    );
+}
+
+#[test]
+fn a_pane_row_stops_its_own_forward_even_when_two_hosts_share_the_port() {
+    // The row is unambiguous — it names a host — so the pane must not go
+    // through the guess a bare `stop <port>` cannot make. Two dev servers
+    // landing on the same port number on two machines is ordinary.
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.path("config/herdr-portfwd/hosts.toml"),
+        "default_host = \"mac-mini-honkoma\"\n\n\
+         [hosts.mac-mini-honkoma]\ntarget = \"mini\"\n\n\
+         [hosts.mac-studio-honkoma]\ntarget = \"studio\"\n",
+    )
+    .expect("write hosts.toml");
+    fs::write(
+        sandbox.state_path("forwards.json"),
+        r#"{"version":1,"forwards":[
+            {"host":"mac-mini-honkoma","remote_port":5178,"local_port":5178,
+             "remote_bind":"127.0.0.1","origin":"explicit","pane_id":null,
+             "created_unix_ms":1},
+            {"host":"mac-studio-honkoma","remote_port":5178,"local_port":5178,
+             "remote_bind":"127.0.0.1","origin":"explicit","pane_id":null,
+             "created_unix_ms":1}
+        ]}"#,
+    )
+    .expect("seed one port on two hosts");
+
+    let run = sandbox.run_with_stdin(
+        &["pane-ui", "list"],
+        &[
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "list"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "local"),
+        ],
+        "j\r",
+    );
+    run.succeeded();
+    // Only the cancels: every host's master is *checked* on every listing, so
+    // both names appear either way.
+    let cancels: Vec<&str> = sandbox
+        .log("ssh.log")
+        .lines()
+        .filter(|line| line.contains("-O cancel"))
+        .map(|line| {
+            if line.contains("studio") {
+                "studio"
+            } else {
+                "mini"
+            }
+        })
+        .collect();
+    assert_eq!(
+        cancels,
+        ["studio"],
+        "the highlighted row named its host; the pane cancelled {cancels:?}\n{}",
+        run.stdout()
+    );
+}
+
+#[test]
+fn stop_narrowed_to_one_host_says_where_the_port_actually_is() {
+    let sandbox = two_hosts_one_forward_each();
+    let run = sandbox.run_with(
+        &["stop", "5178", "--host", "mac-mini-honkoma"],
+        &[("HERDR_PORTFWD_MODE", "local")],
+    );
+    run.succeeded();
+    let text = run.stdout();
+    assert!(
+        text.contains("nothing to stop on mac-mini-honkoma"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mac-studio-honkoma"),
+        "a stop that hides where the port is sends the user hunting:\n{text}"
+    );
+    assert_eq!(sandbox.log("ssh.log"), "", "a no-op dials nobody");
+}
+
 #[test]
 fn reconcile_with_nothing_recorded_succeeds_for_every_trigger() {
     let sandbox = Sandbox::new().with_host();
@@ -1523,6 +2627,76 @@ fn status_reports_rather_than_failing_when_the_world_is_broken() {
     );
     assert_eq!(json["hosts"], serde_json::json!([]));
     assert_eq!(json["pending_requests"], serde_json::json!(0));
+}
+
+#[test]
+fn status_reports_a_damaged_record_file_and_still_prints_everything_else() {
+    // `status` says of itself that it "reports failures instead of becoming
+    // one", and both READMEs send a user here first when something is already
+    // wrong — which is exactly when the record file may be the thing that is
+    // wrong. It had started returning `Err` for that, so the one command meant
+    // to explain a broken world printed nothing about it: not the path of the
+    // broken file, not the hosts, not the requests that were perfectly
+    // readable.
+    for (what, damage) in DAMAGED_RECORD_FILES {
+        let Some(sandbox) = damage.inflicted_on(two_hosts_one_forward_each()) else {
+            continue;
+        };
+        // A pending request in the file that is *not* damaged, so the report
+        // has something to lose by giving up at the first failure.
+        let mut env = action_env("portfwd.add");
+        env.push(("HERDR_PORTFWD_MODE", "remote"));
+        sandbox.run_with(&["add", "5173"], &env).succeeded();
+
+        let run = sandbox.run_with(&["--json", "status"], &[("HERDR_PORTFWD_MODE", "remote")]);
+        // The exit code every other failing command gives: something went
+        // wrong, and a script must be able to tell.
+        run.failed().stderr_mentions("forwards.json");
+        let json = run.json();
+        assert!(
+            json["state_error"]
+                .as_str()
+                .is_some_and(|text| text.contains("forwards.json")),
+            "{what}: the report does not say what could not be read:\n{json}"
+        );
+        // Everything it did learn, in the same document.
+        assert_eq!(
+            json["pending_requests"],
+            serde_json::json!(1),
+            "{what}: a readable queue was thrown away with the unreadable file:\n{json}"
+        );
+        assert_eq!(
+            json["hosts"].as_array().map(Vec::len),
+            Some(2),
+            "{what}: the configured hosts went with it:\n{json}"
+        );
+        // And nothing it did not: an empty list of forwards here is the answer
+        // the failed read never gave.
+        for host in json["hosts"].as_array().expect("hosts is an array") {
+            assert_eq!(
+                host["forwards"],
+                serde_json::Value::Null,
+                "{what}: a file that was never read was reported as empty:\n{json}"
+            );
+        }
+
+        // The human form carries the same, since that is what a user reads.
+        let human = sandbox.run_with(&["status"], &[("HERDR_PORTFWD_MODE", "remote")]);
+        human.failed();
+        let text = human.stdout();
+        assert!(
+            text.contains("forwards.json") && text.contains("requests.json"),
+            "{what}: status stopped naming the files it uses:\n{text}"
+        );
+        assert!(
+            text.contains("pending:      1"),
+            "{what}: the queue it could read is missing:\n{text}"
+        );
+        assert!(
+            text.contains("forwards unknown") && !text.contains("0 forward(s)"),
+            "{what}: an unread file was counted anyway:\n{text}"
+        );
+    }
 }
 
 #[test]
@@ -1622,7 +2796,12 @@ fn the_host_environment_variable_selects_a_host_like_the_flag() {
         ],
     );
     run.succeeded();
-    assert_eq!(run.json()["host"], serde_json::json!("buildbox"));
+    // The variable narrows the listing the way `--host` does; nothing else
+    // narrows it any more.
+    assert_eq!(
+        run.json()["scope"],
+        serde_json::json!({ "host": "buildbox" })
+    );
 }
 
 #[test]
@@ -1635,7 +2814,10 @@ fn a_malformed_invocation_context_is_reported_not_ignored() {
 }
 
 #[test]
-fn a_truncated_state_file_does_not_stop_the_binary() {
+fn a_truncated_state_file_is_reported_rather_than_read_as_an_empty_world() {
+    // This used to assert the opposite — exit 0, `"hosts": []`, and a warning
+    // on stderr — which is the bug written down as an expectation: a warning is
+    // not a return value, and an empty listing is an answer about every host.
     let sandbox = Sandbox::new().with_host();
     fs::write(
         sandbox.state_path("forwards.json"),
@@ -1643,12 +2825,11 @@ fn a_truncated_state_file_does_not_stop_the_binary() {
     )
     .expect("write a half-written state file");
     let run = sandbox.run_with(&["--json", "list"], &[("HERDR_PORTFWD_MODE", "remote")]);
-    run.succeeded();
-    assert_eq!(run.json()["forwards"], serde_json::json!([]));
+    run.failed().stderr_mentions("forwards.json");
     assert!(
-        run.stderr().contains("warning"),
-        "a damaged state file has to be announced: {:?}",
-        run.stderr()
+        !run.stdout().contains("\"hosts\""),
+        "a half-written file was printed as a world:\n{}",
+        run.stdout()
     );
 }
 

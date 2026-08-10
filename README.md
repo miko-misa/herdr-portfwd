@@ -281,9 +281,40 @@ nothing opens on either machine.
 selected host in a picker pane and forwards the ones you select.
 
 **Manage what is running.** The `list` action opens an overlay with every live
-forward for the selected host, its owning pane, and a key to stop it. Both act on
-one host at a time — the one the invocation resolves to, or the one `--host`
-names.
+forward on **every** host, its owning pane, and a key to stop it. `enter` stops
+the forward the highlighted row names, on that row's host, whatever host the
+invocation itself resolved to; `h` shows one host at a time and cycles back to
+all of them; `X` stops everything the pane is currently showing, which with no
+filter on is everything. The header says which it is —
+`(3 live, all hosts)` or `(3 live of 5 recorded, host buildbox only)` — because
+a count on its own cannot tell "there is one" from "you are being shown one".
+
+The count is of forwards that are actually up, not of records. A master dies
+under you often enough — a laptop that slept, a reboot, a dropped link — and the
+record outlives it, so the header separates what it checked and found
+(`1 live, 1 not live, all hosts`) and the row that is no longer live is marked
+`not live` where a remapped one says `remapped`. Where this Herdr server is not
+the machine that binds the port — under `herdr --remote`, where the local agent
+opens it — nothing here can check, and the screen says `not checked` rather than
+picking one of the other two answers. `herdr-portfwd list` prints the same three
+states in its own column.
+
+`--host` opens the pane already narrowed to that host: it presets the same
+filter `h` moves, rather than shortening the list the pane holds. The table
+still carries every host underneath, so the header can say how many it is
+hiding and `h` still reaches the machines the flag left out.
+
+A pane that could not get a listing at all — an unresolvable host name, a store
+it could not read — says so instead of drawing an empty table. *"Could not list
+the forwards."*, the reason on the status line, and `r` to try again: there is
+no count and no *"all hosts"* on that screen, because nothing on it was learned
+from any host. `list` on the command line has always refused the same case
+outright. Once the pane is in that state the reason stays put; `h`, `enter` and
+`X` cannot replace it with a report about a listing that never arrived, and only
+a refresh that works clears it.
+
+The picker is the one surface that is still per host: `scan` looks at the
+listeners on the host the invocation resolved to, or the one `--host` names.
 
 The three surfaces reach each other: `l` and `s` on the confirmation open the
 manager and the picker, and `a` on the manager opens the picker. One click gets
@@ -295,16 +326,16 @@ you to all of them.
 | --- | --- |
 | `portfwd.scan` | picker over attributed remote listeners; forwards the chosen ones |
 | `portfwd.add` | forward a port; opens the picker when no port was named |
-| `portfwd.list` | overlay of live forwards, with stop keys |
-| `portfwd.stop` | stop a selected forward |
-| `portfwd.stop-all` | stop every forward for the current host |
+| `portfwd.list` | overlay of live forwards on every host, with stop keys and a host filter |
+| `portfwd.stop` | stop a selected forward, on whichever host has it |
+| `portfwd.stop-all` | stop every forward on every host; `--host` narrows it |
 | `portfwd.open-url` | link-handler target; opens the confirmation for the clicked URL, and acts on the click directly when the confirmation is turned off or cannot be shown |
 
 ### Panes
 
 | Pane | Is |
 | --- | --- |
-| `list` | overlay of live forwards; `enter` stops one, `X` stops all, `a` opens the picker |
+| `list` | overlay of live forwards on every host; `enter` stops the highlighted one on its own host, `X` stops everything shown, `h` cycles the host filter, `a` opens the picker |
 | `picker` | popup over attributed listeners; `space` marks, `enter` forwards |
 | `confirm` | popup a Ctrl+click lands on; `enter` forwards and opens, `f` forwards only, `l`/`s` open the other two |
 
@@ -417,6 +448,14 @@ invocation resolves to **and by which rule**, whether a control master is up
 per host, the forwards recorded for each, and how many requests are still
 waiting for the local agent. `--json` if you want to grep it.
 
+That includes the files themselves. If `forwards.json` or `requests.json` cannot
+be read, `status` names it and prints everything else it knows anyway — the
+other file, the hosts, the masters — rather than stopping at the first thing
+that is broken. What it could not learn stays blank instead of being reported as
+zero: `forwards unknown` beside the host, `pending: unknown`, and `null` in
+`--json`. The command still exits non-zero, because something *is* wrong; it
+just tells you what first.
+
 **One machine, one directory.** Records live in `$XDG_STATE_HOME/herdr-portfwd`,
 or `~/.local/state/herdr-portfwd` — the same directory the control sockets are
 in — no matter who is running the command: a keybinding, a plugin pane, an event
@@ -450,6 +489,35 @@ Ctrl+click queued a forward and no browser appeared. The log of what Herdr ran
 is `herdr plugin log list --plugin portfwd`, on the machine running the server,
 which under `herdr --remote` is the remote one.
 
+### *"forwards.json could not be read"*
+
+A record file this tool cannot read is not a machine with no forwards on it, and
+nothing here will report it as one. Every command that would have to speak for
+your hosts — `list`, `status`, `stop`, `reconcile`, the manager pane — refuses
+instead, names the file and says what was wrong with it. The pane opens on that
+refusal rather than on an empty table, because a pane that will not open cannot
+tell you why.
+
+Two shapes, two fixes:
+
+- **It could not be opened** — almost always permissions, after something ran
+  as another user. `herdr-portfwd status` prints the directory; `chmod 600` the
+  file in it. Nothing rewrites or moves a file it could not read, so the records
+  are still in there and come back the moment it is readable again.
+- **It could not be understood** — truncated by a power loss, or written by a
+  plugin newer than this one. Move it aside yourself, and the tool starts a
+  fresh file: `mv forwards.json forwards.json.corrupt`. It will not do that for
+  you, because a file this binary cannot parse may be a file it is simply too
+  old to parse, and starting over on top of it would drop forwards a newer
+  plugin is holding open.
+
+Neither one closes a port. The records say what *should* be forwarded; the
+forwards themselves live in the SSH control master and keep working. Once the
+file reads again, `herdr-portfwd reconcile` brings the two back in line.
+
+`requests.json` beside it behaves the same way, and the local agent reports it
+and keeps polling rather than concluding there is nothing left to apply.
+
 ### `--host`: act on a host other than the one that was picked
 
 Every command takes it, and it beats every other signal — the mirror prefix on
@@ -462,6 +530,12 @@ herdr-portfwd list --host buildbox
 `HERDR_PORTFWD_HOST` does the same from a shell. Reach for it when `status`
 reports the wrong host, or none: *"cannot tell which host to use"* means several
 hosts are configured and nothing about the invocation pointed at one.
+
+`list`, `stop` and `stop-all` do **not** need it: they cover every host unless
+you pass it. `--host` is how you narrow them back down, and a `stop <port>` that
+finds the port on two hosts asks you to. A narrowed `stop` that finds nothing
+still names the host that does have the port, so *"nothing to stop"* never means
+*"nothing, on the one host I happened to look at"*.
 
 ### `HERDR_PORTFWD_MODE`: override which side the tool thinks it is on
 
