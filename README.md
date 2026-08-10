@@ -260,20 +260,27 @@ as where the plugin runs.
 **With herdr-mirror**, bind them in your local `~/.config/herdr/config.toml`:
 
 ```toml
+# f for "forward". Herdr's defaults already use most letters — prefix+p is
+# previous_tab and prefix+shift+p is rename_pane — so check yours before
+# picking: `herdr --default-config | grep prefix+`.
 [[keys.command]]
-key = "prefix+p"
+key = "prefix+f"
 type = "plugin_action"
 command = "portfwd.scan"
 description = "forward a remote port"
 
 [[keys.command]]
-key = "prefix+shift+p"
+key = "prefix+shift+f"
 type = "plugin_action"
 command = "portfwd.list"
 description = "manage port forwards"
 ```
 
 Then `herdr server reload-config`.
+
+A binding to an action id that does not exist is **not** reported: config reload
+accepts it silently and the key does nothing when pressed. If a key seems dead,
+check the id against `herdr plugin action list --plugin portfwd`.
 
 **With a plain `herdr --remote`, no custom command binding fires at all** —
 neither yours nor the remote's. `herdr --remote` defaults to

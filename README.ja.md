@@ -253,20 +253,27 @@ Ctrl+クリック・`scan`・`add` で転送します。
 **herdr-mirror なら**、ローカルの `~/.config/herdr/config.toml` に書きます:
 
 ```toml
+# f は forward の f。Herdr の既定はほとんどの文字を使っており、
+# prefix+p は previous_tab、prefix+shift+p は rename_pane です。選ぶ前に
+# `herdr --default-config | grep prefix+` で確認してください。
 [[keys.command]]
-key = "prefix+p"
+key = "prefix+f"
 type = "plugin_action"
 command = "portfwd.scan"
 description = "forward a remote port"
 
 [[keys.command]]
-key = "prefix+shift+p"
+key = "prefix+shift+f"
 type = "plugin_action"
 command = "portfwd.list"
 description = "manage port forwards"
 ```
 
 そのあと `herdr server reload-config` を実行します。
+
+存在しないアクション ID を割り当てても**報告されません**。設定の再読み込みは黙って
+受け入れ、押しても何も起きないだけです。キーが死んでいるように見えたら、ID を
+`herdr plugin action list --plugin portfwd` と突き合わせてください。
 
 **素の `herdr --remote` では、カスタムコマンドのキーバインドはどちら側のものも
 一切発火しません。** `herdr --remote` の既定は `--remote-keybindings local` で、
