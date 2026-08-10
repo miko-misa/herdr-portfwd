@@ -5,6 +5,57 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-10
+
+### Added
+
+- A `confirm` pane, and a Ctrl+click now lands on it. The screen names the host,
+  the workspace and agent the URL was attributed to, the remote and local ports,
+  and — where this is the machine that would bind the port — whether that port
+  is free; from there `enter` forwards and opens the page, `f` forwards without
+  opening anything, `l` opens the forward manager, `s` opens the port picker,
+  and `esc` does nothing at all. Whether a browser opens is a key on that screen
+  rather than something a click implies.
+
+  Three cases the screen states rather than papering over: the port is already
+  forwarded, so `enter` only opens the page; the local port is held by something
+  else, which is said out loud and still never remapped on its own; and the URL
+  belongs to a host this invocation cannot resolve, in which case nothing is
+  offered to forward and the reason is on screen instead of in a plugin log. The
+  first two are questions about the machine that would bind the port, so under
+  `herdr --remote` the screen answers neither — it says that this Herdr server
+  is not the machine with the browser and that the local agent applies the
+  forward, rather than inventing a "free" or an "in use".
+
+  Herdr keeps one popup slot, so a click that arrives while the picker or a
+  previous confirmation is up cannot have a screen. It is acted on rather than
+  dropped, with the reason on stderr and in a Herdr notification: a click whose
+  only trace was a plugin log nobody reads was worse than the forward the user
+  asked for.
+
+- `confirm_on_click` in `~/.config/herdr-portfwd/config.toml`, default `true`.
+  Set it `false` to restore the previous behaviour, where a click forwarded the
+  port and opened the browser in one motion.
+
+- An `a` key on the `list` overlay, which opens the picker. With the `confirm`
+  pane's `l` and `s`, one click now reaches every surface this plugin has.
+
+### Changed
+
+- `open-url` opens the confirmation instead of forwarding immediately. It
+  follows the rule `scan` already followed, terminal included: run as an action
+  it asks Herdr for the `confirm` pane, run at a terminal it draws the screen
+  there itself, and only an invocation with neither — `--json`, or a shell
+  invocation whose output is redirected, with no Herdr to ask — acts on the
+  click rather than asking for a pane nobody would see. A pane command never
+  asks for another pane.
+
+- Under `herdr --remote` the confirmation opens on the remote, where the plugin
+  runs, and "forward" there still means "record a request the local agent
+  applies". The browser is still opened by the agent and never by the pane —
+  and "forward only" now leaves the URL out of the request, so it stays a
+  forward with no page.
+
 ## [0.1.0] - 2026-08-10
 
 ### Added

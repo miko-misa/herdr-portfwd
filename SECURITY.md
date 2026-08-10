@@ -96,7 +96,11 @@ Areas worth extra scrutiny in a security review:
 
 - Local port selection and bind address, in `ssh` and `actions`.
 - URL parsing in the link handler: only loopback hosts and a plain port should
-  ever produce a forward.
+  ever produce a forward. The URL is validated once when the click is turned
+  into the `confirm` pane's payload, and again in `open_url_for` when the pane
+  acts on it — under `herdr --remote` that payload made a round trip through an
+  environment variable on the host whose terminal printed the URL, so the second
+  pass is not redundant.
 - `Agent::open_requested_url` in `local_agent`: the re-validation of a URL that
   came from the remote, the check that it names the port the agent bound, and
   the record that keeps it to one opening.

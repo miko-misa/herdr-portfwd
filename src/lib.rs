@@ -25,6 +25,7 @@ pub const PLUGIN_ID: &str = "portfwd";
 pub mod actions;
 pub mod cli;
 pub mod config;
+pub mod confirm;
 pub mod context;
 pub mod discover;
 pub mod herdr;

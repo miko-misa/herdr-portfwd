@@ -1,11 +1,21 @@
 //! Plugin pane rendering.
 //!
-//! Two entrypoints: a `list` overlay of live forwards with stop keys, and a
-//! `picker` popup over attributed listeners. Both are plain ANSI on a terminal
-//! Herdr owns — no TUI framework, matching how other Herdr plugins stay small.
+//! Three entrypoints: a `list` overlay of live forwards with stop keys, a
+//! `picker` popup over attributed listeners, and a `confirm` popup that says
+//! what a Ctrl+clicked URL is about to do before it does it. All are plain ANSI
+//! on a terminal Herdr owns — no TUI framework, matching how other Herdr
+//! plugins stay small.
 //!
 //! A popup receives all terminal input including Escape and closes when the
 //! command exits, so key handling is ordinary stdin reading.
+//!
+//! # Reaching the other panes
+//!
+//! A pane can send the user to another one: `confirm` offers `l` and `s`, and
+//! `list` offers `a`. The UI never opens anything itself — it returns a
+//! [`Handoff`] in its [`Outcome`] and the caller asks Herdr. That is not
+//! squeamishness about I/O: *when* the ask happens is the whole design. See
+//! [`Handoff`].
 //!
 //! Rendering is a pure function from a snapshot to bytes, so layout, column
 //! widths, and truncation are testable without a terminal.
@@ -28,6 +38,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 
+use crate::confirm::ConfirmState;
 use crate::types::{AttributedListener, Forward, Origin, PaneRef};
 
 /// Fallback terminal geometry when the real size cannot be read.
@@ -819,12 +830,16 @@ pub fn render_list(snapshot: &ListSnapshot) -> String {
 
     if snapshot.rows.is_empty() {
         frame.push("No forwards are live.".to_string());
-        frame.push(
-            "Ctrl+click a localhost URL in a pane, or run \"Port: forward a port\".".to_string(),
-        );
+        frame.push("Ctrl+click a localhost URL in a pane, or press a to pick one.".to_string());
         frame.blank();
         frame.push_status(snapshot.status.as_ref());
-        frame.push(paint("q close", DIM, snapshot.color));
+        // The two keys an empty table still has. Spelled out rather than taken
+        // from `LIST_HINTS`, whose other rows act on a row that is not there.
+        frame.push(paint(
+            &["a add", "q close"].join(HINT_GAP),
+            DIM,
+            snapshot.color,
+        ));
         return frame.finish();
     }
 
@@ -1002,6 +1017,351 @@ pub fn render_picker(snapshot: &PickerSnapshot) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The confirmation screen
+// ---------------------------------------------------------------------------
+
+/// Everything `render_confirm` needs.
+///
+/// The click itself is carried whole rather than flattened, because it is the
+/// same value the asking side encoded into the environment: one shape means the
+/// screen cannot describe a click the payload does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmSnapshot {
+    pub state: ConfirmState,
+    pub status: Option<Status>,
+    pub width: usize,
+    pub height: usize,
+    pub color: bool,
+}
+
+impl Default for ConfirmSnapshot {
+    fn default() -> Self {
+        Self {
+            state: ConfirmState::default(),
+            status: None,
+            width: DEFAULT_WIDTH,
+            height: CONFIRM_HEIGHT,
+            color: true,
+        }
+    }
+}
+
+impl ConfirmSnapshot {
+    pub fn new(state: ConfirmState) -> Self {
+        Self {
+            state,
+            ..Self::default()
+        }
+    }
+}
+
+/// Rows the tallest confirmation frame needs — the height of the pane process,
+/// not of the popup around it. Kept here so
+/// `the_confirm_popup_is_declared_tall_enough_for_its_own_tallest_frame` can
+/// check the manifest against the renderer rather than against a guess.
+pub const CONFIRM_HEIGHT: usize = 16;
+
+/// Rows a `[[panes]] height` spends on the popup's border before the pane
+/// process sees any.
+///
+/// Herdr's `height` is the **outer** size. `resolve_popup_geometry` in
+/// `src/popup_size.rs` derives the terminal it spawns as
+/// `pane_inner_height = outer_height.saturating_sub(2)` and hands that to
+/// `spawn_popup_command` as `rows`, so a popup declared `height = N` runs its
+/// command in `N - 2` rows. Declaring [`CONFIRM_HEIGHT`] itself was a budget
+/// the pane never had, and the two rows it was short are the last two of the
+/// frame: `esc cancel` and the status line.
+pub const POPUP_BORDER_ROWS: usize = 2;
+
+/// Cells the key column of the confirmation's footer occupies.
+const CONFIRM_KEY_WIDTH: usize = 8;
+
+/// A title with a rule after it, filling the pane.
+///
+/// ASCII `-` rather than a box-drawing `─`: U+2500 is East Asian *ambiguous*,
+/// two cells wide in a CJK locale, and a rule that changes length with the
+/// reader's locale is the one piece of chrome guaranteed to overflow.
+fn ruled_title(title: &str, width: usize) -> String {
+    let title = sanitize(title);
+    let used = display_width(&title) + 1;
+    if used >= width {
+        return title;
+    }
+    format!("{title} {}", "-".repeat(width - used))
+}
+
+/// The parenthesised note after the port mapping, and the colour it is painted
+/// in. One function so the wording and the colour cannot drift from the state
+/// that produced them.
+fn confirm_note(state: &ConfirmState) -> Option<(String, &'static str)> {
+    if state.already_forwarded == Some(true) {
+        return Some(("already forwarded".to_string(), DIM));
+    }
+    match state.local_free {
+        Some(true) => Some(("free".to_string(), DIM)),
+        Some(false) => Some(("in use".to_string(), RED)),
+        // The asking side was on the far end of the connection and could not
+        // know. Saying "free" there would be inventing an answer; saying "in
+        // use" would be inventing the opposite.
+        None => None,
+    }
+}
+
+/// The sentences under the mapping. Each is a fact about *this* click that the
+/// two-line summary above cannot carry.
+///
+/// Kept to one short line each rather than one long one, because these are what
+/// [`fit_confirm`] gives up first when the popup is too small: a sentence that
+/// survives as half a sentence says less than one that was never drawn.
+fn confirm_notices(state: &ConfirmState) -> Vec<(String, &'static str)> {
+    let mut notices = Vec::new();
+    if let Some(problem) = &state.problem {
+        notices.push((sanitize(problem), RED));
+        notices.push(("Nothing will be forwarded.".to_string(), DIM));
+        return notices;
+    }
+    if state.port_taken() {
+        notices.push((
+            format!("Local port {} is held by something else.", state.local_port),
+            RED,
+        ));
+        notices.push((
+            "No remap is offered: the port in the URL is the point.".to_string(),
+            DIM,
+        ));
+    }
+    if state.already_forwarded == Some(true) {
+        notices.push((
+            "The forward is already up; enter just opens it.".to_string(),
+            DIM,
+        ));
+    }
+    if !state.applies_here {
+        notices.push((
+            "This Herdr server is not the machine with the browser.".to_string(),
+            DIM,
+        ));
+        notices.push((
+            "The local agent applies it and opens the page.".to_string(),
+            DIM,
+        ));
+    }
+    notices
+}
+
+/// The footer rows this particular click offers, as `(key, text)`.
+///
+/// The forward keys are dropped when there is nothing to forward, because a
+/// footer that promises a key which cannot work is worse than one that stays
+/// quiet: the user presses it, nothing happens, and the screen has lied.
+fn confirm_hints(state: &ConfirmState) -> Vec<(&'static str, &'static str)> {
+    let mut hints: Vec<(&'static str, &'static str)> = Vec::new();
+    if state.actionable() {
+        for (key, text, _, command) in CONFIRM_HINTS {
+            match command {
+                ConfirmCommand::ForwardAndOpen if state.already_forwarded == Some(true) => {
+                    hints.push((key, "open in the browser"));
+                }
+                // Nothing left to forward, so the row would name a no-op. Only
+                // a *known* existing forward drops it: an unknown one is not
+                // evidence there is nothing to do.
+                ConfirmCommand::ForwardOnly if state.already_forwarded == Some(true) => {}
+                ConfirmCommand::ForwardAndOpen | ConfirmCommand::ForwardOnly => {
+                    hints.push((key, text));
+                }
+                _ => {}
+            }
+        }
+    }
+    for (key, text, _, command) in CONFIRM_HINTS {
+        if matches!(
+            command,
+            ConfirmCommand::ShowList | ConfirmCommand::ShowPicker | ConfirmCommand::Quit
+        ) {
+            hints.push((key, text));
+        }
+    }
+    hints
+}
+
+/// One row of the confirmation, and whether a cramped popup may drop it.
+///
+/// Only the explanatory sentences are droppable. The mapping, the keys and the
+/// status are what the screen is *for*: a popup too short to hold everything
+/// must still say what will happen and how to say no.
+struct ConfirmLine {
+    text: String,
+    droppable: bool,
+}
+
+fn essential(text: impl Into<String>) -> ConfirmLine {
+    ConfirmLine {
+        text: text.into(),
+        droppable: false,
+    }
+}
+
+fn optional(text: impl Into<String>) -> ConfirmLine {
+    ConfirmLine {
+        text: text.into(),
+        droppable: true,
+    }
+}
+
+/// Drop the rows a short popup has no room for, least important first.
+///
+/// A frame taller than its pane wraps, and a wrapped line costs a row the
+/// budget already spent — the same reason every line goes through
+/// [`clamp_line`] on the way in. So something has to go, and the order is:
+/// blank rows, then the explanatory sentences from the bottom up, and only then
+/// — when the rows that may not be dropped are by themselves taller than the
+/// pane — the *head*.
+///
+/// Cutting the tail was the obvious implementation and the wrong one twice
+/// over. The last rows of this frame are `esc cancel` and the status line, so a
+/// `truncate` took the status first and `esc cancel` next: the two rows this
+/// screen exists to show. Dropping from the front loses the title and then the
+/// mapping, which are a caption on an answer the user can still act on, rather
+/// than the answer itself and the way out.
+fn fit_confirm(mut lines: Vec<ConfirmLine>, height: usize) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+    while lines.len() > height {
+        let blank = lines.iter().rposition(|line| line.text.trim().is_empty());
+        let victim = blank.or_else(|| lines.iter().rposition(|line| line.droppable));
+        match victim {
+            Some(index) => {
+                lines.remove(index);
+            }
+            // Nothing left that may be dropped, so the cut comes off the head.
+            None => {
+                lines.remove(0);
+            }
+        }
+    }
+    lines.into_iter().map(|line| line.text).collect()
+}
+
+/// Break `text` into lines of at most `width` cells, on spaces.
+///
+/// Measured in cells like everything else here, so a sentence carrying a
+/// Japanese workspace label wraps where a reader sees it wrap. A single word
+/// wider than the budget gets its own line and is cut by [`clamp_line`] on the
+/// way into the frame; hyphenating it would invent characters that are not in
+/// the value.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if display_width(&candidate) <= width || current.is_empty() {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Draw the confirmation. Pure: same snapshot, same bytes.
+pub fn render_confirm(snapshot: &ConfirmSnapshot) -> String {
+    let width = snapshot.width.max(MIN_WIDTH);
+    let state = &snapshot.state;
+    let color = snapshot.color;
+    // Every row is indented two cells, so a sentence has that much less to
+    // wrap into.
+    let body = width.saturating_sub(2).max(1);
+    let mut lines: Vec<ConfirmLine> = Vec::new();
+
+    let host = sanitize(state.host.as_deref().unwrap_or_default());
+    let title = if host.is_empty() {
+        "Forward a port".to_string()
+    } else {
+        format!("Forward a port from {host}")
+    };
+    lines.push(essential(paint(&ruled_title(&title, width), BOLD, color)));
+    lines.push(essential(String::new()));
+
+    // Who it belongs to. Absent when the click could not be attributed, which
+    // is a normal outcome and not worth a row of dashes.
+    let owner: Vec<String> = [state.workspace.as_ref(), state.agent.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|value| sanitize(value))
+        .filter(|value| !value.trim().is_empty())
+        .collect();
+    if !owner.is_empty() {
+        lines.push(optional(format!("  {}", owner.join("    "))));
+    }
+
+    let mapping = format!(
+        "  remote {}  ->  localhost {}",
+        state.remote_port, state.local_port
+    );
+    let mapping = match confirm_note(state) {
+        Some((note, code)) => format!("{mapping}   {}", paint(&format!("({note})"), code, color)),
+        None => mapping,
+    };
+    lines.push(essential(mapping));
+    lines.push(optional(paint(
+        &format!("  {}", sanitize(&state.url)),
+        DIM,
+        color,
+    )));
+
+    let notices = confirm_notices(state);
+    if !notices.is_empty() {
+        lines.push(optional(String::new()));
+    }
+    for (text, code) in notices {
+        for wrapped in wrap_to_width(&text, body) {
+            lines.push(optional(paint(&format!("  {wrapped}"), code, color)));
+        }
+    }
+
+    lines.push(essential(String::new()));
+    for (key, text) in confirm_hints(state) {
+        lines.push(essential(format!(
+            "  {}{text}",
+            pad_to_width(key, CONFIRM_KEY_WIDTH)
+        )));
+    }
+    lines.push(essential(String::new()));
+    match &snapshot.status {
+        // Wrapped rather than clamped to one line, unlike the tables above.
+        // This is the only place a refusal lands on this screen, and the one
+        // that matters most — the local-port collision — is three clauses long
+        // on purpose. Cutting it at the pane edge would leave the user with
+        // "local port 5173 is already in use by another proce+".
+        Some(status) => {
+            let code = if status.error { RED } else { DIM };
+            for wrapped in wrap_to_width(&sanitize(&status.text), width) {
+                lines.push(essential(paint(&wrapped, code, color)));
+            }
+        }
+        None => lines.push(essential(String::new())),
+    }
+
+    let mut frame = Frame::new(width, color);
+    for line in fit_confirm(lines, snapshot.height.max(1)) {
+        frame.push(line);
+    }
+    frame.finish()
+}
+
+// ---------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------
 
@@ -1172,6 +1532,9 @@ pub enum ListCommand {
     Stop,
     StopAll,
     Reload,
+    /// Leave for the picker, so the overlay that shows what is forwarded is
+    /// also a way to forward something else.
+    AddPort,
     Quit,
     Interrupt,
     Ignore,
@@ -1188,6 +1551,7 @@ pub fn list_command(key: Key) -> ListCommand {
         Key::Enter | Key::Char('x') | Key::Char('d') => ListCommand::Stop,
         Key::Char('X') | Key::Char('D') => ListCommand::StopAll,
         Key::Char('r') => ListCommand::Reload,
+        Key::Char('a') => ListCommand::AddPort,
         Key::Escape | Key::Char('q') => ListCommand::Quit,
         Key::Interrupt => ListCommand::Interrupt,
         _ => ListCommand::Ignore,
@@ -1205,6 +1569,38 @@ pub enum PickerCommand {
     Quit,
     Interrupt,
     Ignore,
+}
+
+/// What a key does on the confirmation screen.
+///
+/// Deliberately not a superset of the other two: there is nothing to move
+/// through and nothing to mark, so every key that is not one of these five is
+/// [`ConfirmCommand::Ignore`] rather than doing something adjacent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmCommand {
+    /// Forward, then let the machine with the browser open the page.
+    ForwardAndOpen,
+    /// Forward, and open nothing.
+    ForwardOnly,
+    /// Leave for the `list` overlay.
+    ShowList,
+    /// Leave for the `picker`.
+    ShowPicker,
+    Quit,
+    Interrupt,
+    Ignore,
+}
+
+pub fn confirm_command(key: Key) -> ConfirmCommand {
+    match key {
+        Key::Enter => ConfirmCommand::ForwardAndOpen,
+        Key::Char('f') => ConfirmCommand::ForwardOnly,
+        Key::Char('l') => ConfirmCommand::ShowList,
+        Key::Char('s') => ConfirmCommand::ShowPicker,
+        Key::Escape | Key::Char('q') => ConfirmCommand::Quit,
+        Key::Interrupt => ConfirmCommand::Interrupt,
+        _ => ConfirmCommand::Ignore,
+    }
 }
 
 pub fn picker_command(key: Key) -> PickerCommand {
@@ -1242,10 +1638,11 @@ pub fn picker_command(key: Key) -> PickerCommand {
 const HINT_GAP: &str = "   ";
 
 /// The `list` pane's footer: hint, the key it names, the command it must run.
-const LIST_HINTS: [(&str, Key, ListCommand); 5] = [
+const LIST_HINTS: [(&str, Key, ListCommand); 6] = [
     ("up/down move", Key::Down, ListCommand::Move(1)),
     ("enter stop", Key::Enter, ListCommand::Stop),
     ("X stop all", Key::Char('X'), ListCommand::StopAll),
+    ("a add", Key::Char('a'), ListCommand::AddPort),
     ("r refresh", Key::Char('r'), ListCommand::Reload),
     ("q close", Key::Char('q'), ListCommand::Quit),
 ];
@@ -1257,6 +1654,40 @@ const PICKER_HINTS: [(&str, Key, PickerCommand); 5] = [
     ("enter forward", Key::Enter, PickerCommand::Confirm),
     ("r refresh", Key::Char('r'), PickerCommand::Reload),
     ("esc cancel", Key::Escape, PickerCommand::Quit),
+];
+
+/// The `confirm` pane's footer: the key as it is printed, what it does, the
+/// key it names, and the command that key must run. One row per line rather
+/// than one line for all of them, because this pane's rows are sentences.
+///
+/// Which rows a given click actually shows is [`confirm_hints`]; this is the
+/// full set, and the checked one.
+const CONFIRM_HINTS: [(&str, &str, Key, ConfirmCommand); 5] = [
+    (
+        "enter",
+        "forward and open in the browser",
+        Key::Enter,
+        ConfirmCommand::ForwardAndOpen,
+    ),
+    (
+        "f",
+        "forward only",
+        Key::Char('f'),
+        ConfirmCommand::ForwardOnly,
+    ),
+    (
+        "l",
+        "see the forwards already up",
+        Key::Char('l'),
+        ConfirmCommand::ShowList,
+    ),
+    (
+        "s",
+        "look for other ports on this host",
+        Key::Char('s'),
+        ConfirmCommand::ShowPicker,
+    ),
+    ("esc", "cancel", Key::Escape, ConfirmCommand::Quit),
 ];
 
 fn hint_line<C>(hints: &[(&str, Key, C)]) -> String {
@@ -1280,12 +1711,74 @@ pub enum Exit {
     Interrupted,
 }
 
+/// Another of this plugin's panes, which the user asked for from the one they
+/// are in.
+///
+/// # Why this is a return value and not a call
+///
+/// Herdr keeps exactly one popup slot: `spawn_popup_command` refuses a second
+/// popup with `popup already open`, and the popup it already has is the pane
+/// making the request. (`ui_busy` is the *other* refusal, and a different one:
+/// it fires when the app is in a modal mode — Settings, Copy — which a plugin
+/// popup is not, since opening one sets the mode back to `Terminal`.) A popup
+/// also cannot close itself: Herdr closes it when its process dies, and a popup
+/// pane command is launched without `HERDR_PANE_ID`, so there is not even a
+/// pane id it could name to `herdr pane close`.
+///
+/// So the ordering is forced. The pane cannot exit and then ask, because a
+/// process that has exited asks nothing. It has to ask *before* it exits, while
+/// its own popup is still up — which is fine for an overlay, and is why
+/// [`crate::herdr_cli::plugin_pane_open_argv_with`] takes a placement: a popup
+/// handing off to a popup asks for an overlay instead. Herdr opens it behind
+/// the popup and reveals it the instant the popup's process exits.
+///
+/// This is deliberately *not* the recursion invariant 10 forbids. That rule is
+/// about a pane that was not told enough asking for a pane whose command would
+/// ask again; this is a key the user pressed, and the graph it walks —
+/// `confirm` to `list` or `picker`, `list` to `picker` — has no cycle in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handoff {
+    /// The `list` overlay of live forwards.
+    List,
+    /// The `picker` over attributed listeners.
+    Picker,
+}
+
 /// What a pane leaves behind: the last status line, for the caller to log or
-/// print once the pane is gone.
+/// print once the pane is gone, and the pane the user asked to go to next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub exit: Exit,
     pub status: Option<Status>,
+    /// Set when the user pressed a cross-link key. The caller opens it; see
+    /// [`Handoff`] for why the pane does not.
+    pub handoff: Option<Handoff>,
+}
+
+impl Outcome {
+    fn closed(status: Option<Status>) -> Self {
+        Self {
+            exit: Exit::Closed,
+            status,
+            handoff: None,
+        }
+    }
+
+    fn interrupted(status: Option<Status>) -> Self {
+        Self {
+            exit: Exit::Interrupted,
+            status,
+            handoff: None,
+        }
+    }
+
+    fn handing_off(status: Option<Status>, handoff: Handoff) -> Self {
+        Self {
+            exit: Exit::Closed,
+            status,
+            handoff: Some(handoff),
+        }
+    }
 }
 
 /// What the `list` pane does when a key asks for it.
@@ -1304,6 +1797,17 @@ pub trait ListActions {
 pub trait PickerActions {
     fn forward(&mut self, rows: &[ListenerRow]) -> std::result::Result<String, String>;
     fn rows(&mut self) -> std::result::Result<Vec<ListenerRow>, String>;
+}
+
+/// What the `confirm` pane does when a key asks for it.
+///
+/// One method, because the screen offers one decision with a yes/no attached:
+/// whether the machine that ends up holding the forward should also open the
+/// page. Under `herdr --remote` neither happens here — the forward is recorded
+/// and the local agent does both — and that difference belongs to the caller,
+/// not to the screen.
+pub trait ConfirmActions {
+    fn forward(&mut self, open_browser: bool) -> std::result::Result<String, String>;
 }
 
 /// Terminal newlines. In raw mode a bare `\n` moves down without returning the
@@ -1367,10 +1871,7 @@ where
         draw(out, &render_list(&snapshot))?;
         if !read_chunk(input, &mut pending)? {
             restore(out)?;
-            return Ok(Outcome {
-                exit: Exit::Closed,
-                status: snapshot.status,
-            });
+            return Ok(Outcome::closed(snapshot.status));
         }
         let (keys, consumed) = parse_keys(&pending, true);
         pending.drain(..consumed);
@@ -1403,19 +1904,17 @@ where
                     }
                 }
                 ListCommand::Reload => reload_list(app, &mut snapshot),
+                ListCommand::AddPort => {
+                    restore(out)?;
+                    return Ok(Outcome::handing_off(snapshot.status, Handoff::Picker));
+                }
                 ListCommand::Quit => {
                     restore(out)?;
-                    return Ok(Outcome {
-                        exit: Exit::Closed,
-                        status: snapshot.status,
-                    });
+                    return Ok(Outcome::closed(snapshot.status));
                 }
                 ListCommand::Interrupt => {
                     restore(out)?;
-                    return Ok(Outcome {
-                        exit: Exit::Interrupted,
-                        status: snapshot.status,
-                    });
+                    return Ok(Outcome::interrupted(snapshot.status));
                 }
                 ListCommand::Ignore => {}
             }
@@ -1481,10 +1980,7 @@ where
         draw(out, &render_picker(&snapshot))?;
         if !read_chunk(input, &mut pending)? {
             restore(out)?;
-            return Ok(Outcome {
-                exit: Exit::Closed,
-                status: snapshot.status,
-            });
+            return Ok(Outcome::closed(snapshot.status));
         }
         let (keys, consumed) = parse_keys(&pending, true);
         pending.drain(..consumed);
@@ -1512,10 +2008,7 @@ where
                     match app.forward(&chosen) {
                         Ok(message) => {
                             restore(out)?;
-                            return Ok(Outcome {
-                                exit: Exit::Closed,
-                                status: Some(Status::info(message)),
-                            });
+                            return Ok(Outcome::closed(Some(Status::info(message))));
                         }
                         Err(message) => {
                             snapshot.status = Some(Status::failed(message));
@@ -1526,17 +2019,11 @@ where
                 PickerCommand::Reload => reload_picker(app, &mut snapshot),
                 PickerCommand::Quit => {
                     restore(out)?;
-                    return Ok(Outcome {
-                        exit: Exit::Closed,
-                        status: snapshot.status,
-                    });
+                    return Ok(Outcome::closed(snapshot.status));
                 }
                 PickerCommand::Interrupt => {
                     restore(out)?;
-                    return Ok(Outcome {
-                        exit: Exit::Interrupted,
-                        status: snapshot.status,
-                    });
+                    return Ok(Outcome::interrupted(snapshot.status));
                 }
                 PickerCommand::Ignore => {}
             }
@@ -1546,6 +2033,81 @@ where
                 snapshot.selected,
                 rows_on_screen(snapshot.height, snapshot.rows.len()),
             );
+        }
+    }
+}
+
+/// Run the confirmation against arbitrary streams.
+///
+/// A successful forward closes the popup, as in the picker: the click asked for
+/// one thing and it happened. A failed one stays open with the reason, because
+/// closing would take the reason with it — and a refused forward is exactly the
+/// case this screen exists for.
+///
+/// A cross-link key closes the popup too, and says so through
+/// [`Outcome::handoff`] rather than opening anything itself. [`Handoff`] argues
+/// for that ordering; it is not incidental.
+pub fn run_confirm<A, R, W>(
+    app: &mut A,
+    mut snapshot: ConfirmSnapshot,
+    input: &mut R,
+    out: &mut W,
+) -> io::Result<Outcome>
+where
+    A: ConfirmActions,
+    R: Read,
+    W: Write,
+{
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        draw(out, &render_confirm(&snapshot))?;
+        if !read_chunk(input, &mut pending)? {
+            restore(out)?;
+            return Ok(Outcome::closed(snapshot.status));
+        }
+        let (keys, consumed) = parse_keys(&pending, true);
+        pending.drain(..consumed);
+        for key in keys {
+            match confirm_command(key) {
+                command @ (ConfirmCommand::ForwardAndOpen | ConfirmCommand::ForwardOnly) => {
+                    if !snapshot.state.actionable() {
+                        // The footer does not offer these keys here, but a
+                        // keystroke must still say why rather than doing
+                        // nothing visible.
+                        snapshot.status = Some(Status::failed(
+                            "there is no host to forward from; press esc".to_string(),
+                        ));
+                        continue;
+                    }
+                    let open_browser = command == ConfirmCommand::ForwardAndOpen;
+                    match app.forward(open_browser) {
+                        Ok(message) => {
+                            restore(out)?;
+                            return Ok(Outcome::closed(Some(Status::info(message))));
+                        }
+                        // Including the local-port collision: the refusal names
+                        // the holder and both ports, and nothing was changed.
+                        Err(message) => snapshot.status = Some(Status::failed(message)),
+                    }
+                }
+                ConfirmCommand::ShowList => {
+                    restore(out)?;
+                    return Ok(Outcome::handing_off(snapshot.status, Handoff::List));
+                }
+                ConfirmCommand::ShowPicker => {
+                    restore(out)?;
+                    return Ok(Outcome::handing_off(snapshot.status, Handoff::Picker));
+                }
+                ConfirmCommand::Quit => {
+                    restore(out)?;
+                    return Ok(Outcome::closed(snapshot.status));
+                }
+                ConfirmCommand::Interrupt => {
+                    restore(out)?;
+                    return Ok(Outcome::interrupted(snapshot.status));
+                }
+                ConfirmCommand::Ignore => {}
+            }
         }
     }
 }
@@ -1641,6 +2203,19 @@ pub fn open_picker<A: PickerActions>(app: &mut A, snapshot: PickerSnapshot) -> i
     let mut input = stdin.lock();
     let mut out = stdout.lock();
     run_picker(app, snapshot, &mut input, &mut out)
+}
+
+/// Open the confirmation on this process's terminal.
+pub fn open_confirm<A: ConfirmActions>(
+    app: &mut A,
+    snapshot: ConfirmSnapshot,
+) -> io::Result<Outcome> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let _raw = RawMode::enter(stdin.as_raw_fd())?;
+    let mut input = stdin.lock();
+    let mut out = stdout.lock();
+    run_confirm(app, snapshot, &mut input, &mut out)
 }
 
 #[cfg(test)]
@@ -2114,6 +2689,31 @@ mod tests {
                 );
             }
             assert!(page.lines().count() <= picker.height, "{page}");
+
+            // The confirmation is the third pane and obeys the same rule. It
+            // has a shape the others do not — indented sentences that wrap,
+            // rather than columns that are cut — so it is the one most able to
+            // put a line over the edge without a table looking wrong.
+            let mut crowded = click();
+            crowded.workspace = Some("実験用ワークスペース".to_string());
+            crowded.url =
+                "http://localhost:5173/a/deep/path?with=a-query-string#and-a-fragment".to_string();
+            crowded.local_free = Some(false);
+            crowded.applies_here = false;
+            let confirm = ConfirmSnapshot {
+                width,
+                status: Some(Status::failed(long)),
+                ..plain_confirm(crowded)
+            };
+            let page = render_confirm(&confirm);
+            for line in page.lines() {
+                assert!(
+                    ref_width(line) <= width,
+                    "a {}-cell line in a {width}-cell pane: {line:?}",
+                    ref_width(line)
+                );
+            }
+            assert!(page.lines().count() <= confirm.height, "{page}");
         }
     }
 
@@ -2728,11 +3328,53 @@ mod tests {
                 "the picker promises {hint:?} for {key:?}"
             );
         }
+        for (key_text, hint, key, command) in CONFIRM_HINTS {
+            assert_eq!(
+                confirm_command(key),
+                command,
+                "the confirmation promises {key_text:?} for {hint:?}"
+            );
+        }
         // Aliases the footers have no room to name, and a key bound to nothing.
         assert_eq!(list_command(Key::Char('x')), ListCommand::Stop);
         assert_eq!(list_command(Key::Char('z')), ListCommand::Ignore);
         assert_eq!(picker_command(Key::Char('q')), PickerCommand::Quit);
         assert_eq!(picker_command(Key::Char('z')), PickerCommand::Ignore);
+        assert_eq!(confirm_command(Key::Char('q')), ConfirmCommand::Quit);
+        assert_eq!(confirm_command(Key::Char('z')), ConfirmCommand::Ignore);
+    }
+
+    #[test]
+    fn the_confirmation_only_advertises_rows_it_can_honour() {
+        // The footer is built per click, so the wording and the key have to be
+        // checked against the table they came from — a row invented in
+        // `confirm_hints` would be a promise no key keeps.
+        let all: Vec<(&str, &str)> = CONFIRM_HINTS
+            .iter()
+            .map(|(key, text, _, _)| (*key, *text))
+            .collect();
+        for state in [
+            click(),
+            ConfirmState {
+                already_forwarded: Some(true),
+                ..click()
+            },
+            ConfirmState {
+                host: None,
+                problem: Some("no host".to_string()),
+                ..click()
+            },
+        ] {
+            for (key, text) in confirm_hints(&state) {
+                let known = all.iter().any(|(table_key, table_text)| {
+                    *table_key == key
+                        // The one wording the table cannot carry: enter means
+                        // "open it" once the forward is already up.
+                        && (*table_text == text || text == "open in the browser")
+                });
+                assert!(known, "{key:?} / {text:?} is in no row of CONFIRM_HINTS");
+            }
+        }
     }
 
     #[test]
@@ -2748,7 +3390,7 @@ mod tests {
             Some("mini: scholion"),
         )]));
         assert!(
-            list.contains("up/down move   enter stop   X stop all   r refresh   q close"),
+            list.contains("up/down move   enter stop   X stop all   a add   r refresh   q close"),
             "{list}"
         );
 
@@ -2761,6 +3403,399 @@ mod tests {
             picker.contains("up/down move   space mark   enter forward   r refresh   esc cancel"),
             "{picker}"
         );
+    }
+
+    // ---- the confirmation screen ----------------------------------------
+
+    fn click() -> ConfirmState {
+        ConfirmState {
+            url: "http://localhost:5173/app".to_string(),
+            remote_port: 5173,
+            local_port: 5173,
+            host: Some("buildbox".to_string()),
+            local_free: Some(true),
+            already_forwarded: Some(false),
+            applies_here: true,
+            workspace: Some("mini: scholion".to_string()),
+            agent: Some("claude".to_string()),
+            pane_id: Some("w1:p1".to_string()),
+            problem: None,
+        }
+    }
+
+    fn plain_confirm(state: ConfirmState) -> ConfirmSnapshot {
+        ConfirmSnapshot {
+            state,
+            color: false,
+            ..ConfirmSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn the_confirmation_says_what_is_about_to_happen_before_it_happens() {
+        // The whole point of the screen: everything the click implied, on
+        // screen, with the choice of whether to open a browser as its own key
+        // rather than folded into the act of clicking.
+        let page = render_confirm(&plain_confirm(click()));
+        assert!(page.contains("Forward a port from buildbox"), "{page}");
+        assert!(page.contains("mini: scholion"), "{page}");
+        assert!(page.contains("claude"), "{page}");
+        assert!(page.contains("remote 5173  ->  localhost 5173"), "{page}");
+        assert!(page.contains("(free)"), "{page}");
+        assert!(page.contains("http://localhost:5173/app"), "{page}");
+        assert!(
+            page.contains("enter   forward and open in the browser"),
+            "{page}"
+        );
+        assert!(page.contains("f       forward only"), "{page}");
+        assert!(
+            page.contains("l       see the forwards already up"),
+            "{page}"
+        );
+        assert!(
+            page.contains("s       look for other ports on this host"),
+            "{page}"
+        );
+        assert!(page.contains("esc     cancel"), "{page}");
+    }
+
+    #[test]
+    fn the_confirmations_chrome_stays_ascii_so_a_cjk_locale_cannot_widen_it() {
+        // `─`, `→` and `…` are East Asian *ambiguous*: two cells wide in a CJK
+        // locale, one in a Western one. A rule or an arrow drawn with them
+        // overflows exactly the terminals this tool's users have.
+        let page = render_confirm(&plain_confirm(click()));
+        for ambiguous in ['─', '→', '…', '▸'] {
+            assert!(
+                !page.contains(ambiguous),
+                "{ambiguous:?} is ambiguous-width chrome: {page}"
+            );
+        }
+        assert!(page.is_ascii(), "{page}");
+    }
+
+    #[test]
+    fn a_japanese_workspace_label_never_pushes_the_confirmation_past_its_width() {
+        // The fixture has to be able to overflow, or the test is a tautology:
+        // a ten-kana label and an ASCII agent name in a 48-cell pane left
+        // sixteen cells of slack, so it passed just as happily against a
+        // renderer that counted bytes. Sixteen kana are thirty-two cells, and
+        // the agent name is on the same row, in a pane as narrow as one gets.
+        let mut wide = click();
+        wide.workspace = Some("実験用ワークスペース・スカリオン".to_string());
+        wide.agent = Some("クロード".to_string());
+        assert!(
+            ref_width("  実験用ワークスペース・スカリオン    クロード") > MIN_WIDTH,
+            "the fixture has to be wider than the narrowest pane, or it \
+             cannot fail"
+        );
+        for width in [MIN_WIDTH, 40, 48, DEFAULT_WIDTH] {
+            let snapshot = ConfirmSnapshot {
+                width,
+                ..plain_confirm(wide.clone())
+            };
+            let page = render_confirm(&snapshot);
+            for line in page.lines() {
+                assert!(
+                    ref_width(line) <= width,
+                    "{:?} is {} cells wide in a {width}-cell pane",
+                    line,
+                    ref_width(line)
+                );
+            }
+            assert!(page.contains("実験用"), "the label still has to be there");
+        }
+    }
+
+    #[test]
+    fn an_escape_sequence_in_a_workspace_label_never_reaches_the_confirmation() {
+        // Under `herdr --remote` the label came off the host, travelled through
+        // an environment variable, and is drawn on the user's terminal.
+        let mut hostile = click();
+        hostile.workspace = Some("\u{1b}[2Jmini: scholion".to_string());
+        hostile.url = "http://localhost:5173/\u{1b}[31m".to_string();
+        let page = render_confirm(&plain_confirm(hostile));
+        assert!(!page.contains('\u{1b}'), "escape survived: {page:?}");
+    }
+
+    #[test]
+    fn a_click_over_a_forward_that_is_already_up_offers_to_open_it_rather_than_redo_it() {
+        let mut live = click();
+        live.already_forwarded = Some(true);
+        // The port reads as taken precisely because our own forward holds it.
+        live.local_free = Some(false);
+        let page = render_confirm(&plain_confirm(live));
+        assert!(page.contains("(already forwarded)"), "{page}");
+        assert!(page.contains("enter   open in the browser"), "{page}");
+        assert!(
+            !page.contains("forward only"),
+            "there is nothing left to forward: {page}"
+        );
+        assert!(
+            !page.contains("held by something else"),
+            "our own forward is not a collision: {page}"
+        );
+    }
+
+    #[test]
+    fn a_local_port_held_by_something_else_is_named_and_no_remap_is_offered() {
+        let mut taken = click();
+        taken.local_free = Some(false);
+        let page = render_confirm(&plain_confirm(taken));
+        assert!(page.contains("(in use)"), "{page}");
+        assert!(page.contains("held by something else"), "{page}");
+        assert!(
+            page.contains("No remap is offered"),
+            "the refusal has to say a remap is not on offer: {page}"
+        );
+        // Invariant 1 in the wording: no other port number appears anywhere.
+        assert!(!page.contains("15173"), "{page}");
+    }
+
+    #[test]
+    fn a_click_whose_host_could_not_be_resolved_offers_nothing_to_forward() {
+        let mut orphan = click();
+        orphan.host = None;
+        orphan.local_free = None;
+        orphan.problem = Some("cannot tell which host to use; configured: a, b".to_string());
+        let page = render_confirm(&plain_confirm(orphan));
+        assert!(page.contains("cannot tell which host to use"), "{page}");
+        assert!(page.contains("Nothing will be forwarded"), "{page}");
+        assert!(
+            !page.contains("forward and open"),
+            "a key that cannot work must not be promised: {page}"
+        );
+        assert!(!page.contains("forward only"), "{page}");
+        // The other surfaces are still worth reaching, and cancelling always is.
+        assert!(page.contains("see the forwards already up"), "{page}");
+        assert!(page.contains("esc     cancel"), "{page}");
+    }
+
+    #[test]
+    fn on_the_far_side_the_screen_says_who_will_do_it_instead_of_guessing_the_port() {
+        let mut remote = click();
+        remote.applies_here = false;
+        remote.local_free = None;
+        let page = render_confirm(&plain_confirm(remote));
+        assert!(
+            !page.contains("(free)") && !page.contains("(in use)"),
+            "this side cannot know, and must not answer: {page}"
+        );
+        assert!(page.contains("not the machine with the browser"), "{page}");
+        assert!(page.contains("local agent applies it"), "{page}");
+        assert!(page.contains("opens the page"), "{page}");
+    }
+
+    #[test]
+    fn a_short_popup_gives_up_its_sentences_before_its_keys() {
+        // The bug this exists for: cutting the tail is the obvious way to make
+        // a frame fit, and the tail of this frame is `esc cancel` and the
+        // status line.
+        let rows = || {
+            vec![
+                essential("mapping"),
+                optional(String::new()),
+                optional("why it will not work"),
+                essential(String::new()),
+                essential("esc cancel"),
+            ]
+        };
+        assert_eq!(
+            fit_confirm(rows(), 5),
+            vec!["mapping", "", "why it will not work", "", "esc cancel"]
+        );
+        // Blanks first, from the bottom.
+        assert_eq!(
+            fit_confirm(rows(), 4),
+            vec!["mapping", "", "why it will not work", "esc cancel"]
+        );
+        assert_eq!(
+            fit_confirm(rows(), 3),
+            vec!["mapping", "why it will not work", "esc cancel"]
+        );
+        // Then the sentence, never the key.
+        assert_eq!(fit_confirm(rows(), 2), vec!["mapping", "esc cancel"]);
+        // And with nothing droppable left the cut comes off the head, not the
+        // tail. `truncate` here kept the caption and threw away the way out.
+        assert_eq!(fit_confirm(rows(), 1), vec!["esc cancel"]);
+        assert!(fit_confirm(rows(), 0).is_empty());
+    }
+
+    #[test]
+    fn a_popup_too_short_for_its_own_keys_keeps_the_last_rows_rather_than_the_first() {
+        // The rows that may not be dropped can outnumber the pane by
+        // themselves: every key row is essential, and so are the mapping and
+        // the status. Cutting the tail took the status line first and
+        // `esc cancel` next — the answer and the way out — and left a title.
+        let mut crowded = click();
+        crowded.local_free = Some(false);
+        crowded.applies_here = false;
+        let page = render_confirm(&ConfirmSnapshot {
+            height: 4,
+            status: Some(Status::failed("ssh: connect to host buildbox: refused")),
+            ..plain_confirm(crowded)
+        });
+        assert_eq!(page.lines().count(), 4, "{page}");
+        assert!(
+            page.contains("esc     cancel"),
+            "the way out went off the bottom:\n{page}"
+        );
+        assert!(
+            page.contains("connect to host buildbox"),
+            "the reason went off the bottom:\n{page}"
+        );
+        assert!(
+            !page.contains("Forward a port from"),
+            "the caption is what a pane this short can afford to lose:\n{page}"
+        );
+    }
+
+    #[test]
+    fn a_notice_wraps_into_the_indent_it_is_drawn_in_rather_than_being_cut() {
+        // Every notice is drawn two cells in, so it has `width - 2` to wrap
+        // into. Wrapping to the full width instead is invisible at most widths
+        // and then, at the ones where the greedy chunk lands in that two-cell
+        // band, `clamp_line` cuts the sentence and leaves a `+` — silently, for
+        // every explanatory sentence on the screen.
+        let mut crowded = click();
+        crowded.local_free = Some(false);
+        crowded.applies_here = false;
+        let sentences: Vec<String> = confirm_notices(&crowded)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(sentences.len() >= 4, "{sentences:?}");
+        for width in MIN_WIDTH..=DEFAULT_WIDTH {
+            let page = render_confirm(&ConfirmSnapshot {
+                width,
+                // Tall enough that nothing is dropped for room: this is about
+                // the wrap, not about the fit.
+                height: 60,
+                ..plain_confirm(crowded.clone())
+            });
+            // Undo the wrap the way a reader does, so a sentence split over two
+            // rows still reads as one.
+            let flowed = page.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+            for sentence in &sentences {
+                assert!(
+                    flowed.contains(sentence.as_str()),
+                    "{sentence:?} did not survive a {width}-cell pane:\n{page}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_colour_that_marks_a_collision_is_actually_painted() {
+        // Every other test on this screen renders without colour, so the one
+        // thing colour is here for — telling "in use" apart from "free" at a
+        // glance, and a refusal apart from a note — was drawn by nothing any
+        // test looked at.
+        let coloured = |state: ConfirmState| {
+            render_confirm(&ConfirmSnapshot {
+                state,
+                color: true,
+                ..ConfirmSnapshot::default()
+            })
+        };
+
+        let mut taken = click();
+        taken.local_free = Some(false);
+        let page = coloured(taken);
+        assert!(
+            page.contains(&format!("{RED}(in use){RESET}")),
+            "a collision has to be visible without reading: {page:?}"
+        );
+        assert!(
+            page.contains(RED) && page.contains("held by something else"),
+            "{page:?}"
+        );
+
+        let free = coloured(click());
+        assert!(
+            free.contains(&format!("{DIM}(free){RESET}")),
+            "a free port is a note, not an alarm: {free:?}"
+        );
+        assert!(
+            !free.contains(RED),
+            "nothing on this screen is wrong: {free:?}"
+        );
+
+        let mut live = click();
+        live.already_forwarded = Some(true);
+        live.local_free = Some(false);
+        let page = coloured(live);
+        assert!(
+            page.contains(&format!("{DIM}(already forwarded){RESET}")),
+            "our own forward holding the port is not a collision: {page:?}"
+        );
+        assert!(!page.contains(RED), "{page:?}");
+
+        // And the same screen without colour carries no escapes at all, so a
+        // pane whose output is captured is still readable.
+        assert!(!render_confirm(&plain_confirm(click())).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_sentence_wraps_where_a_reader_sees_it_wrap() {
+        assert_eq!(
+            wrap_to_width("the local agent applies it", 12),
+            ["the local", "agent", "applies it"]
+        );
+        // Cells, not characters: five kana are ten cells wide.
+        assert_eq!(wrap_to_width("あいうえお かき", 10), ["あいうえお", "かき"]);
+        // A word with nowhere to fit still gets a line rather than vanishing.
+        assert_eq!(
+            wrap_to_width("supercalifragilistic", 4),
+            ["supercalifragilistic"]
+        );
+        assert!(wrap_to_width("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn the_tallest_confirmation_still_fits_the_popup_the_manifest_declares() {
+        // Every notice at once: a conflict, an existing forward, and the far
+        // side. If this ever needs more rows than CONFIRM_HEIGHT the manifest
+        // has to grow with it, or `esc cancel` falls off the bottom.
+        let mut crowded = click();
+        crowded.local_free = Some(false);
+        crowded.already_forwarded = Some(true);
+        crowded.applies_here = false;
+        let page = render_confirm(&ConfirmSnapshot {
+            status: Some(Status::failed("ssh: connect to host buildbox: refused")),
+            ..plain_confirm(crowded)
+        });
+        assert!(
+            page.lines().count() <= CONFIRM_HEIGHT,
+            "{} lines in a {CONFIRM_HEIGHT}-row popup:\n{page}",
+            page.lines().count()
+        );
+        assert!(page.contains("esc     cancel"), "{page}");
+        assert!(page.contains("connect to host buildbox"), "{page}");
+    }
+
+    #[test]
+    fn a_refusal_too_long_for_one_line_is_wrapped_rather_than_cut_off() {
+        // The refusal that matters most on this screen is the local-port
+        // collision, and it is several clauses long on purpose: it names the
+        // holder, says nothing was changed, and says what a remap would break.
+        // Clamped to the pane edge, the user reads the first clause and a `+`.
+        let long = "local port 5173 is already in use by another process on this \
+                    machine; forwarding buildbox port 5173 there would collide with \
+                    it. Nothing was changed";
+        let page = render_confirm(&ConfirmSnapshot {
+            width: 56,
+            status: Some(Status::failed(long)),
+            ..plain_confirm(click())
+        });
+        assert!(page.contains("Nothing was changed"), "{page}");
+        assert!(
+            !page.contains("proce+") && !page.contains("collide+"),
+            "the reason was cut instead of wrapped: {page}"
+        );
+        for line in page.lines() {
+            assert!(ref_width(line) <= 56, "{line:?}");
+        }
     }
 
     #[test]
@@ -2848,6 +3883,130 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_picker(app, snapshot, &mut input, &mut out).expect("streams never fail");
         (outcome, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Records what the confirmation asked for, so a test can tell "forward and
+    /// open" from "forward only" — which is the whole reason the screen exists.
+    #[derive(Default)]
+    struct FakeConfirm {
+        forwards: Vec<bool>,
+        error: Option<String>,
+    }
+
+    impl ConfirmActions for FakeConfirm {
+        fn forward(&mut self, open_browser: bool) -> std::result::Result<String, String> {
+            self.forwards.push(open_browser);
+            match &self.error {
+                Some(message) => Err(message.clone()),
+                None => Ok(if open_browser {
+                    "forwarded and opened".to_string()
+                } else {
+                    "forwarded".to_string()
+                }),
+            }
+        }
+    }
+
+    fn drive_confirm(app: &mut FakeConfirm, state: ConfirmState, keys: &[u8]) -> (Outcome, String) {
+        let snapshot = plain_confirm(state);
+        let mut input = keys;
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_confirm(app, snapshot, &mut input, &mut out).expect("streams never fail");
+        (outcome, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[test]
+    fn enter_forwards_and_opens_while_f_forwards_and_opens_nothing() {
+        // The decision the screen was added for: the browser is a choice on the
+        // screen rather than something a click implies.
+        let mut app = FakeConfirm::default();
+        let (outcome, _) = drive_confirm(&mut app, click(), b"\r");
+        assert_eq!(app.forwards, [true]);
+        assert_eq!(outcome.exit, Exit::Closed);
+        assert_eq!(outcome.handoff, None);
+        assert_eq!(
+            outcome.status.map(|status| status.text).as_deref(),
+            Some("forwarded and opened")
+        );
+
+        let mut app = FakeConfirm::default();
+        let (outcome, _) = drive_confirm(&mut app, click(), b"f");
+        assert_eq!(app.forwards, [false]);
+        assert_eq!(outcome.exit, Exit::Closed);
+    }
+
+    #[test]
+    fn a_refused_forward_keeps_the_screen_up_carrying_the_reason() {
+        // Closing on a failure would take the explanation with it, and the
+        // explanation is the whole product here.
+        let mut app = FakeConfirm {
+            error: Some("local port 5173 is already in use by another process".to_string()),
+            ..FakeConfirm::default()
+        };
+        let (outcome, screen) = drive_confirm(&mut app, click(), b"\r");
+        assert_eq!(app.forwards, [true], "it must have been attempted");
+        assert_eq!(outcome.exit, Exit::Closed, "only EOF ended it");
+        let last = frames(&screen).last().copied().unwrap_or_default();
+        assert!(last.contains("already in use"), "{last}");
+    }
+
+    #[test]
+    fn escape_forwards_nothing_at_all() {
+        let mut app = FakeConfirm::default();
+        let (outcome, _) = drive_confirm(&mut app, click(), b"\x1b");
+        assert!(app.forwards.is_empty(), "esc is the way to say no");
+        assert_eq!(outcome.exit, Exit::Closed);
+        assert_eq!(outcome.handoff, None);
+    }
+
+    #[test]
+    fn a_click_with_no_host_refuses_the_forward_keys_and_says_why() {
+        let mut orphan = click();
+        orphan.host = None;
+        orphan.problem = Some("cannot tell which host to use".to_string());
+        let mut app = FakeConfirm::default();
+        let (_, screen) = drive_confirm(&mut app, orphan, b"\rf");
+        assert!(
+            app.forwards.is_empty(),
+            "there is no host, so nothing may be forwarded"
+        );
+        let last = frames(&screen).last().copied().unwrap_or_default();
+        assert!(last.contains("no host to forward from"), "{last}");
+    }
+
+    #[test]
+    fn the_cross_link_keys_leave_the_pane_naming_the_one_to_open_next() {
+        // The pane never opens anything itself: it is a popup, and Herdr keeps
+        // one popup slot which this pane is holding until its process exits.
+        for (key, expected) in [(b'l', Handoff::List), (b's', Handoff::Picker)] {
+            let mut app = FakeConfirm::default();
+            let (outcome, _) = drive_confirm(&mut app, click(), &[key]);
+            assert_eq!(outcome.handoff, Some(expected), "{}", key as char);
+            assert_eq!(outcome.exit, Exit::Closed);
+            assert!(app.forwards.is_empty(), "a cross-link forwards nothing");
+        }
+    }
+
+    #[test]
+    fn the_forward_manager_reaches_the_picker() {
+        // One click into any of these surfaces should reach the rest.
+        let mut app = FakeList {
+            rows: vec![row("buildbox", 5173, 5173, Some("mini: scholion"))],
+            ..FakeList::default()
+        };
+        let (outcome, _) = drive_list(&mut app, b"a");
+        assert_eq!(outcome.handoff, Some(Handoff::Picker));
+        assert!(app.stopped.is_empty(), "`a` must not stop anything");
+    }
+
+    #[test]
+    fn an_empty_forward_manager_still_offers_the_way_to_add_one() {
+        // The pane a user reaches with nothing forwarded is exactly where the
+        // way to forward something matters most, and its footer is not the
+        // populated one.
+        let page = render_list(&plain_list(Vec::new()));
+        assert!(page.contains("a add"), "{page}");
+        assert!(page.contains("press a to pick one"), "{page}");
     }
 
     /// Hands over one keystroke per read, the way a terminal does.

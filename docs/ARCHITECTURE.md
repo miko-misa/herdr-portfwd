@@ -69,6 +69,15 @@ load-bearing; if they change, this design changes.
    pane and the "Port: manage forwards" action — so the argv cannot be what
    decides which one is running.
 
+   The call also takes `--placement`, overriding the manifest's, and repeated
+   `--env KEY=VALUE` words that become the pane process's environment. Herdr
+   protects its own variables (`HERDR_PLUGIN_ID`, `HERDR_PLUGIN_CONTEXT_JSON`,
+   `HERDR_BIN_PATH` and friends) against being set this way; anything else gets
+   through, with only NUL bytes and an empty key rejected. **A pane command
+   receives no arguments beyond the argv its manifest entry declares**, so this
+   is one of only two ways to tell a pane anything: see "A pane that has to be
+   told something" below.
+
 9. **Which kind of command is running is only readable from the injected
    environment.** `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH` and `HERDR_PLUGIN_ID`
    arrive for every plugin command; `HERDR_PLUGIN_ACTION_ID` marks an action,
@@ -83,6 +92,69 @@ load-bearing; if they change, this design changes.
    command it spawns. A rule that consults the terminal before the injected
    variables therefore draws a pane into the plugin log and reads keys off a
    terminal Herdr is already reading.
+
+10. **There is exactly one popup slot, and a popup pane cannot close itself.**
+    `spawn_popup_command` refuses a second popup with `popup already open`
+    (surfacing as `plugin_pane_open_failed`), and Herdr closes a popup only when
+    its process dies — `AppEvent::PaneDied`. A popup pane command is also
+    launched with `PaneLaunchEnv::without_pane_identity`, so it has no
+    `HERDR_PANE_ID` to name to `herdr pane close`, and `popup.close` has no CLI.
+
+    `ui_busy` is a **different** refusal, and the plugin docs' mention of it for
+    this case is misleading: it fires when `state.mode != Mode::Terminal` —
+    Settings, Copy mode, a context menu — and opening a plugin popup sets the
+    mode back to `Terminal`. So a popup asking for a popup is not blocked by a
+    modal; it is blocked by the slot it is itself holding.
+
+    An overlay pane is not a popup and is not blocked by either: it is an
+    ordinary split pane, so Herdr opens it *behind* a live popup and reveals it
+    when that popup's process exits.
+
+## A pane that has to be told something
+
+`confirm` is the screen a Ctrl+click lands on. Unlike `list` and `picker` it
+cannot rebuild its own contents: it is about *one* click, and by the time it
+runs, the thing that knew which click has exited. Fact 8 leaves two ways to tell
+it — `--env`, or a file both sides agree on — and it uses the environment.
+
+One variable, `HERDR_PORTFWD_CONFIRM`, carrying one line of JSON: the validated
+URL, the host, both ports, whether the local port is free, whether the forward
+already exists, which side will apply it, the owning workspace and agent, and
+the pane the URL was printed in. `HERDR_PORTFWD_HOST` rides along so the pane
+resolves the host this click already resolved rather than re-deriving it from a
+context that has moved on.
+
+Why not a file: it would need a name, an owner and a deletion, and each of those
+is a way for the next click to render the previous click's URL; two clicks in
+quick succession are two environments but one path written twice; and the state
+directory rules below exist precisely because "somewhere the pane can find
+without being told" has more than one wrong answer. Nothing in the payload is a
+secret — the URL is already in Herdr's own `HERDR_PLUGIN_CLICKED_URL`.
+
+The pane trusts none of it. Under `--remote` the URL was written on the host,
+put in a variable on the host, and handed back, so `open_url_for` re-validates
+it with the same parser `open-url` used and forwards from the parsed parts.
+Invariant 11, one hop further out.
+
+### One pane reaching another
+
+`confirm` offers `l` (the `list` overlay) and `s` (the `picker`); `list` offers
+`a` (the `picker`). Fact 10 forces the ordering: a pane cannot exit and *then*
+ask, because a process that has exited asks nothing, and it cannot close itself
+first. So it asks while its own pane is still up, and the UI returns the request
+rather than making it — the pane loop ends, the caller asks Herdr, and only then
+does the process exit and take the pane with it.
+
+That works directly for every pair except popup → popup, which asks for the one
+slot the caller is holding. There the request carries `--placement overlay`:
+Herdr opens it behind the popup and reveals it the moment the popup goes. This
+is the only reason `--placement` is ever passed, since overriding it elsewhere
+would give one pane two shapes depending on who opened it.
+
+This is not the recursion invariant 10 forbids. That rule is about a command
+that *was not told enough* asking for a pane whose command would ask again; this
+is a key the user pressed, and the graph — `confirm` → `list` | `picker`,
+`list` → `picker` — has no cycle.
 
 ## Consequence: request and apply must be separable
 
@@ -116,7 +188,10 @@ The same request record drives both paths. Only the transport differs, and only
 A Ctrl+click asks for two things: the forward, and the page. Under `--remote`
 the plugin that handles the click can do neither, so the request carries an
 optional URL for whoever applies it, and the agent opens it once the forward is
-live. Everything else is unchanged, which is why the field is optional in both
+live. That optionality is also what makes the `confirm` pane's "forward only"
+key mean anything on the far side: the pane records the same forward and leaves
+the URL out, because carrying it and hoping the agent ignores it would open the
+window the user pressed a key specifically to avoid. Everything else is unchanged, which is why the field is optional in both
 directions: an agent older than the field applies the forward exactly as before
 and opens nothing, and a newer agent reading an older writer's record simply has
 no URL to open.
@@ -214,12 +289,21 @@ be cycle-guarded and depth-capped: PID reuse can produce a loop.
 
 | Level | Trigger | Who resolves ambiguity | Default |
 | --- | --- | --- | --- |
-| L1 explicit | Ctrl+click on a URL, or `add <port>` | the user pointed at it | on |
+| L1 explicit | Ctrl+click on a URL → the `confirm` pane, which forwards and optionally opens; or `add <port>` | the user pointed at it, then confirmed it | on |
 | L2 offer | new attributed listener → Herdr notification naming the port, the process, the pane, and the `add` that would forward it | the user runs it | on |
 | L3 auto | matches a user-declared allowlist for that workspace | the user configured it | off |
 
 Silent forwarding is never the default. L2's candidate set is already filtered
 by attribution, so infrastructure ports never reach a notification.
+
+**A click is an L1 trigger, not an L1 action.** It opens the `confirm` pane and
+nothing else happens until a key is pressed there, because a click that both
+opened a port and launched a browser gave the user no place to see what it was
+about to do — including the three things that screen now says out loud: the port
+is already forwarded, the local port is held by something else, or the URL
+belongs to a host this invocation cannot resolve. `confirm_on_click = false`
+restores the one-motion behaviour for people who preferred it. Either way the
+forward itself is the same L1 action; what changed is who gets asked first.
 
 **There is no accept key, and L2 cannot have one.** Herdr's notification API is
 `herdr notification show <title> --body <body>` — a toast, with no callback, no
@@ -254,6 +338,7 @@ Leaf modules have no dependencies on each other and are independently testable.
 | --- | --- | --- |
 | `cli` | argument parsing, subcommand dispatch | pure; parse-only tests |
 | `config` | `hosts.toml` (herdr-mirror compatible) + own settings | pure parse from `&str` |
+| `confirm` | the click payload the `confirm` pane is opened with | pure serde; env read at edge |
 | `context` | `HERDR_PLUGIN_CONTEXT_JSON` → host/workspace/pane resolution | pure; env read at edge |
 | `herdr` | Herdr CLI wrapper via `HERDR_BIN_PATH` | `HerdrClient` trait |
 | `ssh` | ControlMaster lifecycle, `-O forward/cancel/check` | `SshRunner` trait |
@@ -310,6 +395,18 @@ These are the properties tests must defend.
     a plugin log rather than a person, so as an action it asks for the picker.
     `--json`, and a shell invocation with no Herdr to ask, still get the printed
     report — `scan` alone has a complete answer without asking anybody.
+    `open-url` follows `scan`'s shape exactly: as an action it asks for the
+    `confirm` pane, at a terminal it draws it, and only an invocation with
+    nowhere to draw *and* no Herdr to ask — `--json`, or a shell whose output is
+    redirected — acts on the click instead, because a screen nobody can see is
+    worse than the forward the user asked for. A shell invocation at a terminal
+    is not that case: it draws the screen.
+
+    What this rule does **not** forbid is a pane opening another pane on a key
+    the user pressed: see "One pane reaching another". The recursion it guards
+    against is a command that was not told enough asking for a pane whose
+    command asks again, and a cross-link is neither missing anything nor
+    cyclic.
 11. Both ends of a forward are chosen on the machine that opens it: the
     listening end is bound to loopback explicitly rather than left to
     `GatewayPorts`, and a request's `remote_bind` is clamped to loopback rather

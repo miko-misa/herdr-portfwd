@@ -8,9 +8,10 @@
 //! courtesy herdr-mirror extends to its own candidate dirs.
 //!
 //! Behavior settings live in `~/.config/herdr-portfwd/config.toml`
-//! (`poll_seconds`, `offer_new_listeners`, `require_pane_attribution`, and the
-//! opt-in `[[auto]]` allowlist). A missing file means defaults, never an error:
-//! the plugin has to work for someone who never wrote one.
+//! (`poll_seconds`, `offer_new_listeners`, `require_pane_attribution`,
+//! `confirm_on_click`, and the opt-in `[[auto]]` allowlist). A missing file
+//! means defaults, never an error: the plugin has to work for someone who never
+//! wrote one.
 //!
 //! Parsing is callable as `parse_hosts(&str)` / `parse_settings(&str)` with no
 //! I/O so it can be tested against fixtures; only `load_*` touches a disk.
@@ -240,6 +241,15 @@ pub struct Settings {
     /// When false, listeners whose ancestry reaches no pane are offered too.
     /// Off-by-default noise: a real host's listener list is mostly daemons.
     pub require_pane_attribution: bool,
+    /// Whether a Ctrl+clicked loopback URL lands on the `confirm` pane first.
+    ///
+    /// On by default: a click is an L1 action, and an L1 action that both opens
+    /// a port and launches a browser with nothing in between gives the user no
+    /// place to see what is about to happen. Setting it false restores the
+    /// one-motion forward-and-open. Read where the *plugin* runs, which under
+    /// `herdr --remote` is the remote host — the same side that puts up the
+    /// pane.
+    pub confirm_on_click: bool,
     pub auto: Vec<AutoRule>,
 }
 
@@ -249,6 +259,7 @@ impl Default for Settings {
             poll_seconds: DEFAULT_POLL_SECONDS,
             offer_new_listeners: true,
             require_pane_attribution: true,
+            confirm_on_click: true,
             auto: Vec::new(),
         }
     }
@@ -273,6 +284,7 @@ struct RawSettings {
     poll_seconds: Option<u64>,
     offer_new_listeners: Option<bool>,
     require_pane_attribution: Option<bool>,
+    confirm_on_click: Option<bool>,
     #[serde(default)]
     auto: Vec<RawAuto>,
 }
@@ -322,6 +334,7 @@ pub fn parse_settings(text: &str) -> Result<Settings> {
         require_pane_attribution: raw
             .require_pane_attribution
             .unwrap_or(defaults.require_pane_attribution),
+        confirm_on_click: raw.confirm_on_click.unwrap_or(defaults.confirm_on_click),
         auto,
     })
 }
@@ -555,6 +568,10 @@ always_control = false
         assert_eq!(defaults.poll_seconds, 5);
         assert!(defaults.offer_new_listeners);
         assert!(defaults.require_pane_attribution);
+        assert!(
+            defaults.confirm_on_click,
+            "a click lands on the confirm pane unless the user turned it off"
+        );
         assert!(defaults.auto.is_empty(), "L3 is off until asked for");
         assert_eq!(parse_settings("").expect("empty file"), defaults);
 
@@ -570,6 +587,7 @@ always_control = false
     fn settings_round_trip_from_a_full_file() {
         let settings = parse_settings(
             "poll_seconds = 15\noffer_new_listeners = false\nrequire_pane_attribution = false\n\
+             confirm_on_click = false\n\
              [[auto]]\nworkspace = \"mini: scholion\"\nports = [5173, 3000]\n\
              [[auto]]\nworkspace = \"w1\"\nports = [65535]\n",
         )
@@ -577,6 +595,10 @@ always_control = false
         assert_eq!(settings.poll_seconds, 15);
         assert!(!settings.offer_new_listeners);
         assert!(!settings.require_pane_attribution);
+        assert!(
+            !settings.confirm_on_click,
+            "confirm_on_click = false must restore the immediate forward-and-open"
+        );
         assert!(settings.auto_allows("mini: scholion", 5173));
         assert!(settings.auto_allows("w1", 65535));
         assert!(

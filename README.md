@@ -10,11 +10,13 @@ forwards without leaving Herdr.
 *[日本語版 README](README.ja.md)*
 
 Your agent runs `npm run dev` on a build box and prints
-`http://localhost:5173`. Ctrl+click it. The port is forwarded under the same
-number to the machine you are actually sitting at, and that machine's browser
-opens the page — immediately with herdr-mirror, and within one poll of the local
-agent (5 seconds by default) under `herdr --remote`, where the forward can only
-be made by the half of this tool that runs on your machine.
+`http://localhost:5173`. Ctrl+click it. A screen says which host, which port,
+and what pressing a key will do; nothing is forwarded and no browser opens until
+you answer it. Press enter and the port is forwarded under the same number to
+the machine you are actually sitting at, and that machine's browser opens the
+page — immediately with herdr-mirror, and within one poll of the local agent
+(5 seconds by default) under `herdr --remote`, where the forward can only be
+made by the half of this tool that runs on your machine.
 
 ## What makes it different from `ssh -L`
 
@@ -150,7 +152,8 @@ where a plugin runs. `herdr-portfwd` supports both, but setup differs.
 
 The plugin runs on your machine, so it can do the whole job itself. Install it
 locally, bind keys in your local `~/.config/herdr/config.toml`, and reload. A
-Ctrl+click forwards the port and opens the browser in the same breath.
+Ctrl+click opens the confirmation, and enter there forwards the port and opens
+the browser in the same breath.
 
 One thing does not run in this mode: the polling that notices new listeners,
 raises the L2 offers, and honours the `[[auto]]` allowlist lives in the local
@@ -219,18 +222,60 @@ bound to a plugin action does not fire on either side.
 ## Usage
 
 **Ctrl+click a URL.** Any `http://localhost:PORT`, `http://127.0.0.1:PORT` or
-`http://[::1]:PORT` in a pane — `https` too — routes to the plugin: the port is
-forwarded, then opened on your machine. Ctrl+click rather than Cmd+click, on
-every platform, because captured terminal mouse reports cannot tell Cmd+click
-from a plain click.
+`http://[::1]:PORT` in a pane — `https` too — routes to the plugin. Ctrl+click
+rather than Cmd+click, on every platform, because captured terminal mouse
+reports cannot tell Cmd+click from a plain click.
 
-What happens next differs by mode. With herdr-mirror the plugin is already on
-your machine: it forwards the port and hands the URL to your browser, in one
-step. Under `herdr --remote` the click is handled on the remote, which puts up a
-notification and queues the forward with the URL attached; your local agent
-makes the forward and opens the browser on its next poll — up to `poll_seconds`
-later, 5 seconds by default. Nothing opens if no agent is running, which is what
-`herdr-portfwd attach` is for.
+The click opens a confirmation, and nothing happens until you answer it:
+
+```
+Forward a port from buildbox ---------------------------
+
+  mini: scholion    claude
+  remote 5173  ->  localhost 5173   (free)
+  http://localhost:5173/app
+
+  enter   forward and open in the browser
+  f       forward only
+  l       see the forwards already up
+  s       look for other ports on this host
+  esc     cancel
+```
+
+The screen says what it knows and nothing it does not. If the port is already
+forwarded it says so and `enter` only opens the page. If the local port is held
+by something else it says that too, and still never picks a different port on
+its own — see [It does not silently
+renumber](#what-makes-it-different-from-ssh--l). If
+the URL belongs to a host this invocation cannot resolve, it offers nothing to
+forward and puts the reason on screen instead of in a log you would have to go
+looking for. Those first two are questions about the machine that would bind the
+port, and under `herdr --remote` that is not the machine showing the screen: it
+leaves the note after the port mapping off rather than guessing at it, and says
+the local agent will apply the forward instead.
+
+`confirm_on_click = false` turns the screen off and restores the older
+behaviour, where a click forwarded the port and opened the browser in one
+motion. See [Configuration](#configuration).
+
+The screen also needs somewhere to appear, and when there is nowhere it is the
+screen that is skipped rather than the click. `herdr-portfwd open-url` at a
+terminal draws it there; with `--json`, or with the output redirected and no
+Herdr to ask for a pane, the click is acted on and the outcome printed. A click
+that arrives while Herdr's one popup slot is already held — by the picker, or by
+a previous confirmation — is forwarded too, with the reason on stderr and in a
+Herdr notification, because a screen nobody can see is worse than the forward
+you asked for.
+
+What "forward" means still differs by mode. With herdr-mirror the plugin is
+already on your machine, so `enter` makes the forward and hands the URL to your
+browser there and then. Under `herdr --remote` the plugin — and the confirmation
+— run on the remote, where neither a local port nor your browser exists; `enter`
+records the forward with the URL attached, and your local agent applies it and
+opens the browser on its next poll, up to `poll_seconds` later, 5 seconds by
+default. Nothing opens if no agent is running, which is what
+`herdr-portfwd attach` is for. `f` records the same forward with no URL, so
+nothing opens on either machine.
 
 **Pick from a list.** The `scan` action shows the attributed listeners on the
 selected host in a picker pane and forwards the ones you select.
@@ -239,6 +284,10 @@ selected host in a picker pane and forwards the ones you select.
 forward for the selected host, its owning pane, and a key to stop it. Both act on
 one host at a time — the one the invocation resolves to, or the one `--host`
 names.
+
+The three surfaces reach each other: `l` and `s` on the confirmation open the
+manager and the picker, and `a` on the manager opens the picker. One click gets
+you to all of them.
 
 ### Actions
 
@@ -249,7 +298,15 @@ names.
 | `portfwd.list` | overlay of live forwards, with stop keys |
 | `portfwd.stop` | stop a selected forward |
 | `portfwd.stop-all` | stop every forward for the current host |
-| `portfwd.open-url` | link-handler target; forward, then open locally |
+| `portfwd.open-url` | link-handler target; opens the confirmation for the clicked URL, and acts on the click directly when the confirmation is turned off or cannot be shown |
+
+### Panes
+
+| Pane | Is |
+| --- | --- |
+| `list` | overlay of live forwards; `enter` stops one, `X` stops all, `a` opens the picker |
+| `picker` | popup over attributed listeners; `space` marks, `enter` forwards |
+| `confirm` | popup a Ctrl+click lands on; `enter` forwards and opens, `f` forwards only, `l`/`s` open the other two |
 
 ### Keybindings
 
@@ -332,6 +389,11 @@ offer_new_listeners = true
 # Only consider listeners that belong to a Herdr pane. Default: true.
 # Read by the agent, and by `scan` wherever `scan` runs.
 require_pane_attribution = true
+
+# Land a Ctrl+click on the confirmation pane instead of forwarding and opening
+# the browser in one motion. Default: true. Read where the *plugin* runs, which
+# under `herdr --remote` is the remote host — the same side that shows the pane.
+confirm_on_click = true
 
 # Opt-in automatic forwarding, matched per workspace. Empty by default, and
 # acted on only by the agent.

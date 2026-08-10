@@ -54,6 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::config::{self, HostsConfig, Settings};
+use crate::confirm::ConfirmState;
 use crate::context::{self, HostSource, Invocation};
 use crate::discover::{self, ProcessTree};
 use crate::herdr::{HerdrClient, Notification};
@@ -923,14 +924,41 @@ impl Actions<'_> {
 
     // -- open-url -----------------------------------------------------------
 
+    /// The URL a click carried, from the argument or from the context Herdr
+    /// injected.
+    fn clicked(&self, url: Option<&str>) -> Result<String> {
+        url.map(str::to_string)
+            .or_else(|| self.env.context.clicked_url.clone())
+            .ok_or(ActionError::NoUrl)
+    }
+
     /// Forward the port in a loopback URL and open it on this machine.
     pub fn open_url(&self, url: Option<&str>) -> Result<OpenOutcome> {
-        let raw = url
-            .map(str::to_string)
-            .or_else(|| self.env.context.clicked_url.clone())
-            .ok_or(ActionError::NoUrl)?;
-        let parsed = parse_loopback_url(&raw).map_err(|reason| ActionError::InvalidUrl {
-            url: raw.clone(),
+        let raw = self.clicked(url)?;
+        self.open_url_for(&raw, self.env.context.pane_id.clone(), true)
+    }
+
+    /// [`Actions::open_url`], with the pane the URL belongs to named and the
+    /// browser optional.
+    ///
+    /// Both extras exist for the `confirm` pane. It runs in a popup Herdr
+    /// launched *without* a pane identity, and the context it is handed names
+    /// whatever pane is focused when the popup opens rather than the one that
+    /// printed the URL — so attribution has to be passed in, or the forward
+    /// belongs to the wrong pane and `reconcile` releases it at the wrong
+    /// moment. And "forward only" is a choice the screen offers, which here
+    /// means: apply exactly the same forward, and hand nobody the URL.
+    pub fn open_url_for(
+        &self,
+        raw: &str,
+        pane_id: Option<String>,
+        open_browser: bool,
+    ) -> Result<OpenOutcome> {
+        // Re-validated even when the caller says it already did: under
+        // `herdr --remote` this string made a round trip through an environment
+        // variable on the host whose terminal printed it. Invariant 11.
+        let parsed = parse_loopback_url(raw).map_err(|reason| ActionError::InvalidUrl {
+            url: raw.to_string(),
             reason,
         })?;
 
@@ -943,7 +971,7 @@ impl Actions<'_> {
             local_port: parsed.port,
             remote_bind: LOOPBACK.to_string(),
             origin: Origin::Explicit,
-            pane_id: self.env.context.pane_id.clone(),
+            pane_id,
         };
         // Re-rendered from the validated parts rather than passed through as
         // the raw click text, and pinned to the port this request asks for, so
@@ -952,9 +980,20 @@ impl Actions<'_> {
         // written, and only the local branch — which opens the URL here — can
         // meet a remap at all.
         let requested_url = parsed.with_port(spec.local_port);
-        let add =
-            self.apply_or_request_opening(&resolved.host, spec, placement, Some(&requested_url))?;
+        // A forward the user asked for without a browser carries no URL into
+        // the request either: the agent opens what the record tells it to, so
+        // leaving it out is the only way "forward only" survives the trip.
+        let carried = open_browser.then_some(requested_url.as_str());
+        let add = self.apply_or_request_opening(&resolved.host, spec, placement, carried)?;
         let local_url = parsed.with_port(add.spec.local_port);
+
+        if !open_browser {
+            return Ok(OpenOutcome {
+                url: local_url,
+                add,
+                opened: false,
+            });
+        }
 
         if placement.is_local() {
             self.opener
@@ -981,6 +1020,65 @@ impl Actions<'_> {
             add,
             opened: false,
         })
+    }
+
+    /// Everything the `confirm` pane needs to describe a click, without doing
+    /// any of it.
+    ///
+    /// A URL that cannot be forwarded at all is still an error — there is
+    /// nothing to confirm about a click this tool will never act on, and the
+    /// refusal names the reason. A host that cannot be *resolved* is not: that
+    /// is a question the screen can put to a person, so it becomes
+    /// [`crate::confirm::ConfirmState::problem`] rather than a failure in a log
+    /// nobody is reading.
+    pub fn preview_open_url(&self, url: Option<&str>) -> Result<ConfirmState> {
+        let raw = self.clicked(url)?;
+        let parsed = parse_loopback_url(&raw).map_err(|reason| ActionError::InvalidUrl {
+            url: raw.clone(),
+            reason,
+        })?;
+        let mut state = ConfirmState {
+            url: parsed.with_port(parsed.port),
+            remote_port: parsed.port,
+            local_port: parsed.port,
+            workspace: self.env.context.workspace_label.clone(),
+            agent: self.env.context.agent.clone(),
+            pane_id: self.env.context.pane_id.clone(),
+            ..ConfirmState::default()
+        };
+
+        let resolved = match self.resolve() {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                state.problem = Some(err.to_string());
+                return Ok(state);
+            }
+        };
+        let placement = self.locate_resolved(&resolved);
+        state.host = Some(resolved.host.name.clone());
+        state.applies_here = placement.is_local();
+        // Both of the next two are questions about the machine that would bind
+        // the port, and under `herdr --remote` this process is not on it. The
+        // records live beside the local agent that applies the forwards, and
+        // the store reachable from here has never seen one — so reading it
+        // would answer `false` to a question it cannot hear. `None` says so,
+        // exactly as it does for the port probe below.
+        state.already_forwarded = if placement.is_local() {
+            Some(
+                self.store
+                    .get(&resolved.host.name, parsed.port)?
+                    .is_some_and(|forward| forward.spec.remote_port == parsed.port),
+            )
+        } else {
+            None
+        };
+        // Only meaningful on the machine that would bind it. On the far side
+        // every candidate is by construction a listener on *this* host, so a
+        // probe here answers a different question; `None` says so.
+        state.local_free = placement
+            .is_local()
+            .then(|| !self.ports.in_use(parsed.port));
+        Ok(state)
     }
 
     // -- list ---------------------------------------------------------------
@@ -2987,6 +3085,208 @@ mod tests {
             1,
             "the forward itself succeeded and stays recorded"
         );
+    }
+
+    // -- the confirmation a click lands on -----------------------------------
+
+    #[test]
+    fn a_preview_describes_the_click_and_changes_nothing() {
+        // The screen is drawn before anything happens, so building it must not
+        // open a socket, write a record, or start a browser.
+        let harness = Harness::simple();
+        let mut e = env(vec![host("buildbox", None)]);
+        e.context.clicked_url = Some("  HTTP://LocalHost:5173/app?x=1  ".into());
+        e.context.workspace_label = Some("mini: scholion".into());
+        e.context.agent = Some("claude".into());
+        e.context.pane_id = Some("w1:p1".into());
+        let state = harness.actions(e).preview_open_url(None).expect("preview");
+
+        // Re-rendered from the validated parts, exactly as a request's URL is.
+        assert_eq!(state.url, "http://localhost:5173/app?x=1");
+        assert_eq!(state.remote_port, 5173);
+        assert_eq!(state.local_port, 5173, "a click never remaps");
+        assert_eq!(state.host.as_deref(), Some("buildbox"));
+        assert_eq!(state.local_free, Some(true));
+        assert_eq!(state.already_forwarded, Some(false));
+        assert!(state.applies_here);
+        assert_eq!(state.workspace.as_deref(), Some("mini: scholion"));
+        assert_eq!(state.agent.as_deref(), Some("claude"));
+        assert_eq!(state.pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(state.problem, None);
+
+        assert!(harness.ssh.calls().is_empty(), "a preview forwards nothing");
+        assert!(harness.store.list().expect("list").is_empty());
+        assert!(harness.requests.pending().expect("pending").is_empty());
+        assert!(harness.opener.opened().is_empty());
+    }
+
+    #[test]
+    fn a_preview_of_a_port_already_forwarded_says_so() {
+        let harness = Harness::new(
+            FakeSsh::new(),
+            FakeHerdr::default(),
+            FakePorts::taken(&[5173]),
+        );
+        harness
+            .store
+            .upsert(forward("buildbox", 5173, 5173, Origin::Explicit, None))
+            .expect("seed");
+        let state = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .preview_open_url(Some("http://localhost:5173/"))
+            .expect("preview");
+        assert_eq!(state.already_forwarded, Some(true));
+        // The port reads as taken because our own forward holds it, which the
+        // screen must not render as a collision.
+        assert_eq!(state.local_free, Some(false));
+        assert!(!state.port_taken());
+    }
+
+    #[test]
+    fn a_preview_of_a_port_something_else_holds_reports_the_conflict() {
+        let harness = Harness::new(
+            FakeSsh::new(),
+            FakeHerdr::default(),
+            FakePorts::taken(&[5173]),
+        );
+        let state = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .preview_open_url(Some("http://localhost:5173/"))
+            .expect("preview");
+        assert_eq!(state.already_forwarded, Some(false));
+        assert!(state.port_taken(), "invariant 1 has to be visible up front");
+    }
+
+    #[test]
+    fn a_preview_on_the_far_side_answers_none_rather_than_guessing() {
+        let harness = Harness::simple();
+        // A record on *this* side, which under `herdr --remote` is the host and
+        // not the machine the forward would be made on. Whatever it says is an
+        // answer to a different question.
+        harness
+            .store
+            .upsert(forward("buildbox", 5173, 5173, Origin::Explicit, None))
+            .expect("seed");
+        let mut e = env(vec![host("buildbox", None)]);
+        e.placement = Some(Placement::Remote);
+        let state = harness
+            .actions(e)
+            .preview_open_url(Some("http://localhost:5173/"))
+            .expect("preview");
+        assert!(!state.applies_here);
+        assert_eq!(
+            state.local_free, None,
+            "this side cannot know what the user's machine has bound"
+        );
+        assert_eq!(
+            state.already_forwarded, None,
+            "nor which forwards it already holds; the records that would answer \
+             live beside the local agent, not here"
+        );
+        assert!(harness.ports.asked().is_empty());
+    }
+
+    #[test]
+    fn a_click_for_a_host_that_cannot_be_resolved_is_a_screen_not_a_failure() {
+        // The command runs headless with its output going to a plugin log, so
+        // failing here means the user Ctrl+clicked and saw nothing at all. The
+        // reason belongs on the screen the click was already opening.
+        let harness = Harness::simple();
+        let state = harness
+            .actions(env(Vec::new()))
+            .preview_open_url(Some("http://localhost:5173/"))
+            .expect("an unresolvable host is a question, not an error");
+        assert_eq!(state.host, None);
+        assert!(!state.actionable());
+        let problem = state.problem.expect("the reason has to be carried");
+        assert!(problem.contains("no hosts are configured"), "{problem}");
+    }
+
+    #[test]
+    fn a_click_this_tool_will_never_act_on_is_still_refused_outright() {
+        // Nothing to confirm about a URL that can never be forwarded, and the
+        // manifest pattern is not the only thing that has to reject it.
+        let harness = Harness::simple();
+        let err = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .preview_open_url(Some("http://localhost@evil.com:80/"))
+            .expect_err("hostile");
+        assert!(matches!(err, ActionError::InvalidUrl { .. }), "{err}");
+    }
+
+    #[test]
+    fn forward_only_makes_the_forward_and_opens_nothing() {
+        let harness = Harness::simple();
+        let outcome = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .open_url_for("http://localhost:5173/app", Some("w1:p1".into()), false)
+            .expect("forward only");
+        assert_eq!(outcome.add.applied, Applied::Forwarded);
+        assert!(!outcome.opened);
+        assert!(
+            harness.opener.opened().is_empty(),
+            "`f` is the key that opens nothing"
+        );
+        // The forward itself is exactly the one `enter` would have made.
+        let recorded = harness.store.list().expect("list");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].spec.local_port, 5173);
+        assert_eq!(recorded[0].spec.pane_id.as_deref(), Some("w1:p1"));
+    }
+
+    #[test]
+    fn forward_only_on_the_far_side_hands_the_agent_no_url_to_open() {
+        // Under `herdr --remote` the browser belongs to the agent, so "forward
+        // only" survives the trip only by leaving the URL out of the record.
+        // Carrying it and hoping the agent ignores it would open a window the
+        // user pressed a key specifically to avoid.
+        let harness = Harness::simple();
+        let mut e = env(vec![host("buildbox", None)]);
+        e.placement = Some(Placement::Remote);
+        let outcome = harness
+            .actions(e)
+            .open_url_for("http://localhost:5173/", None, false)
+            .expect("request");
+        assert_eq!(outcome.add.applied, Applied::Requested);
+        let pending = harness.requests.pending().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].open_url, None);
+        assert!(
+            harness.herdr.notifications().is_empty(),
+            "there is no page to promise"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_click_is_attributed_to_the_pane_that_printed_the_url() {
+        // The confirm pane runs in a popup Herdr launched without a pane
+        // identity, and its context names whatever pane is focused when the
+        // popup opens. Deriving attribution there would hand the forward to the
+        // wrong pane, and `reconcile` releases a forward when its pane exits.
+        let harness = Harness::simple();
+        let mut e = env(vec![host("buildbox", None)]);
+        e.context.pane_id = Some("the-popups-idea-of-focus".into());
+        harness
+            .actions(e)
+            .open_url_for("http://localhost:5173/", Some("w1:clicked".into()), true)
+            .expect("open");
+        let recorded = harness.store.list().expect("list");
+        assert_eq!(recorded[0].spec.pane_id.as_deref(), Some("w1:clicked"));
+    }
+
+    #[test]
+    fn a_url_that_reached_the_pane_through_the_environment_is_validated_again() {
+        // Invariant 11 at the third hop: under `--remote` this string was
+        // written on the host, put in an environment variable there, and handed
+        // back. The pane trusts none of that.
+        let harness = Harness::simple();
+        let err = harness
+            .actions(env(vec![host("buildbox", None)]))
+            .open_url_for("http://localhost@evil.com:80/", None, true)
+            .expect_err("hostile");
+        assert!(matches!(err, ActionError::InvalidUrl { .. }), "{err}");
+        assert!(harness.ssh.calls().is_empty());
+        assert!(harness.opener.opened().is_empty());
     }
 
     // -- stop / stop-all -----------------------------------------------------

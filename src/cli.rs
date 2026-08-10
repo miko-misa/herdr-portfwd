@@ -79,6 +79,9 @@ pub enum Command {
 
     /// Forward the port in a loopback URL, then open it locally. This is the
     /// link-handler target; the URL arrives in `HERDR_PLUGIN_CLICKED_URL`.
+    ///
+    /// With `confirm_on_click` left at its default this opens the `confirm`
+    /// pane instead of acting, and the pane performs whatever the user picks.
     OpenUrl {
         /// URL. Falls back to the clicked-URL environment variable.
         url: Option<String>,
@@ -111,6 +114,8 @@ pub enum PaneEntrypoint {
     List,
     /// Popup for picking from attributed remote listeners.
     Picker,
+    /// Popup that says what a clicked URL is about to do, and asks.
+    Confirm,
 }
 
 #[cfg(test)]
@@ -137,6 +142,7 @@ mod tests {
             vec!["herdr-portfwd", "reconcile", "--event"],
             vec!["herdr-portfwd", "pane-ui", "list"],
             vec!["herdr-portfwd", "pane-ui", "picker"],
+            vec!["herdr-portfwd", "pane-ui", "confirm"],
         ] {
             Cli::try_parse_from(&argv)
                 .unwrap_or_else(|err| panic!("manifest argv {argv:?} does not parse: {err}"));

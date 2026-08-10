@@ -184,6 +184,32 @@ esac
         Run::new(args, command.output().expect("spawn the binary"))
     }
 
+    /// [`Sandbox::run_with`], with keystrokes waiting on stdin.
+    ///
+    /// A pane reads keys from stdin and paints frames to stdout, and neither is
+    /// a terminal here — `RawMode::enter` says so and leaves the tty alone,
+    /// which is exactly what a pane whose streams Herdr captured does. So the
+    /// keys a user would press are bytes and the frame is text, and the half of
+    /// this tool that only runs after a key press becomes reachable from a
+    /// test without a pty.
+    ///
+    /// stdin is closed after the keys, so a pane that consumed them and drew
+    /// again reaches EOF and exits instead of hanging.
+    fn run_with_stdin(&self, args: &[&str], env: &[(&str, &str)], keys: &str) -> Run {
+        use std::io::Write as _;
+
+        let mut command = self.command();
+        command.args(args).stdin(Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn the binary");
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        stdin.write_all(keys.as_bytes()).expect("write the keys");
+        drop(stdin);
+        Run::new(args, child.wait_with_output().expect("wait for the binary"))
+    }
+
     /// Contents of a log one of the fakes appends to, or empty when nothing
     /// ever called it.
     fn log(&self, name: &str) -> String {
@@ -379,6 +405,7 @@ fn the_manifest_declares_the_commands_this_test_file_thinks_it_does() {
         "open-url",
         "pane-ui list",
         "pane-ui picker",
+        "pane-ui confirm",
     ] {
         assert!(
             flattened.contains(expected),
@@ -439,11 +466,98 @@ fn the_plugin_and_pane_ids_the_binary_names_are_the_ones_the_manifest_declares()
     );
     assert_eq!(
         manifest_ids("panes"),
-        ["list", "picker"]
+        ["confirm", "list", "picker"]
             .iter()
             .map(|id| (*id).to_string())
             .collect::<BTreeSet<String>>(),
     );
+}
+
+/// The `placement` a `[[panes]]` entry declares.
+fn manifest_pane(id: &str) -> toml::Table {
+    manifest()
+        .get("panes")
+        .and_then(|value| value.as_array())
+        .expect("the manifest has [[panes]]")
+        .iter()
+        .find(|entry| entry.get("id").and_then(|value| value.as_str()) == Some(id))
+        .and_then(|entry| entry.as_table())
+        .unwrap_or_else(|| panic!("the manifest declares no pane {id:?}"))
+        .clone()
+}
+
+#[test]
+fn the_placements_the_binary_reasons_about_are_the_ones_the_manifest_declares() {
+    // `is_popup` in src/main.rs copies these, and it has to: the placement is
+    // what decides whether one pane handing off to another must ask for an
+    // overlay, because Herdr keeps exactly one popup slot and a pane handing
+    // off is still holding its own. A manifest change that makes `list` a popup
+    // without changing that function would produce a handoff Herdr refuses with
+    // `popup already open`, at runtime, in front of a user.
+    for (id, placement) in [
+        ("list", "overlay"),
+        ("picker", "popup"),
+        ("confirm", "popup"),
+    ] {
+        assert_eq!(
+            manifest_pane(id).get("placement").and_then(|v| v.as_str()),
+            Some(placement),
+            "pane {id:?} changed placement; update `is_popup` in src/main.rs too"
+        );
+    }
+}
+
+#[test]
+fn the_confirm_popup_is_declared_tall_enough_for_its_own_tallest_frame() {
+    // The renderer drops blank lines and then explanatory sentences when the
+    // popup is shorter than the frame, so a manifest height below what the
+    // screen needs loses them silently — and once they are gone, rows the
+    // screen exists for.
+    //
+    // The two numbers are not the same number. Herdr's `height` is the *outer*
+    // popup: `resolve_popup_geometry` hands the pane command
+    // `outer_height - 2` rows, the border taking the rest. Asserting equality
+    // here is what let the pane be declared two rows shorter than the frame it
+    // has to hold.
+    let declared = manifest_pane("confirm")
+        .get("height")
+        .and_then(|value| value.as_integer())
+        .expect("the confirm pane declares a height");
+    assert_eq!(
+        usize::try_from(declared).expect("a sane height"),
+        herdr_portfwd::ui::CONFIRM_HEIGHT + herdr_portfwd::ui::POPUP_BORDER_ROWS,
+        "the manifest declares the outer popup; the pane process gets \
+         {} rows of it",
+        herdr_portfwd::ui::POPUP_BORDER_ROWS,
+    );
+}
+
+#[test]
+fn every_declared_popup_leaves_its_pane_the_rows_the_renderer_asks_for() {
+    // The same subtraction, stated once for every popup rather than only for
+    // the one it was found on: a `[[panes]] height` is the outer box, so a
+    // popup declared with the renderer's own row count is always two rows
+    // short. `picker` renders from a snapshot whose height Herdr sets at
+    // launch, so it only has to be big enough to be usable at all.
+    for id in ["picker", "confirm"] {
+        let pane = manifest_pane(id);
+        assert_eq!(
+            pane.get("placement").and_then(|value| value.as_str()),
+            Some("popup"),
+            "pane {id:?} is not a popup any more; this test picked it for that"
+        );
+        let declared = pane
+            .get("height")
+            .and_then(|value| value.as_integer())
+            .unwrap_or_else(|| panic!("pane {id:?} declares no height"));
+        let usable = usize::try_from(declared).expect("a sane height")
+            - herdr_portfwd::ui::POPUP_BORDER_ROWS;
+        assert!(
+            usable >= 12,
+            "pane {id:?} declares {declared} rows, which is {usable} for the \
+             command once Herdr's border has taken its share"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +856,490 @@ fn open_url_on_the_far_side_queues_a_request_and_notifies_instead_of_opening() {
         sandbox.log("ssh.log"),
         "",
         "the far side has no master to talk to; the local agent owns that"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a click that asks first
+// ---------------------------------------------------------------------------
+//
+// Ctrl+click used to forward the port and open a browser in one motion, with
+// nothing in between. It now opens the `confirm` pane, and the pane performs
+// whatever the user picks.
+
+#[test]
+fn a_click_opens_the_confirmation_and_forwards_nothing_yet() {
+    let sandbox = Sandbox::new().with_host();
+    let run = sandbox.run_with(
+        &["open-url", "http://localhost:5173/app?x=1"],
+        &[
+            ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "remote"),
+        ],
+    );
+    run.succeeded();
+
+    let herdr = sandbox.log("herdr.log");
+    assert!(
+        herdr.contains("plugin pane open --plugin portfwd --entrypoint confirm"),
+        "the click never reached the confirmation:\n{herdr}"
+    );
+    // A pane command gets no arguments beyond its argv, so the click travels in
+    // the environment Herdr was asked to inject. Both parts have to be there or
+    // the pane draws a screen about nothing.
+    assert!(
+        herdr.contains("--env HERDR_PORTFWD_CONFIRM="),
+        "the pane was told nothing about the click:\n{herdr}"
+    );
+    assert!(
+        herdr.contains("http://localhost:5173/app?x=1"),
+        "the URL never reached the pane:\n{herdr}"
+    );
+    assert!(
+        herdr.contains("--env HERDR_PORTFWD_HOST=buildbox"),
+        "the pane would have to re-resolve the host:\n{herdr}"
+    );
+
+    // And nothing at all happened yet. That is the point of the screen.
+    assert_eq!(
+        sandbox.log("open.log"),
+        "",
+        "no browser before the user says"
+    );
+    assert_eq!(
+        sandbox.log("ssh.log"),
+        "",
+        "no forward before the user says"
+    );
+    assert!(!sandbox.state_file("requests.json").contains("5173"));
+    assert!(!sandbox.state_file("forwards.json").contains("5173"));
+}
+
+#[test]
+fn turning_the_confirmation_off_restores_the_one_motion_click() {
+    let sandbox = Sandbox::new().with_host();
+    fs::write(
+        sandbox.path("config/herdr-portfwd/config.toml"),
+        "confirm_on_click = false\n",
+    )
+    .expect("write config.toml");
+    let run = sandbox.run_with(
+        &["open-url", "http://localhost:5173/app"],
+        &[
+            ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "remote"),
+        ],
+    );
+    run.succeeded();
+    assert!(
+        !sandbox.log("herdr.log").contains("pane open"),
+        "the user asked for no screen:\n{}",
+        sandbox.log("herdr.log")
+    );
+    assert!(
+        sandbox.state_file("requests.json").contains("5173"),
+        "the forward the click asked for was never requested"
+    );
+}
+
+#[test]
+fn a_parsing_caller_still_gets_the_click_acted_on_rather_than_a_pane() {
+    // Same rule `scan` follows: `--json` names a caller that wants the outcome,
+    // and a plain shell invocation has nowhere to put a pane.
+    let sandbox = Sandbox::new().with_host();
+    let run = sandbox.run_with(
+        &["--json", "open-url", "http://localhost:5173/app"],
+        &[
+            ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "remote"),
+        ],
+    );
+    run.succeeded();
+    assert_eq!(run.json()["add"]["applied"], serde_json::json!("requested"));
+    assert!(!sandbox.log("herdr.log").contains("pane open"));
+
+    let shell = Sandbox::new().with_host();
+    shell
+        .run_with(
+            &["open-url", "http://localhost:5173/app"],
+            &[("HERDR_PORTFWD_MODE", "remote")],
+        )
+        .succeeded();
+    assert!(!shell.log("herdr.log").contains("pane open"));
+    assert!(shell.state_file("requests.json").contains("5173"));
+}
+
+#[test]
+fn the_confirmation_pane_refuses_rather_than_drawing_a_screen_about_nothing() {
+    let sandbox = Sandbox::new().with_host();
+    sandbox
+        .run_with(
+            &["pane-ui", "confirm"],
+            &[
+                ("HERDR_PLUGIN_ENTRYPOINT_ID", "confirm"),
+                ("HERDR_PLUGIN_ID", "portfwd"),
+            ],
+        )
+        .failed()
+        .stderr_mentions("no click to confirm");
+
+    // A payload that is not a click at all is a reason, not a blank screen.
+    sandbox
+        .run_with(
+            &["pane-ui", "confirm"],
+            &[
+                ("HERDR_PLUGIN_ENTRYPOINT_ID", "confirm"),
+                ("HERDR_PLUGIN_ID", "portfwd"),
+                ("HERDR_PORTFWD_CONFIRM", "not json"),
+            ],
+        )
+        .failed()
+        .stderr_mentions("HERDR_PORTFWD_CONFIRM");
+
+    assert!(
+        !sandbox.log("herdr.log").contains("pane open"),
+        "a pane that could not draw must not ask for another one:\n{}",
+        sandbox.log("herdr.log")
+    );
+}
+
+#[test]
+fn the_confirmation_pane_never_asks_herdr_for_a_confirmation_of_its_own() {
+    // The recursion guard at the command that now opens a pane: a pane's own
+    // command carries HERDR_PLUGIN_ENTRYPOINT_ID, and that alone stops it, even
+    // when Herdr also injected the action id the link handler runs under.
+    let sandbox = Sandbox::new().with_host();
+    let run = sandbox.run_with(
+        &["open-url", "http://localhost:5173/"],
+        &[
+            ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+            ("HERDR_PLUGIN_ENTRYPOINT_ID", "confirm"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "remote"),
+        ],
+    );
+    run.succeeded();
+    assert!(
+        !sandbox.log("herdr.log").contains("pane open"),
+        "the confirm pane asked for another pane:\n{}",
+        sandbox.log("herdr.log")
+    );
+    assert!(
+        sandbox.state_file("requests.json").contains("5173"),
+        "with nobody left to ask, the click has to be acted on"
+    );
+}
+
+#[test]
+fn a_click_carries_the_side_it_resolved_the_host_on_along_with_the_host() {
+    // Naming the host in the pane's environment resolves it as
+    // `HostSource::Explicit`, and `locate_resolved` reads anything but
+    // `WorkspacePrefix` as "no mirror prefix matched" — so the variable that
+    // stops the pane guessing the host also turns off the rule that decided
+    // which machine this click applies on. The pane would then re-derive
+    // placement from a popup context with no pane identity, and could queue a
+    // request for a forward it is standing on the machine to make.
+    let sandbox = Sandbox::new().with_host();
+    sandbox
+        .run_with(
+            &["open-url", "http://localhost:5173/app"],
+            &[
+                ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+                ("HERDR_PLUGIN_ID", "portfwd"),
+                ("HERDR_PORTFWD_MODE", "remote"),
+            ],
+        )
+        .succeeded();
+    let herdr = sandbox.log("herdr.log");
+    assert!(
+        herdr.contains("--env HERDR_PORTFWD_HOST=buildbox"),
+        "the pane would have to re-resolve the host:\n{herdr}"
+    );
+    assert!(
+        herdr.contains("--env HERDR_PORTFWD_MODE=remote"),
+        "the pane was told which host but not which side of the connection \
+         this click had already been placed on:\n{herdr}"
+    );
+
+    // And the other side, decided the same way and carried the same way.
+    let mirror = Sandbox::new().with_host();
+    mirror
+        .run_with(
+            &["open-url", "http://localhost:5173/app"],
+            &[
+                ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+                ("HERDR_PLUGIN_ID", "portfwd"),
+                ("HERDR_PORTFWD_MODE", "local"),
+            ],
+        )
+        .succeeded();
+    assert!(
+        mirror
+            .log("herdr.log")
+            .contains("--env HERDR_PORTFWD_MODE=local"),
+        "a click the mirror side owns must not hand the pane the far side:\n{}",
+        mirror.log("herdr.log")
+    );
+}
+
+#[test]
+fn a_click_herdr_will_not_show_a_screen_for_is_acted_on_rather_than_dropped() {
+    // There is exactly one popup slot, so a Ctrl+click while the picker is up
+    // gets `popup already open` back. Stopping there made the whole click a
+    // no-op: no forward, no browser, no toast, and a reason in a plugin log
+    // nobody is reading. Invariant 10 already settles it — a screen nobody can
+    // see is worse than the forward the user asked for.
+    let sandbox = Sandbox::new().with_host();
+    sandbox.script_in(
+        "herdr-bin",
+        "herdr",
+        r#"printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
+case "$1.$2.$3" in
+  plugin.pane.open)
+    echo "popup already open" >&2
+    exit 1
+    ;;
+esac
+case "$1.$2" in
+  pane.list)
+    echo '{"result":{"panes":[]}}'
+    ;;
+  workspace.list)
+    echo '{"result":{"workspaces":[]}}'
+    ;;
+  notification.show)
+    ;;
+  *)
+    echo "fake herdr: unsupported command $*" >&2
+    exit 2
+    ;;
+esac
+"#,
+    );
+    let run = sandbox.run_with(
+        &["open-url", "http://localhost:5173/app?x=1"],
+        &[
+            ("HERDR_PLUGIN_ACTION_ID", "portfwd.open-url"),
+            ("HERDR_PLUGIN_ID", "portfwd"),
+            ("HERDR_PORTFWD_MODE", "remote"),
+        ],
+    );
+    run.succeeded();
+
+    // The click did what it was for.
+    assert!(
+        sandbox.state_file("requests.json").contains("5173"),
+        "the click was dropped on the floor:\n{}",
+        sandbox.state_file("requests.json")
+    );
+    assert!(
+        sandbox
+            .state_file("requests.json")
+            .contains("http://localhost:5173/app?x=1"),
+        "the browser half of the click went missing too"
+    );
+    // And said so, on both channels this command has: the log, and the one
+    // surface a person sees without going looking.
+    run.stderr_mentions("popup already open");
+    assert!(
+        sandbox.log("herdr.log").contains("notification show"),
+        "the user was never told the screen had been skipped:\n{}",
+        sandbox.log("herdr.log")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the pane the click lands on, driven by keys
+// ---------------------------------------------------------------------------
+//
+// Everything above stops at the `plugin pane open` call. These start from the
+// other side of it: the process Herdr launches for that pane, told about the
+// click through the environment exactly as `confirm_env` writes it.
+
+/// The click payload Herdr would inject, as one line of JSON.
+///
+/// `pane_id` is deliberately not the pane the fake `herdr` reports as focused:
+/// a popup is launched without a pane identity and sees whatever pane happens
+/// to be focused when it opens, so a forward attributed from the context rather
+/// than from the payload belongs to the wrong pane and `reconcile` releases it
+/// at the wrong moment.
+const CLICKED_PANE: &str = "printed-the-url";
+
+fn confirm_payload() -> String {
+    format!(
+        r#"{{"url":"http://localhost:5173/app?x=1","remote_port":5173,"local_port":5173,"host":"buildbox","local_free":null,"already_forwarded":null,"applies_here":false,"workspace":"mini: scholion","agent":"claude","pane_id":"{CLICKED_PANE}"}}"#
+    )
+}
+
+/// What Herdr injects for the `confirm` pane it was asked to open, which is
+/// `confirm_env` plus the entrypoint id that marks the process as the pane.
+fn confirm_pane_env(payload: &str) -> Vec<(&str, &str)> {
+    vec![
+        ("HERDR_PLUGIN_ENTRYPOINT_ID", "confirm"),
+        ("HERDR_PLUGIN_ID", "portfwd"),
+        ("HERDR_PORTFWD_CONFIRM", payload),
+        ("HERDR_PORTFWD_HOST", "buildbox"),
+        ("HERDR_PORTFWD_MODE", "remote"),
+        // The context a popup really gets: some other pane, focused when the
+        // popup opened.
+        (
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"focused_pane_id":"some-other-pane","workspace_label":"mini: elsewhere"}"#,
+        ),
+    ]
+}
+
+#[test]
+fn the_confirm_entrypoint_draws_the_confirmation_and_not_another_pane() {
+    // `Ctx::open` maps `Pane::Confirm` to the confirmation, and nothing else
+    // pinned that: an arm pointing at the manager overlay or the picker draws a
+    // perfectly good screen about the wrong thing, exits 0, and leaves CI
+    // green.
+    let sandbox = Sandbox::new().with_host();
+    let payload = confirm_payload();
+    let run = sandbox.run_with(&["pane-ui", "confirm"], &confirm_pane_env(&payload));
+    run.succeeded();
+    let screen = run.stdout();
+
+    for expected in [
+        "Forward a port from buildbox",
+        "remote 5173  ->  localhost 5173",
+        "http://localhost:5173/app?x=1",
+        "enter   forward and open in the browser",
+        "esc     cancel",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "the confirmation never said {expected:?}:\n{screen}"
+        );
+    }
+    // The footers of the two panes it could have been pointed at instead.
+    assert!(
+        !screen.contains("q close"),
+        "this is the manager overlay, not the confirmation:\n{screen}"
+    );
+    assert!(
+        !screen.contains("space mark"),
+        "this is the picker, not the confirmation:\n{screen}"
+    );
+
+    // Drawing is all it did: the keys are what act.
+    assert_eq!(sandbox.log("open.log"), "");
+    assert_eq!(sandbox.log("ssh.log"), "");
+    assert!(!sandbox.state_file("requests.json").contains("5173"));
+}
+
+#[test]
+fn the_key_the_confirmation_offers_forwards_the_click_it_was_opened_for() {
+    // The callback behind `enter`. Both of the things it passes on come from
+    // the payload rather than from this process's own context, and both were
+    // uncovered: the URL, which is the one the terminal printed, and the pane
+    // it was printed in.
+    let sandbox = Sandbox::new().with_host();
+    let payload = confirm_payload();
+    let run = sandbox.run_with_stdin(&["pane-ui", "confirm"], &confirm_pane_env(&payload), "\r");
+    run.succeeded();
+
+    let requests = sandbox.state_file("requests.json");
+    assert!(
+        requests.contains("\"remote_port\": 5173"),
+        "enter forwarded nothing:\n{requests}"
+    );
+    assert!(
+        requests.contains(CLICKED_PANE),
+        "the forward was attributed to the pane the popup found focused rather \
+         than the one that printed the URL:\n{requests}"
+    );
+    assert!(!requests.contains("some-other-pane"), "{requests}");
+    assert!(
+        requests.contains("http://localhost:5173/app?x=1"),
+        "the applier was given no page to open, so `forward and open` opened \
+         nothing:\n{requests}"
+    );
+}
+
+#[test]
+fn forward_only_records_the_same_forward_and_hands_nobody_the_url() {
+    // The other half of the same callback: the flag really does travel, and it
+    // is the only thing that differs. Carrying the URL anyway and hoping the
+    // applier ignored it would open the window the user pressed `f` to avoid.
+    let sandbox = Sandbox::new().with_host();
+    let payload = confirm_payload();
+    let run = sandbox.run_with_stdin(&["pane-ui", "confirm"], &confirm_pane_env(&payload), "f");
+    run.succeeded();
+
+    let requests = sandbox.state_file("requests.json");
+    assert!(
+        requests.contains("\"remote_port\": 5173"),
+        "`f` forwarded nothing:\n{requests}"
+    );
+    assert!(
+        requests.contains(CLICKED_PANE),
+        "the forward lost its pane:\n{requests}"
+    );
+    assert!(
+        !requests.contains("http://localhost"),
+        "`forward only` handed the applier a page to open anyway:\n{requests}"
+    );
+    assert_eq!(
+        sandbox.log("open.log"),
+        "",
+        "and opened nothing here either"
+    );
+}
+
+#[test]
+fn a_cross_link_key_asks_herdr_for_the_pane_it_names_with_a_placement_that_can_open() {
+    // `Ctx::finish_pane` turns an `Outcome.handoff` into a `plugin pane open`,
+    // and the whole reason the UI returns the request instead of making it is
+    // that Herdr keeps one popup slot which this pane is still holding. Both
+    // halves — the entrypoint, and the `--placement overlay` that gets past the
+    // slot — were untested.
+    let sandbox = Sandbox::new().with_host();
+    let payload = confirm_payload();
+    sandbox
+        .run_with_stdin(&["pane-ui", "confirm"], &confirm_pane_env(&payload), "s")
+        .succeeded();
+    let herdr = sandbox.log("herdr.log");
+    assert!(
+        herdr.contains("plugin pane open --plugin portfwd --entrypoint picker --placement overlay"),
+        "`s` did not hand off to the picker in a shape Herdr can open while \
+         this popup still holds the slot:\n{herdr}"
+    );
+
+    // The manager is an overlay already, so it keeps the shape the manifest
+    // declares: overriding it there would give one pane two shapes depending on
+    // who opened it.
+    let listing = Sandbox::new().with_host();
+    listing
+        .run_with_stdin(&["pane-ui", "confirm"], &confirm_pane_env(&payload), "l")
+        .succeeded();
+    let herdr = listing.log("herdr.log");
+    let handoff = herdr
+        .lines()
+        .find(|line| line.contains("plugin pane open"))
+        .unwrap_or_else(|| panic!("`l` never asked for a pane:\n{herdr}"));
+    assert!(
+        handoff.contains("--entrypoint list"),
+        "`l` asked for the wrong pane: {handoff:?}"
+    );
+    assert!(
+        !handoff.contains("--placement"),
+        "an overlay is already openable behind a popup: {handoff:?}"
+    );
+
+    // Cancelling asks for nothing at all.
+    let quiet = Sandbox::new().with_host();
+    quiet
+        .run_with_stdin(&["pane-ui", "confirm"], &confirm_pane_env(&payload), "\x1b")
+        .succeeded();
+    assert!(
+        !quiet.log("herdr.log").contains("pane open"),
+        "esc opened a pane:\n{}",
+        quiet.log("herdr.log")
     );
 }
 

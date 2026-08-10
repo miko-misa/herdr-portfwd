@@ -111,12 +111,29 @@ impl<R: HerdrRunner> HerdrCli<R> {
     /// that knows it was started headless with nothing to draw on — needs this.
     ///
     /// A pane opens with no payload worth reading, so an empty echo is success,
-    /// exactly as for [`Self::notify`]. A refusal (`ui_busy` while another
-    /// modal is up, an entrypoint this Herdr does not know) arrives either as a
+    /// exactly as for [`Self::notify`]. A refusal (`ui_busy` while a modal mode
+    /// is up, `plugin_pane_open_failed` while a popup already holds the only
+    /// popup slot, an entrypoint this Herdr does not know) arrives either as a
     /// non-zero exit or as an error object, and both become an error here
     /// rather than a silently unopened pane.
     pub fn open_pane(&self, plugin_id: &str, entrypoint: &str) -> Result<()> {
-        let argv = plugin_pane_open_argv(plugin_id, entrypoint);
+        self.open_pane_with(plugin_id, entrypoint, None, &[])
+    }
+
+    /// [`Self::open_pane`], with a placement that overrides the manifest's and
+    /// environment for the pane process.
+    ///
+    /// Both exist for the same caller: a popup pane handing off to another
+    /// pane, and the `confirm` pane needing to be told which click it is
+    /// confirming. See [`plugin_pane_open_argv_with`].
+    pub fn open_pane_with(
+        &self,
+        plugin_id: &str,
+        entrypoint: &str,
+        placement: Option<&str>,
+        env: &[String],
+    ) -> Result<()> {
+        let argv = plugin_pane_open_argv_with(plugin_id, entrypoint, placement, env);
         let stdout = self.stdout(PLUGIN_PANE_OPEN, &argv)?;
         if stdout.trim().is_empty() {
             return Ok(());
@@ -289,7 +306,30 @@ pub fn notification_argv(notification: &Notification) -> Vec<String> {
 /// command opened it. Both ids are separate argv words, so neither can be read
 /// as an option however it is spelled.
 pub fn plugin_pane_open_argv(plugin_id: &str, entrypoint: &str) -> Vec<String> {
-    vec![
+    plugin_pane_open_argv_with(plugin_id, entrypoint, None, &[])
+}
+
+/// [`plugin_pane_open_argv`], with the two options a pane opening another pane
+/// needs.
+///
+/// **`placement`** overrides the manifest's, and there is exactly one reason to
+/// pass it: Herdr keeps a single popup slot (`spawn_popup_command` refuses a
+/// second with `popup already open`), so a popup asking for a popup is asking
+/// for the slot it is itself holding. Asking for an overlay instead gets a pane
+/// Herdr opens *behind* the popup and reveals the moment the popup's process
+/// exits. Nothing else may pass one, for the reason above.
+///
+/// **`env`** carries `KEY=VALUE` words for the pane process. Each is one argv
+/// word after its own `--env`, so a value with a space, a `;` or a `$(` in it
+/// is bytes rather than syntax — invariant 9, at the one place this crate hands
+/// a value it did not choose to another program.
+pub fn plugin_pane_open_argv_with(
+    plugin_id: &str,
+    entrypoint: &str,
+    placement: Option<&str>,
+    env: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
         "plugin".to_string(),
         "pane".to_string(),
         "open".to_string(),
@@ -297,7 +337,16 @@ pub fn plugin_pane_open_argv(plugin_id: &str, entrypoint: &str) -> Vec<String> {
         plugin_id.to_string(),
         "--entrypoint".to_string(),
         entrypoint.to_string(),
-    ]
+    ];
+    if let Some(placement) = placement {
+        argv.push("--placement".to_string());
+        argv.push(placement.to_string());
+    }
+    for assignment in env {
+        argv.push("--env".to_string());
+        argv.push(assignment.clone());
+    }
+    argv
 }
 
 /// Panes on the server, in the order the response listed them.
@@ -1106,6 +1155,51 @@ mod tests {
                 "--entrypoint",
                 "picker",
             ]]
+        );
+    }
+
+    #[test]
+    fn a_pane_handing_off_to_another_pane_names_the_placement_and_the_payload() {
+        // The two options only a pane opening another pane passes: an overlay
+        // placement, because Herdr keeps one popup slot and the caller is
+        // holding it, and the payload the opened pane is otherwise never told.
+        let runner = FakeRunner::ok("");
+        let client = HerdrCli::new(runner);
+        client
+            .open_pane_with(
+                "portfwd",
+                "confirm",
+                Some("overlay"),
+                &["HERDR_PORTFWD_CONFIRM={\"url\":\"http://localhost:5173/a b\"}".to_string()],
+            )
+            .expect("an empty echo is still an opened pane");
+        assert_eq!(
+            client.runner.calls(),
+            vec![vec![
+                "plugin",
+                "pane",
+                "open",
+                "--plugin",
+                "portfwd",
+                "--entrypoint",
+                "confirm",
+                "--placement",
+                "overlay",
+                "--env",
+                // One argv word, spaces and all: nothing here is ever handed to
+                // a shell to re-split.
+                "HERDR_PORTFWD_CONFIRM={\"url\":\"http://localhost:5173/a b\"}",
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_pane_open_with_nothing_extra_is_byte_for_byte_the_old_argv() {
+        // The handoff options are opt-in: every existing caller must still send
+        // the argv Herdr has always been answering.
+        assert_eq!(
+            plugin_pane_open_argv_with("portfwd", "list", None, &[]),
+            plugin_pane_open_argv("portfwd", "list"),
         );
     }
 

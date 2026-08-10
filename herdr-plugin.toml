@@ -1,6 +1,6 @@
 id = "portfwd"
 name = "Herdr Port Forward"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
 description = "Forward dev-server ports from remote Herdr hosts to your local machine"
 platforms = ["macos", "linux"]
@@ -53,8 +53,8 @@ command = ["./target/release/herdr-portfwd", "stop-all"]
 
 [[actions]]
 id = "open-url"
-title = "Port: forward and open"
-description = "Forward the clicked localhost URL, then open it locally"
+title = "Port: confirm and forward"
+description = "Confirm the clicked localhost URL, then forward and open it"
 contexts = ["pane"]
 command = ["./target/release/herdr-portfwd", "open-url"]
 
@@ -63,7 +63,7 @@ command = ["./target/release/herdr-portfwd", "open-url"]
 # restricted to loopback hosts: see SECURITY.md.
 [[link_handlers]]
 id = "loopback-url"
-title = "Forward and open locally"
+title = "Confirm this port forward"
 pattern = "^https?://(?:localhost|127\\.0\\.0\\.1|\\[::1\\]):[0-9]{1,5}(?:[/?#].*)?$"
 action = "open-url"
 
@@ -82,6 +82,26 @@ placement = "popup"
 width = "80%"
 height = 20
 command = ["./target/release/herdr-portfwd", "pane-ui", "picker"]
+
+# Where a Ctrl+click lands. The state it renders — host, ports, whether the
+# local port is free, the owning workspace and agent — arrives in the
+# environment, because a pane command gets no arguments beyond this argv: see
+# the module docs in src/confirm.rs.
+#
+# `height` is the *outer* popup, border included: Herdr spawns the pane command
+# in `height - 2` rows (resolve_popup_geometry in its src/popup_size.rs). So
+# this is ui::CONFIRM_HEIGHT + ui::POPUP_BORDER_ROWS, which a test in
+# tests/cli.rs checks against this file. Declaring CONFIRM_HEIGHT itself gave
+# the pane two rows fewer than the frame it has to hold, and the two it lost
+# were `esc cancel` and the status line.
+[[panes]]
+id = "confirm"
+title = "Forward a port"
+description = "Say what a clicked localhost URL is about to do, and ask"
+placement = "popup"
+width = "70%"
+height = 18
+command = ["./target/release/herdr-portfwd", "pane-ui", "confirm"]
 
 # Reconcile when attention moves to a different host, and release forwards owned
 # by a pane that has gone away.
